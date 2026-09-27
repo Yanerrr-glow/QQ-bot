@@ -47,9 +47,22 @@ jobs:
 
       - name: 冒烟测试：exe 能起来、能认出自检脚本
         run: |
-          # 仓库根没有 .env，所以退出码 1（有阻塞）是**正常**的；只拦"跑不起来"。
-          & 'dist/上手自检.exe' --no-input --offline
-          if ($LASTEXITCODE -gt 1) { throw "exe 异常退出：$LASTEXITCODE" }
+          # 这一步有两个坑，都必须显式绕开：
+          #
+          # ① **期望的退出码就是 1**（仓库里没有 .env → 自检报阻塞）。而 GitHub 对
+          #    pwsh / powershell 步骤会在脚本末尾追加 `exit $LASTEXITCODE`，
+          #    于是"被检出的阻塞"会直接把这一步判红、后面的发版步骤全部跳过 ——
+          #    实测踩过：冒烟红、Release 没建成。
+          # ② pwsh 步骤预先设了 `$ErrorActionPreference = 'stop'`，原生命令往 stderr
+          #    写一个字就会变成终止性错误（与 `_工具链/_打包上手exe.ps1` 里记的同源坑）。
+          $ErrorActionPreference = 'Continue'
+          $out = & 'dist/上手自检.exe' --no-input --offline 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          Write-Host "自检退出码：$code（0 = 全过；1 = 有阻塞 —— CI 里没有 .env，1 属正常）"
+          # 只拦"没能正常跑完"（崩溃 / DLL 缺失 / 路径找不到）：那是真问题，不该发版。
+          if ($code -ne 0 -and $code -ne 1) { throw "exe 没能正常跑完，退出码：$code" }
+          exit 0
 
       - name: 建 Release 并附上 exe
         uses: softprops/action-gh-release@v2
