@@ -20,9 +20,10 @@ import sys
 # 一个文件都查不到，却照样打印"失败 0 个"退出 0 —— 绿得毫无意义。
 HERE = pathlib.Path(__file__).resolve().parent.parent
 ROOTS = [HERE]
-# 作者本机活项目与副本并存时顺带查另一棵。副本已经搬过一次（进了 `项目\Git-open\`），
-# 所以按候选位置找，而不是假定它叫 `<本项目名>_open`。
-for _cand in (HERE.parent / "Git-open" / "QQ_bot_open", HERE.parent / "QQ_bot_open"):
+# 作者本机活项目与去敏副本并存时顺带查另一棵。候选路径**由活项目名推导**
+# （工作区约定 §1.1：去敏版本放 `项目\Git-open\<名>_open\`），不写死具体项目名。
+for _cand in (HERE.parent / "Git-open" / (HERE.name + "_open"),
+              HERE.parent / (HERE.name + "_open")):
     try:
         if _cand.is_dir() and _cand.resolve() != HERE:
             ROOTS.append(_cand)
