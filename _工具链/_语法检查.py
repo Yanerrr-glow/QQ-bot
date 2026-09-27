@@ -16,6 +16,15 @@ import py_compile
 import re
 import sys
 
+# 与 `离线验证_桩.py` 同一条：输出被管道捕获时 Python 用系统区域编码，英文区域的
+# Windows（GitHub runner）是 cp1252，打中文会 `UnicodeEncodeError` 崩掉、退出码 1。
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):
+    pass
+
 # **路径从脚本自身推**：这个脚本随副本分发，写死绝对路径的话，在别人机器上
 # 一个文件都查不到，却照样打印"失败 0 个"退出 0 —— 绿得毫无意义。
 HERE = pathlib.Path(__file__).resolve().parent.parent

@@ -34,6 +34,18 @@ import time
 import types
 import urllib.parse
 
+# 输出被重定向/管道时，Python 会退回**系统区域编码**打印。英文区域的 Windows（例如
+# GitHub 的 windows runner）是 cp1252，而这份脚本要打中文 —— 于是
+# `UnicodeEncodeError: 'charmap' codec ...` 直接崩、退出码 1。
+# CI 里就是这么挂的（`offline-checks` 报 exit code 1）。真控制台上不需要动
+# （Python 走 WriteConsoleW，中文一定对），所以只在非 tty 时钉成 UTF-8。
+try:
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):
+    pass
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 
