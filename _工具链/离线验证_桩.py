@@ -1736,7 +1736,17 @@ check("临时库已卸下，不影响后续", not _lib_probe.items or True)
 
 # --------------------------------------------------------------------- 21. 时间能力
 print("\n=== 21. 读时间：现在几点 / 多久之前 / 跨天记录 ===")
-_NOW = time.time()
+
+# **把"现在"钉死在一个固定时刻。**
+#
+# 为什么：这一节要验的是"跨天怎么标日期"，而「N 秒之前」换算成「几个日历日之前」
+# 取决于**运行时刻** —— 实测在 00:0x 跑就会假红：`86400 + 120` 秒前落到了两个日历日之前，
+# 于是「昨天」变成「2 天前」、`3 * 86400` 变成「4 天前」、连"30 秒前的消息不带日期前缀"
+# 都会因为跨过午夜而带上日期。用例本身没问题，是**它依赖了运行时刻**。
+# 中午 12:00 离两侧边界都足够远，这一节从此与"什么时候跑"无关。
+#
+# 后面 NTP / 时钟偏移那几组用的是真实 `time.time()`，与 `_NOW` 无关，不受影响。
+_NOW = time.mktime((2026, 9, 27, 12, 0, 0, 0, 0, -1))
 
 
 def _at(seconds_ago: float, text: str = "内容", *, uid: int = 111, name: str = "阿离") -> dict:
@@ -1836,7 +1846,16 @@ _log2.messages.append(
     {**_at(10, "主人说的", uid=int(settings.get("master_qq")), name="魔王")}
 )
 
-_bg = _log2.render_background(bot_uid="10000")
+# `render_background()` 内部写死用 `clock.now()`（真实时钟），没法从外面传"现在" ——
+# 所以这里**临时把它指向 `_NOW`**：桩环境本来就该这样控制时间，否则渲染出来的
+# 日期标签取决于运行时刻（同样是上面那个假红的来源）。渲染完立刻还原。
+_clock_mod = importlib.import_module("ai_chat.clock")
+_real_clock_now = _clock_mod.now
+_clock_mod.now = lambda: _NOW
+try:
+    _bg = _log2.render_background(bot_uid="10000")
+finally:
+    _clock_mod.now = _real_clock_now
 check("背景里带日期锚点", "——" in _bg and re.search(r"—— \d{4}-\d{2}-\d{2} ——", _bg) is not None,
       _bg[:120])
 check("「3 天前」与「昨天」在渲染里都能看到", "3 天前" in _bg and "昨天" in _bg, _bg[:160])
