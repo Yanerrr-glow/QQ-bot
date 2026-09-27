@@ -950,18 +950,30 @@ def consolidate_profile(name: str, uid_key: str) -> None:
 
 
 def clear(kind: str = "all") -> int:
-    """清空记忆。kind: all / facts / events / profile。"""
+    """清空记忆。kind: all / facts / events / profile。
+
+    **逐条删，不要用 `list.clear()` / `dict.clear()`。**
+    穿透容器（`memstore._WriteThroughList` / `_WriteThroughDict`）只覆盖了
+    `append/remove/pop/__delitem__`（画像另有 `__setitem__/setdefault`）——`clear()`
+    **没有**被覆盖，所以直接 `clear()` 只清内存。而 sqlite 后端的 `save()` 只补一个
+    `next_id`、**不整库重写**，于是重启之后旧条目原样复活；JSON 后端因为 `save()`
+    会整库重写，所以这个问题在 JSON 上看不出来（实测在服务器上踩到：
+    `/记忆 清 画像` 回执说清掉了 N 项，控制台里也空了，重启后又全回来了）。
+    """
     _db.ensure()
     n = 0
     if kind in ("all", "facts"):
         n += len(_db.facts)
-        _db.facts.clear()
+        for item in list(_db.facts):
+            _db.facts.remove(item)
     if kind in ("all", "events"):
         n += len(_db.events)
-        _db.events.clear()
+        for item in list(_db.events):
+            _db.events.remove(item)
     if kind in ("all", "profile"):
         n += len(_db.profile)
-        _db.profile.clear()
+        for key in list(_db.profile):
+            _db.profile.pop(key, None)
     return n
 
 

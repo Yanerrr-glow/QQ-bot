@@ -3635,6 +3635,36 @@ try:
           str(_back[0].get("vis") if _back else None))
     _reload.close()
 
+    # ---- 30.2.1 清空画像必须真的落盘（否则重启就复活）----
+    # 这一条是被服务器上的真事故逼出来的：`/记忆 清 画像` 回执说清掉了 N 项，
+    # 控制台里也确实空了，但重启之后全回来了 —— 因为 `clear()` 用的是
+    # `list.clear()` / `dict.clear()`，而穿透容器没覆盖它们（sqlite 的 `save()`
+    # 又只补 next_id、不整库重写）。所以这里**必须用"重新打开数据库"来验**，
+    # 只看内存里的计数是验不出来的。
+    _fresh_mem()
+    _mem.set_profile("画像甲", display="甲", love=["拿铁"], note="测试")
+    _mem.set_profile("画像乙", display="乙", dislike=["香菜"])
+    _mem.add_fact("顺手放一条事实，确认不会被连带清掉", scope="global", subject="甲", conv="g1")  # noqa: SLF001
+    check("两份画像写进去了", _mem.stats()["people"] == 2, str(_mem.stats()["people"]))  # noqa: SLF001
+    check("clear('profile') 报告清掉了 2 项", _mem.clear("profile") == 2, "")  # noqa: SLF001
+    check("内存里立刻是空的", _mem.stats()["people"] == 0, str(_mem.stats()["people"]))  # noqa: SLF001
+    _after = _ms.SqliteStore(_b2 / "memory.db")
+    _after.load()
+    check("**磁盘上也真的没有了（重启不会复活）**", not _after.profile, str(list(_after.profile)))
+    check("事实没被连带清掉", len(_after.facts) >= 1, str(len(_after.facts)))
+    _after.close()
+
+    # 走 `/记忆 清 画像` 用的那条异步路径，再验一遍
+    _fresh_mem()
+    _mem.set_profile("画像丙", display="丙", habit=["熬夜"])
+    check("清之前有一份", _mem.stats()["people"] == 1, str(_mem.stats()["people"]))  # noqa: SLF001
+    asyncio.run(_mem.wipe("profile"))  # noqa: SLF001
+    _after2 = _ms.SqliteStore(_b2 / "memory.db")
+    _after2.load()
+    check("wipe('profile') 之后重新打开也是空的", not _after2.profile, str(list(_after2.profile)))
+    _after2.close()
+    _mem._db.facts.clear()  # noqa: SLF001
+
     _json_seed = _ms.JsonStore(_b2 / "memories.json")
     _json_seed.load()
     _json_seed.facts = [{"id": 900, "ts": 1.0, "text": "迁移用的一条", "subject": "甲"}]
