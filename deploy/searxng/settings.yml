@@ -1,0 +1,84 @@
+# SearXNG 配置 —— 为 QQ bot 提供 JSON 搜索接口
+#
+# 这份文件由部署脚本生成。改完要 `docker restart searxng` 才生效。
+use_default_settings: true
+
+general:
+  instance_name: "qqbot-search"
+  # 关闭公开统计与遥测，这是自用实例
+  enable_metrics: false
+
+server:
+  # 绑定容器内所有地址，宿主只映射 127.0.0.1（见 docker-compose.yml）
+  bind_address: "0.0.0.0"
+  port: 8080
+  # 只跑 HTTP，不自己处理 TLS（宿主上是回环 + 容器内网，不需要）
+  base_url: false
+  # 部署时由脚本替换成随机值
+  secret_key: "__SECRET_KEY__"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # ⚠️ 关键：**打开 json 输出**。bot 用 ?format=json 取结果，
+  # 不开的话 SearXNG 会直接回 403 Forbidden（官方文档明确写了，
+  # 且"多数公共实例都关掉了这些格式"）。
+  formats:
+    - html
+    - json
+  safe_search: 1
+  autocomplete: ""
+  default_lang: "zh-CN"
+
+ui:
+  static_use_hash: true
+
+# 引擎启用清单 —— **按实测结果配的，不是照抄默认**。
+#
+# 在这台服务器上逐个测过（q=鲸落），只有两个引擎真能出结果：
+#   sogou 8 条、360search 3 条
+# 其余全部 0 条，原因分三类：
+#   * baidu  → 对机房 IP 返回 CAPTCHA（unresponsive_engines 里报的就是它）
+#   * wikipedia / wikidata / google cse / brave → 直接 timeout（域名不可达）
+#   * bing / duckduckgo / google / startpage / mojeek / qwant / chinaso / presearch → 无结果
+#
+# 留着不能用的引擎只会让每次搜索白等它们的超时，所以显式关掉。
+# 以后换机房或加代理，再回来打开。
+engines:
+  - name: sogou
+    disabled: false
+  - name: 360search
+    disabled: false
+  - name: baidu
+    disabled: true      # 实测 CAPTCHA
+  - name: bing
+    disabled: true
+  - name: google
+    disabled: true
+  - name: google cse
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: mojeek
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: chinaso
+    disabled: true
+  - name: presearch
+    disabled: true
+  - name: wikipedia
+    disabled: true      # timeout
+  - name: wikidata
+    disabled: true      # timeout
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  pool_connections: 20
+  pool_maxsize: 10
+  enable_http2: false

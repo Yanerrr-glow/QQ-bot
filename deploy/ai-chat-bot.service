@@ -1,0 +1,40 @@
+[Unit]
+Description=QQ AI Chat Bot (NoneBot2 + OneBot v11 + DeepSeek)
+Documentation=file:///opt/qq-bot/deploy/README.md
+# 等网络就绪再起，避免开机时抢跑
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建议用非 root 专用账号跑（见 deploy/README.md 的「备选方案」一节）
+User=qqbot
+Group=qqbot
+WorkingDirectory=/opt/qq-bot
+
+# 直接跑 venv 里的解释器。
+# 【不要用 EnvironmentFile= 加载 .env】——
+# systemd 的环境文件语法和 dotenv 不一样（引号、# 注释的处理都不同），
+# NoneBot 自己会读工作目录下的 .env，交给它读最稳。
+ExecStart=/opt/qq-bot/.venv/bin/python bot.py
+
+# 崩溃就拉起。正向 WS 模式下就算 NapCat 还没起来也没关系 ——
+# nonebot-adapter-onebot 每 3 秒重连一次、永不放弃，会自己接上。
+Restart=always
+RestartSec=5
+
+# 退出时留点时间把聊天记录写完，别硬杀
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+NoNewPrivileges=true
+
+# 日志默认进 journald：
+#     journalctl -u qqbot -f
+# 想同时落一份文件到 data/bot.log，把下面两行取消注释
+# （append: 需要 systemd 240+，Ubuntu 22.04 是 249，够）
+#StandardOutput=append:/opt/qq-bot/data/bot.log
+#StandardError=append:/opt/qq-bot/data/bot.log
+
+[Install]
+WantedBy=multi-user.target

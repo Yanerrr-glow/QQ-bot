@@ -1,0 +1,51 @@
+# ---------------- 密钥与个人配置：绝对不能提交 ----------------
+# .env 里有 DeepSeek API Key、主人的 QQ 号。
+# 一旦提交，密钥会永久留在 git 历史里（删掉文件也没用），必须吊销重发。
+.env
+.env.*
+!.env.example
+deploy/.env
+!deploy/.env.server
+deploy/searxng/.env
+!deploy/searxng/.env.example
+
+# ---------------- 运行时数据：别人的聊天记录，永远不进仓库 ----------------
+# 里面有群号、QQ 号、群友昵称与真实对话内容。公开等于替所有群友做一次人肉。
+data/
+deploy/napcat/
+deploy/searxng/data/
+
+# ---------------- Python ----------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------------- 日志与临时文件 ----------------
+*.log
+*.corrupt-*
+*.tmp
+*.bak
+
+# `离线验证_桩.py` 的工作区临时目录。它**必须落在项目内**（%TEMP% 那侧不可写，
+# 见脚本开头的说明），里面是每次跑测试的 sqlite 库，跑完会删；
+# Windows 上句柄没释放时会删不掉，脚本会打印出来提醒手工删 —— 但绝不能进仓库。
+.tmp_selftest/
+
+# ---------------- 二进制产物：走 Release，不进仓库 ----------------
+# `_工具链/_打包上手exe.ps1` 把 `上手自检.py` 打成 `dist/上手自检.exe`（自带解释器，
+# 约 8 MB），它作为 **GitHub Release 的 asset** 分发，仓库里只留打包脚本与下载链接 ——
+# 二进制在 git 里只增不减：每重打一次就永久多一个 8 MB 的 blob，删文件也删不掉旧 blob。
+# 下载与自建方式见 README 的「第 0 步」。
+*.exe
+dist/
+build/
+*.spec
+
+# ---------------- 编辑器 / 系统 ----------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

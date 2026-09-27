@@ -1,0 +1,41 @@
+# SearXNG —— 给 QQ bot 用的搜索后端
+#
+# 独立于 bot 的 compose：换/升级它不会影响机器人，反之亦然。
+# 通过**外部网络** qq-ai-chat_botnet 与 bot 互通，所以 bot 里端点填 http://searxng:8080。
+#
+# 资源：2C2G 的机器上约吃 200-400MB 内存。本机可用内存偏紧，所以加了 mem_limit 兜底。
+name: searxng
+
+services:
+  searxng:
+    # 用 daocloud 的完整引用：本机只能通过镜像加速器拉取（直连 Docker Hub 不通），
+    # 而 daocloud 对 `searxng/searxng` 这个库的短名请求返回 403，带上前缀才通。
+    # 固定 latest 而非某个日期标签：实测过的几个日期标签在加速器上都不存在。
+    image: docker.m.daocloud.io/searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    # 内存兜底：宁可它被 OOM 杀掉重启，也不要拖垮同机的 QQ 与 bot
+    mem_limit: 512m
+    environment:
+      # 容器内监听端口（settings.yml 里也是 8080）
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?请先在 .env 里设置 SEARXNG_SECRET}
+    ports:
+      # 只给宿主回环：宿主机上能 curl 测试，公网扫不到。
+      # bot 走容器内网，不依赖这个映射。
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./config:/etc/searxng:rw
+      - ./data:/var/cache/searxng:rw
+    networks:
+      - botnet
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  botnet:
+    external: true
+    name: qq-ai-chat_botnet

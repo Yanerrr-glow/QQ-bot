@@ -1,0 +1,11 @@
+[Unit]
+Description=QQ Bot NapCat watchdog (one-shot)
+Documentation=file:///opt/qq-bot/deploy/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# 脚本里自己会 cd 到 deploy 目录并调用 docker compose
+ExecStart=/opt/qq-bot/deploy/watchdog.sh
+# 日志走 journald：journalctl -u qqbot-watchdog -n 50

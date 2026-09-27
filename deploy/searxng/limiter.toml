@@ -1,0 +1,3 @@
+# 自用实例，不需要限流。启用的话 bot 的请求会因为缺 X-Forwarded-For 被挡。
+[botdetection.ip_limit]
+link_token = false

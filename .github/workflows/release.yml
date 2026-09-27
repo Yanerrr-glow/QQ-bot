@@ -1,0 +1,83 @@
+name: Release
+
+# 打 tag（v*）就出 Release：**现构建** `上手自检.exe` 并附到 Release 上。
+#
+# 为什么交给 Actions 而不是本地打包：exe 把 `_工具链/上手自检.py` **烤进了二进制**，
+# 本地忘了重打包就会发出旧逻辑 —— 仓库里那条时间戳提醒只能"提示"，不能"保证"。
+# 在 tag 上现构建，产物一定对应那一版源码，这个问题从根上消失。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # 建 Release / 上传 asset 需要
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest     # PyInstaller 不能跨平台构建；目标是 Windows 用户
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 打包单文件 exe
+        run: |
+          python -m PyInstaller --onefile --console --noconfirm --clean `
+            --name 上手自检 `
+            --distpath dist --workpath build --specpath build `
+            _工具链/上手自检.py
+          if (-not (Test-Path 'dist/上手自检.exe')) { throw '打包没产出 exe' }
+
+      - name: 算 SHA256（与本地打包脚本同一格式：无 BOM 的 UTF-8）
+        id: sha
+        run: |
+          $h = (Get-FileHash 'dist/上手自检.exe' -Algorithm SHA256).Hash.ToLower()
+          $text = "$h  上手自检.exe" + [Environment]::NewLine
+          [System.IO.File]::WriteAllText(
+            'dist/上手自检.exe.sha256', $text, (New-Object System.Text.UTF8Encoding($false)))
+          "hash=$h" >> $env:GITHUB_OUTPUT
+
+      - name: 冒烟测试：exe 能起来、能认出自检脚本
+        run: |
+          # 仓库根没有 .env，所以退出码 1（有阻塞）是**正常**的；只拦"跑不起来"。
+          & 'dist/上手自检.exe' --no-input --offline
+          if ($LASTEXITCODE -gt 1) { throw "exe 异常退出：$LASTEXITCODE" }
+
+      - name: 建 Release 并附上 exe
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: |
+            dist/上手自检.exe
+            dist/上手自检.exe.sha256
+          body: |
+            ## 下载
+
+            **`上手自检.exe`** —— 双击就能跑，自带解释器、**不需要装 Python**。
+            它检的是**你自己那台机器**上的 Python 与 venv，与它自带的那份无关。
+
+            把它放在仓库附近任意位置都行：它会先在自己周围找这个仓库，找不到会问你路径。
+
+            ## 校验
+
+            ```
+            SHA256  ${{ steps.sha.outputs.hash }}
+            ```
+
+            ```powershell
+            Get-FileHash .\上手自检.exe -Algorithm SHA256    # 与上面一致即未被篡改
+            ```
+
+            ## 自己构建
+
+            ```powershell
+            & '.\_工具链\_打包上手exe.ps1'     # 产出 dist\上手自检.exe
+            ```

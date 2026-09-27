@@ -1,0 +1,12 @@
+[Unit]
+Description=Run QQ Bot NapCat watchdog every 3 minutes
+
+[Timer]
+# 开机 5 分钟后再开始（给容器留出启动和快速登录的时间）
+OnBootSec=5min
+# 之后每 3 分钟跑一次
+OnUnitActiveSec=3min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+# 换行一律 LF。这不是洁癖，有两个具体后果：
+#
+# ① `deploy/watchdog.sh` 是给 Linux 服务器用的。Git for Windows 默认 `core.autocrlf=true`，
+#    检出时会把 LF 变成 CRLF —— 到了服务器上就是 `bad interpreter: /bin/bash^M`，很难查。
+# ② 维护者的「活项目 ↔ 本副本」脱敏核对是**按字节比对**的：一旦检出把这里改成 CRLF，
+#    每一行都和活项目对不上，核对会把**所有文件**都报成"有差异"，判据直接失效。
+#
+# `text=auto` 让 git 自己判断哪些是文本，`eol=lf` 强制检出也用 LF。
+* text=auto eol=lf
+
+# 二进制：别做任何转换（这些不进仓库，写在这里是留给以后）
+*.exe  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.webp binary
+*.pdf  binary

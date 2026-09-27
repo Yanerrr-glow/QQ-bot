@@ -1,0 +1,12 @@
+# 国内直连 PyPI 会超时，安装时走阿里云镜像：
+#   pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+# 两个 extra 都要：fastapi 提供 Web 控制台，websockets 用于主动连 NapCat。
+nonebot2[fastapi,websockets]>=2.3.0
+nonebot-adapter-onebot>=2.4.0
+openai>=1.50.0
+python-dotenv>=1.0.0
+# 感知哈希（表情包近似去重）用它俩：Pillow 解码图片、numpy 做 DCT。
+# 两个都缺时 perceptual.available() 返回 False，入库自动退回精确哈希去重，不会崩 ——
+# 只是认不出"改过编码的同一张图"。装不上也不影响机器人跑起来。
+Pillow>=10.0.0
+numpy>=1.24.0

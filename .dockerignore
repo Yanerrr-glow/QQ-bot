@@ -1,0 +1,39 @@
+# 构建上下文是项目根目录，这里列的东西一律不进镜像。
+# 最重要的一条：.env 含 DeepSeek 密钥，绝不能被 COPY 进镜像层 ——
+# 镜像层是永久的，即使后来删掉文件，密钥仍留在层历史里。
+.env
+.env.*
+!.env.example
+
+# Windows 的虚拟环境：Linux 镜像里完全没用，而且体积很大
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时数据（聊天记录、表情包、日志）—— 由卷挂载，不进镜像
+data/
+*.log
+
+# NapCat 的容器数据（QQ 登录态可能有几百 MB）
+deploy/napcat/
+
+# 本地 Windows 工具链与杂物。_工具链/ 整体排除，只放行进镜像的脚本
+# （与 Dockerfile 的 COPY 一一对应；漏一个就会 build 报 "file not found"——
+#   2026-09-25 加 `_水位线初始化.py` 时正是漏了这里，build 报
+#   「failed to calculate checksum … not found」，而文件明明就在。
+#   记住：**新增进镜像的脚本要改两处**：Dockerfile 的 COPY + 这里的 ! 放行）。
+_工具链/
+!_工具链/诊断状态.py
+!_工具链/离线验证.py
+!_工具链/PDF端到端验证.py
+!_工具链/_搜索查询验证.py
+!_工具链/_水位线初始化.py
+!_工具链/_记忆库迁移.py
+*.jpg
+*.png
+*.zip
+
+.git/
+.gitignore

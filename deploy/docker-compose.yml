@@ -1,0 +1,86 @@
+# QQ AI 机器人 —— 服务器部署编排（NapCat + bot）
+#
+# 用法（在 deploy/ 目录下，且已复制好 .env）：
+#     docker compose up -d
+#     docker compose logs -f
+#
+# 架构：NapCat 与 bot 在同一 bridge 网络里，用容器名互通，
+#       OneBot 端口不需要暴露到宿主，公网更碰不到。
+#       连接方式为【反向 WS】：NapCat 主动连 bot 的 /onebot/v11/ws。
+#
+# 安全要点：两个 ports 都写死了 127.0.0.1 前缀 —— 只绑宿主回环，
+#           公网扫不到，本地靠 SSH 隧道访问。不要把前缀删掉。
+name: qq-ai-chat
+
+services:
+  # ------------------------------------------------------------------ bot
+  # 它是反向 WS 的服务端，所以不依赖 napcat；反过来 napcat 依赖它。
+  bot:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ai-chat-bot:local
+    container_name: ai-chat-bot
+    restart: always
+    # bot 的全部配置从这里注入（DRIVER / 密钥 / AI_CHAT_* …）。
+    # 注意：env_file 只喂给容器；compose 自己的 ${变量} 插值读的是同目录的 .env。
+    env_file: .env
+    ports:
+      # 只给宿主回环。远程访问走：ssh -L 8080:127.0.0.1:8080 用户@服务器
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # 聊天记录、表情包库、settings.json、日志都落在这里，重建容器不丢。
+      # settings.json 是你的调参成果，务必保留。
+      - ../data:/app/data
+      # 【必须有】让 NoneBot 真正读到 .env。
+      #
+      # 原因：NoneBot 的 Config 是 extra="allow" —— 已声明的字段（driver/port…）
+      # 能从环境变量读，但插件用的那些**自定义字段**（deepseek_api_key、ai_chat_*）
+      # 只会从 .env **文件**里读，环境变量里的同名键进不了 extra。
+      # 而 Dockerfile 故意不 COPY .env（防密钥进镜像层），于是容器里只有环境变量、
+      # 没有文件 —— 结果所有自定义配置静默退回代码默认值。
+      # 实测症状：`docker exec ai-chat-bot sh -c 'echo ${#DEEPSEEK_API_KEY}'` 返回 35，
+      # 机器人却照旧回「我还没拿到 API Key」。
+      #
+      # 只读挂载，容器内改不了它。注意：这个文件必须先存在（cp .env.server .env），
+      # 否则 Docker 会把它当成目录创建出来。
+      - ./.env:/app/.env:ro
+    networks:
+      - botnet
+
+  # --------------------------------------------------------------- napcat
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    depends_on:
+      - bot
+    environment:
+      # 让 NapCat 以宿主用户身份写文件，避免挂载目录变成 root 属主
+      NAPCAT_UID: ${NAPCAT_UID:-1000}
+      NAPCAT_GID: ${NAPCAT_GID:-1000}
+      # WebUI(6099) 的登录令牌 —— 不设的话默认 token 是公开的 napcat
+      WEBUI_TOKEN: ${WEBUI_TOKEN:?请先在 deploy/.env 里设置 WEBUI_TOKEN}
+      # 快速登录：entrypoint.sh 读的就是这个环境变量，**不是**命令行 -q 参数！
+      # 它结尾的判断是 `if [ -n "${ACCOUNT}" ]; then ... -q $ACCOUNT`。
+      # 不设的话每次重启容器都得重新扫码（实测踩过，见 README 第 7 节）。
+      ACCOUNT: ${ACCOUNT:?请在 deploy/.env 里设置 ACCOUNT（机器人小号的 QQ 号）}
+    ports:
+      # NapCat 的登录页：扫码要用它。同样只绑回环 + SSH 隧道。
+      - "127.0.0.1:6099:6099"
+      # 走反向 WS 时下面这行不需要；只有改用【正向 WS】时才打开，
+      # 并在 .env 里把 ONEBOT_WS_URLS 改成 ["ws://napcat:6700"]
+      # - "127.0.0.1:6700:6700"
+    volumes:
+      # 这两个卷是「不用反复扫码」的关键，必须持久化
+      - ./napcat/config:/app/napcat/config   # OneBot 网络配置
+      - ./napcat/QQ:/app/.config/QQ          # QQ 登录态
+    networks:
+      - botnet
+    # 固定 MAC 地址：降低「设备变化」触发 QQ 风控、导致掉登录的概率。
+    # 这个值是 NapCat 官方 compose 模板里用的，保持不动即可。
+    mac_address: "02:42:ac:11:00:02"
+
+networks:
+  botnet:
+    driver: bridge
