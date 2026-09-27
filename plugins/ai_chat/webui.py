@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import json
 import logging
 import time
 
@@ -28,6 +29,7 @@ from . import (
     clock,
     config,
     greetings,
+    llm,
     memory,
     persona,
     persona_eval,
@@ -136,6 +138,7 @@ _HTML = """<!doctype html>
 
   <div class="tabs">
     <button class="tab active" data-tab="settings" onclick="tab('settings')">参数</button>
+    <button class="tab" data-tab="model" onclick="tab('model')">模型</button>
     <button class="tab" data-tab="persona" onclick="tab('persona')">人设要求</button>
     <button class="tab" data-tab="memory" onclick="tab('memory')">记忆库</button>
     <button class="tab" data-tab="image" onclick="tab('image')">图片策略</button>
@@ -160,6 +163,52 @@ _HTML = """<!doctype html>
       <div class="acc-body"><div id="timeCard"></div></div>
     </div>
     <div class="grid" id="settings"></div>
+  </div>
+
+  <!-- ---------------------------------------------------------- 模型 -->
+  <div class="panel" id="panel-model">
+    <div class="toolbar">
+      <button class="primary" onclick="addModelTemplate()">加一个档案（模板）</button>
+      <button onclick="testModel('')">测一下当前档案</button>
+      <button onclick="load()">刷新</button>
+      <button onclick="accAll(true)">全部展开</button>
+      <button onclick="accAll(false)">全部收起</button>
+    </div>
+    <div class="card">
+      <h2>接口档案 <span class="count" id="modelCount"></span></h2>
+      <div class="muted" style="margin-bottom:12px">
+        一个档案 = <b>一家接口 + 一个模型</b>（地址、密钥来源、模型名、能力标记）。
+        想换一家（中转站、自建服务、别的厂商的 OpenAI 兼容端点）就在这里加一个，
+        点「设为当前」<b>下一条消息就生效，不用重启</b>。
+        <b>能力标记不是装饰</b>：端点不支持 tools 却收到工具表会直接报错，
+        所以「工具 / 读图 / logprobs」要按实际情况勾。
+      </div>
+      <div id="modelList"></div>
+    </div>
+    <div class="card acc" data-acc="model:json">
+      <button class="acc-head" onclick="toggleAcc(this)">
+        <span class="caret">▸</span><span class="title">直接编辑档案 JSON</span>
+        <span class="meta">细调 / 批量改；密钥只显示 ***，保存时原样保留</span>
+      </button>
+      <div class="acc-body">
+        <div class="muted" style="margin-bottom:8px">
+          字段：<code>id</code>（只能用字母数字与 <code>_ . -</code>）、<code>label</code>、
+          <code>base_url</code>、<code>api_key</code>（<b>不建议</b>直接写在这里）、
+          <code>api_key_env</code>（推荐：写 <code>.env</code> 里的变量名）、
+          <code>model</code>、<code>vision</code> / <code>tools</code> / <code>logprobs</code>。
+          本机端点（127.0.0.1 / localhost）留空密钥即可；<code>active</code> 是当前选中的档案 id。
+          <code>deepseek</code> 这个播种档案删不掉 —— 它是「回到 .env 默认」唯一的路。
+        </div>
+        <textarea id="modelJson" spellcheck="false"
+          style="width:100%;height:260px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
+                 background:#0d1117;color:#d7e2ee;border:1px solid var(--line);border-radius:8px;padding:10px"></textarea>
+        <div style="margin-top:8px">
+          <button class="primary" onclick="saveModelJson()">保存这份 JSON</button>
+          <button onclick="load()">放弃改动并重载</button>
+        </div>
+        <div id="modelJsonMsg" class="muted" style="margin-top:6px"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ---------------------------------------------------------- 人格三层 -->
@@ -285,13 +334,15 @@ function toggleAcc(btn) {
 }
 function applyAccState() {
   const st = accState();
-  document.querySelectorAll('#settings .card.acc').forEach(c => {
+  // 只挑带 data-acc 的卡片：没有 key 的（如"时间校准"）状态不持久化，
+  // 保持它出生时的样子。选择器不限定 #settings —— 模型页的卡片也是同一套。
+  document.querySelectorAll('.card.acc[data-acc]').forEach(c => {
     if (c.dataset.acc) c.classList.toggle('open', !!st[c.dataset.acc]);
   });
 }
 function accAll(open) {
   const st = accState();
-  document.querySelectorAll('#settings .card.acc').forEach(c => {
+  document.querySelectorAll('.card.acc[data-acc]').forEach(c => {
     c.classList.toggle('open', open);
     if (c.dataset.acc) st[c.dataset.acc] = open;
   });
@@ -624,11 +675,121 @@ function renderTime(t) {
     ${t.last_error ? `<div class="row"><label>最近失败</label><span class="muted">${esc(t.last_error)}</span></div>` : ''}`;
 }
 
+// ---------------------------------------------------------------- 模型档案
+// 「哪家接口 + 哪个模型」现在是一份可切换的档案表。这一页只做四件事：
+// 看现状、切当前、测通不通、改 JSON —— 所有写操作都打服务端接口，
+// **页面不自己推导任何"生效的模型名"**（那由 settings.model 覆盖 + 档案一起决定）。
+function renderModels(m) {
+  const box = document.getElementById('modelList');
+  if (!box || !m) return;
+  document.getElementById('modelCount').textContent = `（${m.profiles.length} 个，当前用 ${m.active}）`;
+  box.innerHTML = m.profiles.map(p => {
+    const cur = p.id === m.active;
+    const tags = [['读图', p.vision], ['工具', p.tools], ['logprobs', p.logprobs]]
+      .filter(t => t[1]).map(t => `<span class="tag">${t[0]}</span>`).join(' ');
+    const key = p.has_key
+      ? `<span class="tag">${esc(p.key_hint)}</span>`
+      : '<span class="tag" style="color:var(--warn)">没配密钥</span>';
+    const ov = (cur && m.override)
+      ? ` <span class="tag">被 settings.model 覆盖成 ${esc(m.override)}</span>` : '';
+    return `<div class="card acc" data-acc="model:${esc(p.id)}">
+      <button class="acc-head" onclick="toggleAcc(this)">
+        <span class="caret">▸</span>
+        <span class="title">${cur ? '● ' : ''}${esc(p.label || p.id)}</span>
+        <span class="meta">${esc(p.effective_model)} · ${esc(p.base_url)}</span>
+      </button>
+      <div class="acc-body">
+        <div class="row"><label>档案 id</label><span><code>${esc(p.id)}</code></span></div>
+        <div class="row"><label>接口地址</label><span><code>${esc(p.base_url)}</code></span></div>
+        <div class="row"><label>模型名</label><span><b>${esc(p.effective_model)}</b>${ov}
+          <span class="muted">（档案里写的是 ${esc(p.model)}）</span></span></div>
+        <div class="row"><label>密钥</label><span>${key}
+          <span class="muted">${p.key_env ? '来自 .env 的 ' + esc(p.key_env) : '直接写在档案里'}</span></span></div>
+        <div class="row"><label>能力标记</label><span>${tags || '<span class="muted">（都没开：只发纯文本对话）</span>'}</span></div>
+        <div class="row"><label>操作</label><span>
+          ${cur ? '<span class="tag">当前在用</span>'
+                : `<button onclick="useModel('${p.id}')">设为当前</button>`}
+          <button onclick="testModel('${p.id}')">测一下</button>
+          ${p.removable ? `<button onclick="delModel('${p.id}')">删除</button>` : ''}
+        </span><span class="muted" id="mt_${p.id}"></span></div>
+      </div>
+    </div>`;
+  }).join('');
+  applyAccState();
+}
+
+function renderModelJson(text) {
+  const el = document.getElementById('modelJson');
+  // 正在编辑时不要覆盖用户敲了一半的内容（刷新按钮会重载，但别在打字时抢）
+  if (el && document.activeElement !== el) el.value = text || '';
+}
+
+async function useModel(id) {
+  try {
+    const r = await api('/api/model/active', {method:'POST', body: JSON.stringify({id})});
+    toast(r.ok ? ('已切到 ' + id) : ('没切成：' + (r.detail || '')), !r.ok);
+    if (r.ok) load();
+  } catch (e) { toast('切换失败：' + e.message, true); }
+}
+
+async function testModel(id) {
+  const box = document.getElementById(id ? ('mt_' + id) : 'modelJsonMsg');
+  if (box) box.textContent = '测试中…（真连一次接口，几秒）';
+  try {
+    const r = await api('/api/model/test', {method:'POST', body: JSON.stringify({id})});
+    const line = (r.ok ? '✅ ' : '❌ ') + (r.detail || '')
+      + (r.models && r.models.length ? `：${r.models.slice(0, 12).join(' / ')}` : '');
+    if (box) box.textContent = line;
+    toast(r.ok ? '接口通了' : '接口不通', !r.ok);
+  } catch (e) {
+    if (box) box.textContent = '❌ ' + e.message;
+    toast('测试失败：' + e.message, true);
+  }
+}
+
+async function delModel(id) {
+  if (!confirm('删掉档案「' + id + '」？它的接口地址、密钥来源与模型名一起消失。')) return;
+  try {
+    const r = await api('/api/model/delete', {method:'POST', body: JSON.stringify({id})});
+    toast(r.ok ? ('已删除 ' + id) : ('没删成：' + (r.detail || '')), !r.ok);
+    if (r.ok) load();
+  } catch (e) { toast('删除失败：' + e.message, true); }
+}
+
+function addModelTemplate() {
+  const el = document.getElementById('modelJson');
+  let data;
+  try { data = JSON.parse(el.value); } catch (e) { toast('先修好 JSON 语法再加：' + e.message, true); return; }
+  if (!data || !Array.isArray(data.profiles)) { toast('JSON 里没有 profiles 数组', true); return; }
+  data.profiles.push({
+    id: 'newapi', label: '新接口', base_url: 'https://example.com/v1',
+    api_key: '', api_key_env: 'NEWAPI_API_KEY', model: '填对方的模型名',
+    vision: false, tools: false, logprobs: false,
+  });
+  el.value = JSON.stringify(data, null, 2);
+  const box = document.querySelector('.card.acc[data-acc="model:json"]');
+  if (box) box.classList.add('open');
+  toast('已插入模板，改完点「保存这份 JSON」');
+}
+
+async function saveModelJson() {
+  const el = document.getElementById('modelJson');
+  const msg = document.getElementById('modelJsonMsg');
+  try {
+    const r = await api('/api/model/save', {method:'POST', body: JSON.stringify({json: el.value})});
+    if (msg) msg.textContent = (r.ok ? '已保存，当前档案：' : '没保存：') + (r.detail || '');
+    toast(r.ok ? '已保存' : '没保存', !r.ok);
+    if (r.ok) load();
+  } catch (e) { toast('保存失败：' + e.message, true); }
+}
+
 // ---------------------------------------------------------------- 装载
 async function load() {
   const data = await api('/api/state');
   DATA = data;
   renderSettings(data.settings);
+  renderModels(data.models);
+  renderModelJson(data.models_editor);
   renderPersona(data.persona);
   renderMemory(data.memory);
   renderImage(data.image);
@@ -662,7 +823,7 @@ async function load() {
     <span class="badge">群 <b>${st.groups.length}</b> 个</span>
     <span class="badge">主动发言 <b>${st.proactive_enabled ? '开' : '关'}</b></span>
     <span class="badge">定时问候 <b>${gr.enabled ? '开' : '关'}</b>／今日 <b>${greeted}</b></span>
-    <span class="badge">模型 <b>${esc(st.model)}</b></span>`;
+    <span class="badge">模型 <b>${esc(st.model)}</b> <span class="muted">@ ${esc(st.model_profile || '')}</span></span>`;
 }
 
 load().catch(e => toast('加载失败：' + e.message, true));
@@ -708,6 +869,10 @@ def _register() -> bool:
         return JSONResponse(
             {
                 "settings": settings.describe(),
+                # 模型档案：哪家接口 + 哪个模型（**只给掩码，不给密钥明文**）
+                "models": llm.snapshot(),
+                # 编辑框那份文本是单独一份（api_key 显示成 ***，保存时原样保留）
+                "models_editor": llm.editor_text(),
                 # 人设：三层结构。`catalog()`（旧槽位目录）已随分层一起删除 ——
                 # 控制台上的人设页现在只展示三层 + 自动改动日志 + 手动触发反思。
                 "persona": {
@@ -734,7 +899,8 @@ def _register() -> bool:
                     "proactive_enabled": bool(settings.get("proactive_enabled")),
                     "proactive": proactive.status(),
                     "greet": greetings.status(),
-                    "model": config.MODEL,
+                    "model": llm.model_name(),
+                    "model_profile": llm.active_id(),
                     # 时间状态：宿主时钟漂了、或 NTP 没通，控制台上这里是唯一能看见的地方
                     "time": {
                         "now": clock.strftime("%Y-%m-%d %H:%M:%S"),
@@ -749,6 +915,49 @@ def _register() -> bool:
                 ),
             }
         )
+
+    # ---- 模型档案：看 / 切 / 测 / 整份改。接口是**新增的**，旧的 /api/settings 形状不变 ----
+    @app.post(prefix + "/api/model/active")
+    async def _model_active(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        pid = str(body.get("id") or "").strip()
+        had = str(settings.get("model") or "").strip()
+        ok, why = llm.set_active(pid)
+        note = f"当前用 {why}" + (f"（顺带清掉了模型名覆盖「{had}」）" if ok and had else "")
+        return JSONResponse({"ok": ok, "detail": why if not ok else note, "state": llm.snapshot()})
+
+    @app.post(prefix + "/api/model/test")
+    async def _model_test(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        pid = str(body.get("id") or "").strip()
+        prof = llm.get(pid) if pid else None
+        if pid and prof is None:
+            return JSONResponse({"ok": False, "detail": f"没有这个档案：{pid}", "models": []})
+        try:
+            got = await llm.probe(prof)
+        except Exception as exc:  # noqa: BLE001 - 探测本身不该把控制台打成 500
+            got = {"ok": False, "detail": f"{type(exc).__name__}: {exc}", "models": []}
+        got["profile"] = (prof or llm.active())["id"]
+        return JSONResponse(got)
+
+    @app.post(prefix + "/api/model/save")
+    async def _model_save(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        try:
+            data = json.loads(str(body.get("json") or ""))
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "detail": f"JSON 解析失败：{exc}"})
+        if not isinstance(data, dict):
+            return JSONResponse({"ok": False, "detail": "顶层必须是一个对象"})
+        ok, why = llm.replace_all(data)
+        return JSONResponse({"ok": ok, "detail": why if not ok else f"当前用 {why}",
+                             "state": llm.snapshot() if ok else None})
+
+    @app.post(prefix + "/api/model/delete")
+    async def _model_delete(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        ok, why = llm.del_profile(str(body.get("id") or "").strip())
+        return JSONResponse({"ok": ok, "detail": why, "state": llm.snapshot() if ok else None})
 
     @app.post(prefix + "/api/settings")
     async def _update(request: Request):  # noqa: ANN202

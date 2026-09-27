@@ -42,13 +42,11 @@ import logging
 import time
 from typing import Any
 
-from openai import AsyncOpenAI
 
-from . import chatlog, clock, config, persona, settings, signals
+from . import chatlog, clock, config, llm, persona, settings, signals
 
 logger = logging.getLogger("ai_chat.persona_iter")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 _MAX_CANDIDATE = 200     # 与 persona._MAX_ITEM 对齐（闸门也会挡一次）
 
@@ -160,8 +158,7 @@ async def _ask_model(base: str, forbidden: str, surface: str, demands: str, line
     )
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 max_tokens=900,
@@ -195,7 +192,7 @@ async def reflect_once(*, notify: bool = True) -> dict[str, Any]:
     """
     if not settings.get("persona_iter_enabled"):
         return {"ok": False, "why": "自我迭代开关关着（控制台「人格」组可以打开）"}
-    if not config.API_KEY:
+    if not llm.api_key():
         return {"ok": False, "why": "没配 API Key"}
 
     base, forbidden, surface = persona.base_text(), persona.forbidden_text(), persona.surface_text()

@@ -32,13 +32,11 @@ from typing import Any
 
 from nonebot import get_bots
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
-from openai import AsyncOpenAI
 
-from . import chatlog, clock, config, context, settings
+from . import chatlog, clock, config, context, llm, settings
 
 logger = logging.getLogger("ai_chat.greetings")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 SKIP_TOKEN = "[SKIP]"
 _STATE_FILE = "greet_state.json"
@@ -213,8 +211,8 @@ async def compose(slot: str, now: float | None = None) -> str:
     """让模型按人设写一句问候。没配 Key、调用失败或超时都退回内置话术。"""
     label = _LABEL.get(slot, "问候")
     fallback = _FALLBACK.get(slot, "主人好呀。")
-    if not config.API_KEY:
-        logger.info("未配置 API Key，问候改用内置话术 slot=%s", slot)
+    if not llm.api_key():
+        logger.info("当前档案没配 Key，问候改用内置话术 slot=%s", slot)
         return fallback
 
     stamp, weekday, period = config.time_parts(now)
@@ -231,8 +229,7 @@ async def compose(slot: str, now: float | None = None) -> str:
 
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 # 问候也要带上"近期发生过什么、你知道主人什么" ——
                 # 不然早晚安就是两句可以互换的空话，跟改造前一样没有"熟人感"。
                 messages=context.build_simple(

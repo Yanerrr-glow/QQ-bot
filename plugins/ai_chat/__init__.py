@@ -46,7 +46,6 @@ from pathlib import Path
 from nonebot import get_driver, on_message
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.rule import Rule
-from openai import AsyncOpenAI
 
 from . import (
     attention,
@@ -61,6 +60,7 @@ from . import (
     greetings,
     instructions,
     introspect,  # noqa: F401 —— 供插件内其它模块按需引用，同时保证注册顺序
+    llm,
     memory,
     mode,
     msgindex,
@@ -80,7 +80,6 @@ from . import webui  # noqa: F401 —— 导入即注册控制台路由（副作
 logger = logging.getLogger("ai_chat")
 
 # 未配置 key 时也要能 import 成功，否则插件加载阶段就崩，报错不直观。
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 _semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
 
 RESET_WORDS = {"清空对话", "重置对话", "清空记录", "reset", "/reset", "新对话"}
@@ -213,7 +212,7 @@ def _question_text(event: MessageEvent) -> str:
 
 async def _ask_deepseek(messages: list[dict]) -> str:
     response = await asyncio.wait_for(
-        _client.chat.completions.create(model=settings.get("model"), messages=messages, stream=False),
+        llm.chat(messages=messages, stream=False),
         timeout=config.TIMEOUT,
     )
     if not response.choices:
@@ -275,7 +274,7 @@ async def _remember_definition(
         return
     if not results:
         return
-    definition = await search_memory.summarize(query, results, _client)
+    definition = await search_memory.summarize(query, results)
     if not definition:
         return
     # 入库用拧过的词当 key：这样 /搜索 与自动搜索会命中同一条
@@ -371,8 +370,7 @@ async def _ask_with_tools(messages: list[dict], *, conv: str, question: str = ""
     for _round in range(_MAX_TOOL_ROUNDS):
         try:
             response = await asyncio.wait_for(
-                _client.chat.completions.create(
-                    model=settings.get("model"),
+                llm.chat(
                     messages=messages,
                     stream=False,
                     tools=[search.tool_schema(), fetch.tool_schema()],
@@ -1103,7 +1101,7 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         await _send(bot, event, "好啦，之前的聊天记录我都忘掉了，重新开始吧。")
         return
 
-    if not config.API_KEY:
+    if not llm.api_key():
         await _send(bot, event, config.MSG_NO_KEY)
         return
 
@@ -1218,8 +1216,12 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
     # 关键：不能只在「纯图片消息」时才读 —— 用户 @ 它并配上一句「这是什么」，
     # 图同样必须送进去，否则它就是在对着空气回答。
     # 被引用的图同理：既然引用了，就说明想让它看见。
+    #
+    # 还要看**当前档案标没标「读图」**：换成本地纯文本模型之后，把 image_url 段
+    # 塞过去多半是 400，而且那种失败发生在发消息那一步、看起来像"图坏了"。
+    # 这里不读图，模型只会知道"有人发了图"，跟它自己说的"这个模型不看图"一致。
     vision_images: list[bytes] = []
-    if settings.get("chat_vision") and state.may_view(conv):
+    if settings.get("chat_vision") and llm.caps()["vision"] and state.may_view(conv):
         for group in (image_segments, quoted_images):
             data = await _load_first_image(group)
             if data is not None:

@@ -44,14 +44,12 @@ import urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
-from openai import AsyncOpenAI
 
-from . import config, perceptual, settings, state
+from . import config, llm, perceptual, settings, state
 from .perceptual import distance as phash_distance
 
 logger = logging.getLogger("ai_chat.stickers")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 # OneBot v11 image 段的 sub_type
 SUB_TYPE_LABEL = {
@@ -392,8 +390,12 @@ async def judge_image(
     fallback = 0.75 if sub_type in STICKER_LIKE_SUB_TYPES else 0.35
     if file_sent:
         fallback = min(fallback, 0.3)
-    if not config.API_KEY:
-        return fallback, "未配置 Key，按规则分"
+    if not llm.api_key():
+        return fallback, "当前档案没配 Key，按规则分"
+    if image_data is not None and not llm.caps()["vision"]:
+        # 档案标了"不读图"：图送过去只会 400，不如退回按规则打分。
+        # 失败方向是安全的 —— 判不准就不给它分，不会误把普通图收进表情包库。
+        return fallback, "当前档案不读图，按规则分"
 
     who = "主人" if is_master else "别人"
     label = "以文件形式发送的图片" if file_sent else SUB_TYPE_LABEL.get(sub_type, f"未知({sub_type})")
@@ -428,8 +430,7 @@ async def judge_image(
 
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[
                     {
                         "role": "user",
@@ -829,8 +830,12 @@ async def pick_for_context(
         logger.debug("未启用按语境挑图，退回随机取用 conv=%s", conv)
         return await pick_as_segment(), "未启用语境挑选"
 
-    if not config.API_KEY:
-        return None, "未配置 Key"
+    if not llm.api_key():
+        return None, "当前档案没配 Key"
+    if not llm.caps()["vision"]:
+        # 按语境挑图**全靠看图**：档案不读图就退回随机，别发一个它答不了的请求。
+        logger.info("当前档案不读图，语境挑图退回随机 conv=%s", conv)
+        return await pick_as_segment(), "当前档案不读图"
 
     lib = await get_library()
     want = int(settings.get("sticker_pick_candidates"))
@@ -863,8 +868,7 @@ async def pick_for_context(
 
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[
                     {
                         "role": "user",

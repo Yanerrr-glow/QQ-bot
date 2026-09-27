@@ -59,9 +59,8 @@ import re
 import time
 from typing import Any
 
-from openai import AsyncOpenAI
 
-from . import config, persona, settings
+from . import config, llm, persona, settings
 
 logger = logging.getLogger("ai_chat.persona_eval")
 
@@ -70,7 +69,6 @@ _MAX_RUNS = 60           # 历史轮次上限（按时间淘汰最旧的）
 _NEUTRAL = 3.0           # 影子评估的"测不出差异"阈值（分）
 _GEN_TOKENS = 4000       # 生成素材用多少 max_tokens（见 `_ask()` 的说明）
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 
 # --------------------------------------------------------------------- 取值
@@ -96,6 +94,21 @@ def judge_model() -> str:
     """
     default = (settings.choices_of("eval_judge_model") or ("deepseek-chat",))[0]
     return str(_sget("eval_judge_model", default) or default)
+
+
+def judge_profile() -> dict[str, Any]:
+    """裁判该用哪个档案：**必须能给出 logprobs** 的那个。
+
+    这是"不同 API 混用"最实际的形态：聊天用便宜/本地的那个，打分用官方那个给
+    token 概率的。当前档案能给就用它；否则退回第一个能给的。
+    """
+    cur = llm.active()
+    if llm.caps(cur)["logprobs"]:
+        return cur
+    for item in llm.profiles():
+        if llm.caps(item)["logprobs"]:
+            return item
+    return cur
 
 
 def _rollouts() -> int:
@@ -173,7 +186,8 @@ async def judge(reply: str, *, trait_label: str, rubric: str) -> int | None:
     )
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
+            llm.chat(
+                profile=judge_profile(),
                 model=judge_model(),
                 messages=[{"role": "system", "content": _JUDGE_SYS},
                           {"role": "user", "content": user}],
@@ -267,8 +281,7 @@ async def _ask(messages: list[dict[str, str]], *, max_tokens: int = _GEN_TOKENS)
     """
     for budget in (max_tokens, max_tokens * 2):
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=str(_sget("model", "deepseek-flash") or "deepseek-flash"),
+            llm.chat(
                 messages=messages,          # type: ignore[arg-type]
                 max_tokens=budget,
                 temperature=0.8,
@@ -345,8 +358,7 @@ async def score_trait(slug: str, trait: dict[str, Any], art: dict[str, Any],
         for _ in range(_rollouts()):
             try:
                 resp = await asyncio.wait_for(
-                    _client.chat.completions.create(
-                        model=str(_sget("model", "deepseek-flash") or "deepseek-flash"),
+                    llm.chat(
                         messages=[{"role": "system", "content": sys_prompt},
                                   {"role": "user", "content": q}],  # type: ignore[arg-type]
                         max_tokens=300, temperature=1.0),

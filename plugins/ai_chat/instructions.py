@@ -45,7 +45,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import AsyncOpenAI
 
 from . import (
     attention, clock, config, dsh_bridge, identity, memory, mode, persona, search, settings,
@@ -53,11 +52,6 @@ from . import (
 )
 
 logger = logging.getLogger("ai_chat.instructions")
-
-# 自己的一个客户端。本模块需要发一次模型调用（把搜索结果压成一句释义），
-# **不能借用 search 模块的** —— search 是纯 HTTP 搜索，本来就不该持有 LLM 客户端
-# （第一版就是 `search._client` 这么写的，直接 AttributeError）。
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 # 中文全角斜杠也认（手机上很容易打成 ／）
 _SLASH = "/／"
@@ -1002,7 +996,7 @@ async def _cmd_search(rest: str, *, conv: str, is_master: bool, ctx: Any = None)
     # 顺手沉淀释义，并把置信度回给主人看
     conf, _signals, reasons = search_memory.score_confidence(results)
     if search_memory.is_definition_query(query):
-        definition = await search_memory.summarize(query, results, _client)
+        definition = await search_memory.summarize(query, results)
         if definition:
             await search_memory.put(query, definition, results, by="/搜索")
             flag = "⚠️ 低置信度" if search_memory.is_low(conf) else "已存为释义"
@@ -1093,22 +1087,61 @@ async def _cmd_lease(rest: str, *, conv: str, is_master: bool, ctx: Any = None) 
 
 # ---- /模型 -------------------------------------------------------------
 async def _cmd_model(rest: str, *, conv: str, is_master: bool, ctx: Any = None) -> Action:
+    """`/模型`：说清"现在用哪家的哪个模型"，并且能当场切。
+
+    三种用法（都是**热生效**，不用重启）：
+
+    * `/模型`           —— 现状 + 有哪些接口档案；
+    * `/模型 <档案id>`  —— 换接口档案（这一层才换 base_url 与密钥）；
+    * `/模型 <模型名>`  —— 只覆盖模型名；`/模型 默认` 撤销覆盖。
+
+    「档案 id」与「模型名」共用同一个位置，是因为**它们几乎不会重名**（id 是
+    `deepseek` / `local` 这种短名，模型名带厂商前缀），而多开一个子命令
+    （`/模型 切 xxx`）在手机上多打四个字。真撞上了以档案优先 —— 换档案影响更大，
+    也只在这一个地方能换。
+    """
     if not is_master:
         return _deny("model", "换模型只有主人能做。")
     name = _norm(rest)
-    from . import settings as st
+    from . import llm, settings as st
 
-    # **模型名只从 Spec 表取一处**（见 `settings.choices_of`）：原先这里又写了一份，
-    # API 一侧改名就会和应用/控制台漂开。
-    choices = set(st.choices_of("model")) or {"deepseek-flash"}
+    cur = llm.active()
+    ids = [p["id"] for p in llm.profiles()]
+
     if not name:
-        # 同 introspect：读 settings 而不是 config.MODEL，否则控制台改过模型后自述会不准
-        return _say("model", f"当前用的是 {st.get('model')}。可用：{' / '.join(st.choices_of('model'))}。")
-    if name not in choices:
-        return _say("model", f"官方只认：{' / '.join(sorted(choices))}。")
-    old = st.get("model")
+        return _say("model", "\n".join([
+            f"现在用「{cur['id']}」（{cur['label']}）：{llm.model_name()} @ {cur['base_url']}",
+            "接口档案：" + " / ".join(ids),
+            "换档案发 `/模型 <档案id>`；只改模型名直接发 `/模型 <模型名>`，撤销用 `/模型 默认`。",
+        ]))
+
+    # ① 命中档案 id → 换接口（base_url / 密钥一起换）
+    if name in ids:
+        if name == cur["id"]:
+            return _say("model", f"现在用的就是「{name}」：{llm.model_name()} @ {cur['base_url']}。")
+        # 覆盖是**针对某一家接口**设的，切档案时会被清掉（见 llm.set_active）——
+        # 回执里必须说明，否则"我设的模型名怎么没了"就是下一句追问。
+        had = str(st.get("model") or "").strip()
+        ok, why = llm.set_active(name)
+        if not ok:
+            return _deny("model", why)
+        new = llm.active()
+        key_note = "" if llm.api_key(new) else "（**这个档案还没配密钥**，配好之前调不通）"
+        over_note = f"，顺便清掉了模型名覆盖「{had}」" if had else ""
+        return _say("model", f"接口档案从「{cur['id']}」换成「{name}」了{over_note}："
+                             f"{new['base_url']} / {llm.model_name()}{key_note}，下一条消息就生效。")
+
+    # ② `/模型 默认` → 清掉覆盖，回到档案自带的模型名
+    if name in ("默认", "default", "auto", "-", "清空"):
+        st.set_value("model", "")
+        return _say("model", f"模型名覆盖清掉了，回到「{cur['id']}」档案自带的 {llm.model_name()}。")
+
+    # ③ 其余当模型名覆盖。**不校验名字**：换一家接口之后本地根本无从知道对方有哪些模型，
+    #    能验的只有"调得通"，所以回执里如实说清"名字对不对要看接口"。
+    old = llm.model_name()
     st.set_value("model", name)
-    return _say("model", f"对话模型从 {old} 换成 {name} 了，下一条消息就生效。")
+    return _say("model", f"模型名从 {old} 覆盖成 {name} 了（接口仍是「{cur['id']}」"
+                         f"{cur['base_url']}）。名字对不对以接口为准 —— 调不通就在「模型」页里改回去。")
 
 
 # ---- /昵称 · /头像 · /名片：改它自己的身份 ------------------------------
@@ -1233,7 +1266,7 @@ async def _cmd_help(rest: str, *, conv: str, is_master: bool, ctx: Any = None) -
         "· /搜索 <关键词> —— 手动联网查一次（也可直接问，我自己判断要不要查）",
         "· /模式 [日常|专注|安慰|自动] —— 换说话的场合态度（也可 /模式 看）",
         "· /对话 [结束] —— 看/结束当前的一对一对话（叫过我一次之后，接着聊不必每句都 @）",
-        "· /模型 [名字] —— 换模型（限主人）",
+        "· /模型 [档案id|模型名] —— 换接口档案或覆盖模型名（限主人）",
         "· /昵称 [新名字] —— 看/改我自己的 QQ 昵称（全局，限主人；聊天记录里也跟着换）",
         "· /头像 —— 把本条或引用的图当我的新头像（限主人）",
         "· /名片 [新名字|清] —— 改我在这一个群里的显示名（限主人，群里用）",

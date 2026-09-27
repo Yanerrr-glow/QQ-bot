@@ -627,6 +627,50 @@ def check_ports(env: dict[str, str]) -> None:
         say(OK, f"控制台端口 {port} 空闲", f"启动后访问 http://{host}:{port}/ai/")
 
 
+def model_profiles(root: Path, env: dict[str, str]) -> tuple[str, list[dict[str, object]]]:
+    """读 `data/models.json`，返回 `(当前档案 id, 档案列表)`。
+
+    **没有这个文件就按 `.env` 现推一个**：自检常常在第一次启动之前跑（那时还没有
+    档案文件），不能因为"文件不存在"就说模型没配。推出来的那个与 `llm.seeded()`
+    是同一份语义 —— 所以自检的结论与机器人真跑起来后的行为一致。
+    """
+    seed: dict[str, object] = {
+        "id": "deepseek",
+        "label": "DeepSeek 官方（按 .env 播种）",
+        "base_url": (env.get("DEEPSEEK_BASE_URL", "") or "").strip() or "https://api.deepseek.com",
+        "key": (env.get("DEEPSEEK_API_KEY", "") or "").strip(),
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model": (env.get("DEEPSEEK_MODEL", "") or "").strip() or "deepseek-flash",
+    }
+    raw_dir = (env.get("AI_CHAT_LOG_DIR", "") or "").strip() or "data"
+    data_dir = Path(raw_dir) if Path(raw_dir).is_absolute() else root / raw_dir
+    try:
+        data = json.loads((data_dir / "models.json").read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return "deepseek", [seed]
+    items = [it for it in (data.get("profiles") or []) if isinstance(it, dict)] \
+        if isinstance(data, dict) else []
+    if not items:
+        return "deepseek", [seed]
+
+    out: list[dict[str, object]] = []
+    for i, it in enumerate(items):
+        env_name = str(it.get("api_key_env") or "").strip()
+        key = str(it.get("api_key") or "").strip() or (env.get(env_name, "") or "").strip()
+        out.append({
+            "id": str(it.get("id") or f"p{i + 1}"),
+            "label": str(it.get("label") or it.get("id") or f"p{i + 1}"),
+            "base_url": str(it.get("base_url") or seed["base_url"]).rstrip("/"),
+            "key": key,
+            "api_key_env": env_name,
+            "model": str(it.get("model") or seed["model"]),
+        })
+    active = str((data or {}).get("active") or "").strip()
+    if active not in {str(p["id"]) for p in out}:
+        active = str(out[0]["id"])
+    return active, out
+
+
 def probe_model(base: str, key: str, model: str) -> tuple[bool, str]:
     """发一个最小请求，判断这个模型**能不能真用**。
 
@@ -659,40 +703,55 @@ def probe_model(base: str, key: str, model: str) -> tuple[bool, str]:
         return False, str(exc)[:140]
 
 
-def check_online(env: dict[str, str], offline: bool) -> None:
-    head("5. DeepSeek 连通性")
+def check_online(env: dict[str, str], offline: bool, root: Path) -> None:
+    head("5. 模型接口连通性")
     if offline:
         say(INFO, "已按 --offline 跳过")
         return
-    key = env.get("DEEPSEEK_API_KEY", "").strip()
-    base = env.get("DEEPSEEK_BASE_URL", "").strip() or "https://api.deepseek.com"
-    if not key:
-        say(INFO, "没 Key，跳过实测（先填 .env）")
+
+    active, items = model_profiles(root, env)
+    prof = next((p for p in items if p["id"] == active), items[0])
+    base = str(prof["base_url"])
+    key = str(prof["key"])
+    model = str(prof["model"])
+    if len(items) > 1:
+        say(INFO, f"当前档案「{active}」（共 {len(items)} 个）",
+            "控制台「模型」页 / /模型 指令可以随时切换")
+    # 本机端点通常不校验密钥，不该因为"没配 key"就被判成不可用
+    local = any(t in base.lower() for t in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+    if not key and not local:
+        say(INFO, f"档案「{active}」没配密钥，跳过实测",
+            f"填好 {prof['api_key_env'] or '密钥'} 后重跑（接口 {base}）")
         return
 
+    # ① 先问 /models：顺手能列出对方有哪些模型，人看了好挑
     req = urllib.request.Request(f"{base.rstrip('/')}/models",
                                  headers={"Authorization": f"Bearer {key}"})
+    ids: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))
         ids = [str(d.get("id", "")) for d in (payload.get("data") or [])]
-        say(OK, f"Key 有效，可用模型 {len(ids)} 个", ", ".join(ids[:6]))
-        model = env.get("DEEPSEEK_MODEL", "").strip() or "deepseek-flash"
-        if model in ids:
-            say(OK, f"配置的模型可用：{model}")
-        else:
-            # 不在列表里 ≠ 不能用 —— 实测一次再下结论。
-            ok, why = probe_model(base, key, model)
-            if ok:
-                say(OK, f"配置的模型可用：{model}", "不在 /models 列表里，但实测调得通（兼容别名）")
-            else:
-                say(BLOCK, f"配置的模型 {model} 调不通",
-                    f"{why} —— 改 .env 的 DEEPSEEK_MODEL，或用 /模型 切换")
+        say(OK, f"接口通了（{base}），/models 列出 {len(ids)} 个模型", ", ".join(ids[:6]))
     except urllib.error.HTTPError as exc:
-        reason = {401: "Key 无效", 402: "余额不足", 403: "无权限", 404: "地址不对"}.get(exc.code, f"HTTP {exc.code}")
-        say(BLOCK, f"Key 实测失败：{reason}", "检查 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL")
+        if exc.code in (401, 402, 403):
+            reason = {401: "密钥无效", 402: "余额不足", 403: "无权限"}[exc.code]
+            say(BLOCK, f"接口拒绝：{reason}", f"检查档案「{active}」的密钥（{base}）")
+            return
+        # 404/405 很常见：自建与中转端点不一定实现 /models。这不是错，接着实测对话。
+        say(INFO, f"/models 不可用（HTTP {exc.code}）", "很多自建/中转端点没实现它 —— 直接实测对话")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        say(BLOCK, f"连不上 {base}", f"{exc} —— 检查网络或代理")
+        say(BLOCK, f"连不上 {base}", f"{exc} —— 检查网络/代理，或档案里写的 base_url")
+        return
+
+    # ② 再实测一次对话：**列表里有也不代表这个模型名能用**（反之亦然）
+    ok, why = probe_model(base, key, model)
+    if ok:
+        note = "不在 /models 列表里，但实测调得通（兼容别名很常见）" if ids and model not in ids else ""
+        say(OK, f"模型可用：{model}", note)
+    else:
+        say(BLOCK, f"模型 {model} 调不通",
+            f"{why} —— 在控制台「模型」页改这个档案，或用 /模型 切换")
 
 
 def check_code(root: Path, python_cmd: list[str] | None, deep: bool) -> None:
@@ -728,9 +787,15 @@ def check_code(root: Path, python_cmd: list[str] | None, deep: bool) -> None:
 def print_summary(root: Path, env: dict[str, str], overrides: dict[str, object]) -> tuple[int, int]:
     head("配置摘要（当前生效值；控制台改过的以控制台为准）")
     master, master_from = effective(root, env, "master_qq", "AI_CHAT_MASTER_QQ", overrides)
-    model, model_from = effective(root, env, "model", "DEEPSEEK_MODEL", overrides)
+    active, items = model_profiles(root, env)
+    prof = next((p for p in items if p["id"] == active), items[0])
+    override, override_from = effective(root, env, "model", "DEEPSEEK_MODEL", overrides)
+    model_show = (f"{override}（{override_from} 覆盖）" if override
+                  else f"{prof['model']}（档案「{active}」）")
     rows = [
-        ("模型", (model or "deepseek-flash") + (f"（{model_from}）" if model_from else "")),
+        ("模型", f"{model_show} @ {prof['base_url']}"),
+        ("接口档案", f"{len(items)} 个（{'／'.join(str(p['id']) for p in items[:5])}）"
+                     "，控制台「模型」页可切换"),
         ("机器人名", env.get("AI_CHAT_BOT_NAME", "") or "（未填）"),
         ("主人 QQ", (master + f"（{master_from}）") if master else "（未配置：限主人功能全关）"),
         ("触发", "只靠 @ 与唤醒词" if not env.get("AI_CHAT_PREFIX") else f"前缀 {env['AI_CHAT_PREFIX']}"),
@@ -831,12 +896,12 @@ def main() -> int:
 
     if has_env:
         check_ports(env)
-        check_online(env, args.offline)
+        check_online(env, args.offline, root)
     else:
         # 不静默跳过：段号直接消失会让人以为工具漏跑了。
         head("4. 端口与 NapCat")
         say(INFO, "跳过 —— 要先有 .env（探哪个地址由它决定）")
-        head("5. DeepSeek 连通性")
+        head("5. 模型接口连通性")
         say(INFO, "跳过 —— 要先有 .env 里的 Key")
 
     python_cmd = [str(venv_py)] if venv_py.is_file() else None

@@ -42,11 +42,19 @@ class Spec:
 
 _SPECS: list[Spec] = [
     # ---------------------------------------------------------- 基础
-    Spec("model", str, "deepseek_model", "deepseek-flash", "对话模型", "基础",
-         choices=("deepseek-flash", "deepseek-v4-pro", "deepseek-chat"),
-         hint="`/models` 只列前两个（都带推理，会多花一些 token）；**deepseek-chat 仍然能用**，"
-              "只是没被列出 —— 实测调用与 logprobs 都正常，属未公开的兼容别名。"
-              "判断能不能用要看调得通不通，别只看列表"),
+    # **留空 = 用「模型」页当前档案里写好的那个模型名**；填了才覆盖它。
+    # 保留这个键是为了兼容：改造前所有调用点读的都是 `settings.get("model")`
+    # （那时它既表示模型名、又隐含了接口），老 `data/settings.json` 里也存着它。
+    # 现在**接口/密钥归档案管，这里只管名字** —— 这也是能随时换一家 API 的前提。
+    #
+    # ⚠ `env_name` 故意留空（与下面 `bot_name` 同一个道理）：`.env` 的 `DEEPSEEK_MODEL`
+    # 已经由 `config.MODEL` 读去播种 `deepseek` 档案了。若这里同名再读一遍，
+    # 它就会**同时**变成一个全局覆盖值 —— 于是切到别的档案时模型名压根不变，
+    # "换了接口没换模型"就是这么来的（实测踩过）。
+    Spec("model", str, "", "", "对话模型覆盖", "基础",
+         hint="留空就用「模型」页当前档案自带的模型名。填了只覆盖**名字**，接口与密钥仍由档案决定；"
+              "切档案时这个覆盖会被清掉。写对写错以调得通为准：有些不公开的别名"
+              "（如 deepseek-chat）不在 /models 列表里但照样能用"),
     Spec("master_qq", int, "ai_chat_master_qq", 100000001, "主人的 QQ 号", "基础",
          hint="只有这个人被当作「主人」；其他人不归类，按聊天记录里的名字认就行"),
     Spec("master_title", str, "ai_chat_master_title", "主人", "对主人的称呼", "基础"),

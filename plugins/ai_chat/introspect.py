@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any
 
-from . import clock, config, memory, persona, settings, state
+from . import clock, config, llm, memory, persona, settings, state
 
 logger = logging.getLogger("ai_chat.introspect")
 
@@ -292,13 +292,12 @@ def _safety_facts(conv: str, is_master: bool) -> str:
         )
 
     lines += [
-        # **必须读 settings，不能读 config.MODEL**：对话实际调用走的是
-        # `settings.get("model")`（见 __init__ / attention / proactive 等 8 处），
-        # 而 `config.MODEL` 只是 .env 的初始值。控制台一旦覆盖过 `model`，
-        # 用 config.MODEL 自述就会出现「它说的模型和实际用的不是一个」——
-        # 这正是 5.6.8 想根治的那类"问到机制只能编"。
-        f"· 对话模型：{settings.get('model')}",
-        f"· 接口密钥：{'已配置' if config.API_KEY else '**没配置**'}（内容不会出现在任何回复里）",
+        # **必须读 llm 而不是 config.MODEL**：对话实际调用走的是 `llm.chat`，
+        # 用哪个模型由「当前档案 + `settings.model` 覆盖」一起决定，而 `config.MODEL`
+        # 只是 .env 的初始值。控制台换过档案/覆盖过模型名之后，读 config 自述就会出现
+        # 「它说的模型和实际用的不是一个」—— 这正是 5.6.8 想根治的那类"问到机制只能编"。
+        f"· 对话模型：{llm.model_name()}（走「{llm.active_id()}」这个接口档案）",
+        f"· 接口密钥：{'已配置' if llm.api_key() else '**没配置**'}（内容不会出现在任何回复里）",
         f"· 聊天记录落在 {config.LOG_DIR} 下的 chatlog_*.json，按会话分文件",
         f"· 记忆落在 {_memory_location()}，会话图片策略落在 "
         f"{config.LOG_DIR / 'conv_state.json'}"

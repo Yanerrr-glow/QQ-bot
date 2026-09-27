@@ -271,6 +271,24 @@ class _AsyncOpenAI:
 
 _openai.AsyncOpenAI = _AsyncOpenAI
 
+
+# ---- 假模型：打桩点收敛成了一处 ----
+# 改造前十个模块各自建 `_client`，桩得逐个替换；现在调用统一走 `llm.chat`，
+# 所以只替换这一个函数就够了（`pkg.llm` 是包内 `from . import llm` 暴露的属性）。
+def _patch_chat(fake):
+    """把 `llm.chat` 换成假实现，返回原函数供还原。`fake` 与原 `_fake_create` 同形：收 kwargs。"""
+    orig = pkg.llm.chat
+
+    async def _fake_chat(messages, *, profile=None, model=None, **kw):
+        return await fake(messages=messages, **kw)
+
+    pkg.llm.chat = _fake_chat  # type: ignore[assignment]
+    return orig
+
+
+def _unpatch_chat(orig) -> None:
+    pkg.llm.chat = orig  # type: ignore[assignment]
+
 _fastapi = types.ModuleType("fastapi")
 
 
@@ -1648,14 +1666,11 @@ async def _pick_probe(answer: str, *, raise_exc: bool = False, context: str = "�
             choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=answer))]
         )
 
-    _orig = stickers._client  # noqa: SLF001
-    stickers._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_fake_create))
-    )
+    _orig = _patch_chat(_fake_create)
     try:
         return await stickers.pick_for_context(context, conv="g1")
     finally:
-        stickers._client = _orig  # type: ignore[assignment]
+        _unpatch_chat(_orig)
 
 
 # 库必须是**真的非空**才能验这一段 —— 所以在临时目录里放一张图再测，不依赖别的用例。
@@ -2590,10 +2605,7 @@ try:
             msg = types.SimpleNamespace(content="哦，鲸落就是鲸鱼死后沉到海底那回事。", tool_calls=[])
         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
 
-    _orig_client = pkg._client  # noqa: SLF001
-    pkg._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_fake_create_tools))
-    )
+    _orig_chat = _patch_chat(_fake_create_tools)
     # 这一节只验**工具循环**本身。释义沉淀会额外发一次模型请求（把结果压成一句），
     # 那会打乱"几次请求"的计数，所以在这里替换成空操作 —— 它有自己的用例。
     _orig_remember = pkg._remember_definition  # noqa: SLF001
@@ -2618,7 +2630,7 @@ try:
         check("tool 结果里是不可信声明过的搜索块",
               "不是谁对你说的话" in _tool_msgs[0]["content"], _tool_msgs[0]["content"][:90])
     finally:
-        pkg._client = _orig_client  # type: ignore[assignment]
+        _unpatch_chat(_orig_chat)
         pkg._remember_definition = _orig_remember  # type: ignore[assignment]
     _loop_calls.clear()
 
@@ -2629,10 +2641,7 @@ try:
             message=types.SimpleNamespace(content="", tool_calls=[_FakeToolCall(9, "翻来覆去搜")])
         )])
 
-    _orig_client2 = pkg._client  # noqa: SLF001
-    pkg._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_always_tool))
-    )
+    _orig_chat2 = _patch_chat(_always_tool)
     _search._recent.clear()  # noqa: SLF001
     settings.set_value("search_max_per_message", 1)
     try:
@@ -2643,7 +2652,7 @@ try:
         check("模型一直要搜时不会死循环", isinstance(_ans2, str))
         check("单条消息的搜索次数被硬性限住", len(_q2) <= 1, str(_q2))
     finally:
-        pkg._client = _orig_client2  # type: ignore[assignment]
+        _unpatch_chat(_orig_chat2)
         settings.set_value("search_max_per_message", 2)
 
     # 工具调用直接报错（端点不支持）→ 退回普通问答而不是整条回复失败
@@ -2654,10 +2663,7 @@ try:
         return types.SimpleNamespace(choices=[types.SimpleNamespace(
             message=types.SimpleNamespace(content="普通回答", tool_calls=[]))])
 
-    _orig_client3 = pkg._client  # noqa: SLF001
-    pkg._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_tools_rejected))
-    )
+    _orig_chat3 = _patch_chat(_tools_rejected)
     _search._recent.clear()  # noqa: SLF001
     try:
         _ans3, _q3 = asyncio.run(pkg._ask_with_tools(  # noqa: SLF001
@@ -2666,7 +2672,7 @@ try:
         ))
         check("工具不被支持时退回普通问答（不整条失败）", _ans3 == "普通回答", _ans3[:40])
     finally:
-        pkg._client = _orig_client3  # type: ignore[assignment]
+        _unpatch_chat(_orig_chat3)
 
     # ---- 24.13 本地兜底预取 ----
     _search._recent.clear()  # noqa: SLF001
@@ -2683,9 +2689,7 @@ try:
     # ---- 24.14 端到端：普通回复路径上真的会搜 ----
     _search._recent.clear()  # noqa: SLF001
     _loop_calls.clear()
-    pkg._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_fake_create_tools))
-    )
+    _patch_chat(_fake_create_tools)
     _bot_search = _FakeBot()
     try:
         asyncio.run(pkg._reply(_bot_search, _make_event("@鲸鱼娘 鲸落是啥"), "addressed"))  # noqa: SLF001
@@ -2694,15 +2698,13 @@ try:
         check("回复里带上了「查过了」的说明",
               settings.get("search_note_prefix") in _sent_text, _sent_text[:60])
     finally:
-        pkg._client = _orig_client  # type: ignore[assignment]
+        _unpatch_chat(_orig_chat)
 
     # ---- 24.15 关掉搜索后工具不再提供（免得它假装搜过）----
     settings.set_value("search_enabled", False)
     _search._recent.clear()  # noqa: SLF001
     _loop_calls.clear()
-    pkg._client = types.SimpleNamespace(  # type: ignore[assignment]
-        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_fake_create_tools))
-    )
+    _patch_chat(_fake_create_tools)
     try:
         asyncio.run(pkg._ask_with_tools(  # noqa: SLF001
             [{"role": "system", "content": "人设"}, {"role": "user", "content": "鲸落是啥"}],
@@ -2712,7 +2714,7 @@ try:
         check("关掉搜索后也不注入工具说明",
               "联网搜索" not in _loop_calls[0]["messages"][0]["content"])
     finally:
-        pkg._client = _orig_client  # type: ignore[assignment]
+        _unpatch_chat(_orig_chat)
 
     # ---- 24.16 Tavily 后端（国内服务器上唯一实测可达的路子）----
     # 它跟 searxng 有三点根本不同，都得验：① 走 POST ② 密钥在请求体里 ③ 不填端点也能用
@@ -3122,11 +3124,11 @@ try:
           _sm.is_definition_query(_stripped) is False)
     check("对用户原话判定为 True", _sm.is_definition_query("鲸落 是什么") is True)
 
-    # 造一个假 summarizer 与假 client，走 _remember_definition 真路径
+    # 造一个假 summarizer，走 _remember_definition 真路径（client 现在由 llm 统一持有）
     _sm._orig_summarize = _sm.summarize  # noqa: SLF001
     _calls_seen = []
 
-    async def _fake_summarize(q, res, client):
+    async def _fake_summarize(q, res):
         _calls_seen.append(q)
         return "鲸鱼死后沉入深海形成的生态系统。"
 
@@ -3215,7 +3217,7 @@ try:
     _sm._orig_summarize = _sm.summarize  # noqa: SLF001
     _searched: list[str] = []
 
-    async def _fake_summarize(q, res, client):
+    async def _fake_summarize(q, res):
         return "鲸鱼死后沉入深海形成的生态系统。"
 
     async def _fake_search(q):
@@ -4740,6 +4742,181 @@ finally:
     settings.store.save()  # noqa: SLF001
     config.LOG_DIR = _old_logdir_id  # type: ignore[misc]
     shutil.rmtree(_id_dir, ignore_errors=True)
+
+# =====================================================================
+print("\n=== 34. 模型档案：换一家接口不该要重启，更不该改代码 ===")
+# 这一节验机制本身：按 .env 播种、选中、模型名覆盖、能力标记真的会改变请求、
+# 以及**密钥只能以掩码出现**（编辑框 / 快照 / 自检里都不许有明文）。
+_llm = pkg.llm  # noqa: SLF001
+_llm_dir = TMP / "llm_profiles"
+_llm_dir.mkdir(parents=True, exist_ok=True)
+_old_logdir_llm = config.LOG_DIR  # noqa: SLF001
+config.LOG_DIR = _llm_dir  # type: ignore[misc]
+_old_model_setting = settings.get("model")
+
+try:
+    # ---- 34.1 没有档案文件时，按 .env 播种（老部署零改动）----
+    check("没有 models.json 时按 .env 播种一个档案",
+          (not _llm.path().exists()) and _llm.active_id() == "deepseek", str(_llm.path()))
+    _seed = _llm.active()
+    check("播种档案的接口与密钥来源都取自 .env",
+          _seed["base_url"] == config.BASE_URL and _seed["api_key_env"] == "DEEPSEEK_API_KEY",
+          f"{_seed['base_url']} / {_seed['api_key_env']}")
+    check("只读一遍不会往盘上写文件（正常聊天不该产生垃圾）", not _llm.path().exists())
+    # 密钥**不许**被抄进档案 json（这个文件比 .env 更容易被顺手同步出去）：
+    # 播种档案只留变量名，真值由 api_key() 去 os.environ / .env 取。
+    _old_env_key = os.environ.get("DEEPSEEK_API_KEY")
+    os.environ["DEEPSEEK_API_KEY"] = "sk-stubkey-123456"
+    try:
+        check("播种档案里没有明文密钥，只记了变量名",
+              _seed["api_key"] == "" and _seed["api_key_env"] == "DEEPSEEK_API_KEY",
+              f"api_key={_seed['api_key']!r} env={_seed['api_key_env']!r}")
+        check("但 api_key() 仍能从环境变量取到它",
+              _llm.api_key(_seed) == "sk-stubkey-123456", _llm.mask_key(_llm.api_key(_seed)))
+    finally:
+        if _old_env_key is None:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+        else:
+            os.environ["DEEPSEEK_API_KEY"] = _old_env_key
+
+    # ---- 34.2 生效模型名的两个来源 ----
+    settings.set_value("model", "")
+    check("覆盖留空 → 用档案里写的模型名",
+          _llm.model_name() == _seed["model"], f"{_llm.model_name()} vs {_seed['model']}")
+    settings.set_value("model", "别的名字")
+    check("覆盖有值 → 以覆盖为准（接口仍由档案决定）",
+          _llm.model_name() == "别的名字", _llm.model_name())
+    settings.set_value("model", "")
+
+    # ---- 34.3 加一家别的接口并切过去 ----
+    ok, why = _llm.set_active("不存在")
+    check("切到不存在的档案会被拒（不是静默没生效）", (not ok) and "没有这个档案" in why, why)
+    ok, why = _llm.upsert({"id": "local", "label": "本地端点", "base_url": "http://127.0.0.1:11434/v1/",
+                           "model": "qwen2.5:7b", "vision": False, "tools": False, "logprobs": False})
+    check("能新增一个档案", ok, why)
+    check("base_url 末尾的斜杠被规范化",
+          _llm.get("local")["base_url"] == "http://127.0.0.1:11434/v1",
+          _llm.get("local")["base_url"])
+    ok, why = _llm.set_active("local")
+    check("能切到新档案", ok and _llm.active_id() == "local", why)
+    check("切完生效的模型名跟着变（不用重启）", _llm.model_name() == "qwen2.5:7b", _llm.model_name())
+    check("能力标记跟着档案走",
+          _llm.caps() == {"vision": False, "tools": False, "logprobs": False}, str(_llm.caps()))
+    ok, why = _llm.upsert({"id": "坏 id'", "base_url": "http://x"})
+    check("档案 id 含引号/空格会被拒（它会进 onclick，必须限死字符集）", not ok, why)
+
+    # ---- 34.4 能力标记真的改变请求：不支持 tools 就不能带工具表 ----
+    _seen: list[dict] = []
+
+    async def _rec(**kw):  # noqa: ANN003, ANN202
+        _seen.append(kw)
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="ok"))])
+
+    _rec_client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_rec)))
+    _orig_client_fn = _llm.client
+    _llm.client = lambda profile=None: _rec_client  # type: ignore[assignment]
+    try:
+        asyncio.run(_llm.chat(messages=[{"role": "user", "content": "1"}], tools=[{"t": 1}]))
+        check("档案没标 tools → 请求里不带工具表（否则很多端点直接 400）",
+              bool(_seen) and "tools" not in _seen[0], str(list(_seen[0].keys())))
+        check("请求里的模型名取自档案", _seen[0].get("model") == "qwen2.5:7b",
+              str(_seen[0].get("model")))
+        _llm.upsert({"id": "local", "label": "本地端点", "model": "qwen2.5:7b",
+                     "base_url": "http://127.0.0.1:11434/v1", "tools": True})
+        asyncio.run(_llm.chat(messages=[{"role": "user", "content": "1"}], tools=[{"t": 1}]))
+        check("标了 tools 就照常带上", "tools" in _seen[1], str(list(_seen[1].keys())))
+    finally:
+        _llm.client = _orig_client_fn  # type: ignore[assignment]
+
+    # ---- 34.5 密钥：任何给出去的文本里都只能是掩码 ----
+    _llm.upsert({"id": "keytest", "base_url": "http://127.0.0.1:9/v1", "model": "m",
+                 "api_key": "sk-verysecret-1234567890"})
+    check("掩码是首尾可见、中间省略", _llm.mask_key("sk-verysecret-1234567890") == "sk-v…7890",
+          _llm.mask_key("sk-verysecret-1234567890"))
+    check("太短的密钥只报「已配置」", _llm.mask_key("sk-1234") == "已配置", _llm.mask_key("sk-1234"))
+    _ed = _llm.editor_text()
+    _snap = _llm.snapshot()
+    check("编辑框里没有密钥明文（显示成 ***）",
+          "sk-verysecret" not in _ed and "***" in _ed, _ed[-260:])
+    check("快照里没有密钥明文",
+          not any("sk-verysecret" in json.dumps(p, ensure_ascii=False) for p in _snap["profiles"]),
+          str([p.get("key_hint") for p in _snap["profiles"]]))
+    check("快照报出了每个档案的能力标记与密钥存在性",
+          all({"vision", "tools", "logprobs", "has_key"} <= set(p) for p in _snap["profiles"]))
+    ok, why = _llm.replace_all(json.loads(_ed))
+    check("把编辑框里的 *** 原样存回去，密钥不会被清掉",
+          ok and _llm.get("keytest")["api_key"] == "sk-verysecret-1234567890", why)
+
+    # ---- 34.6 整份替换的边界 ----
+    ok, why = _llm.replace_all({"active": "a", "profiles": [
+        {"id": "a", "base_url": "http://x"}, {"id": "a", "base_url": "http://y"}]})
+    check("重复的档案 id 会被拒", (not ok) and "重复" in why, why)
+    ok, why = _llm.replace_all({"active": "查无此人", "profiles": [{"id": "a", "base_url": "http://x"}]})
+    check("active 指向不存在的档案会被拒", (not ok) and "active" in why, why)
+    ok, _w = _llm.replace_all({"active": "a", "profiles": [{"id": "a", "base_url": "http://x"}]})
+    check("整份替换后播种档案被自动补回（保住「回到 .env 默认」的路）",
+          ok and any(p["id"] == "deepseek" for p in _llm.profiles()), _w)
+    ok, why = _llm.replace_all({"profiles": []})
+    check("空的 profiles 会被拒（不能把档案表清空）", not ok, why)
+
+    # ---- 34.7 删档案的两条硬规则 ----
+    _llm.upsert({"id": "tmpdel", "base_url": "http://x", "model": "m"})
+    ok, why = _llm.set_active("tmpdel")
+    check("切到待删档案", ok, why)
+    ok, why = _llm.del_profile("deepseek")
+    check("播种档案删不掉（它是回到 .env 默认唯一的路）", (not ok) and "不能删" in why, why)
+    ok, why = _llm.del_profile("tmpdel")
+    check("正在用的档案删不掉", (not ok) and "正在用" in why, why)
+    _llm.set_active("deepseek")
+    ok, why = _llm.del_profile("tmpdel")
+    check("切走之后就能删了", ok, why)
+    check("删完之后确实不在表里了", _llm.get("tmpdel") is None)
+
+    # ---- 34.8 探测：不通要说清哪一段不通，且绝不抛 ----
+    _llm.upsert({"id": "bad", "base_url": "http://127.0.0.1:9/v1", "model": "m", "api_key": "k"})
+    _got = asyncio.run(_llm.probe(_llm.get("bad")))
+    check("接口不通时 probe 返回 ok=False 而不是抛出来",
+          _got["ok"] is False and bool(_got["detail"]), str(_got)[:140])
+    _got2 = asyncio.run(_llm.probe({
+        "id": "nokey", "label": "x", "base_url": "https://api.example.com/v1", "model": "m",
+        "api_key": "", "api_key_env": "", "vision": False, "tools": False, "logprobs": False}))
+    check("远端端点没配密钥 → 直接说没配密钥，不发请求",
+          _got2["ok"] is False and "没配密钥" in _got2["detail"], _got2["detail"])
+    check("本机端点没密钥不算配置问题", _llm._looks_local("http://127.0.0.1:1/v1") is True  # noqa: SLF001
+          and _llm._looks_local("https://api.deepseek.com") is False)  # noqa: SLF001
+
+    # ---- 34.9 /模型：切档案 / 覆盖模型名 / 撤销覆盖 ----
+    _llm.upsert({"id": "local", "label": "本地端点", "base_url": "http://127.0.0.1:11434/v1",
+                 "model": "qwen2.5:7b"})
+    _llm.set_active("deepseek")
+    settings.set_value("model", "")
+    _act = asyncio.run(instructions.parse("/模型", conv="u1", is_master=True))
+    check("/模型 报出当前档案、模型与接口",
+          _act.handled and "deepseek" in _act.reply and "api.deepseek" in _act.reply, _act.reply[:130])
+    _act = asyncio.run(instructions.parse("/模型 local", conv="u1", is_master=True))
+    check("/模型 <档案id> 能切接口档案", _llm.active_id() == "local", _act.reply[:110])
+    _act = asyncio.run(instructions.parse("/模型 换个名字", conv="u1", is_master=True))
+    check("/模型 <模型名> 覆盖模型名",
+          settings.get("model") == "换个名字" and _llm.model_name() == "换个名字", _act.reply[:110])
+    _act = asyncio.run(instructions.parse("/模型 默认", conv="u1", is_master=True))
+    check("/模型 默认 撤销覆盖，回到档案自带的模型名",
+          settings.get("model") == "" and _llm.model_name() == _llm.active()["model"], _act.reply[:110])
+    # 覆盖是**针对某一家接口**设的：切档案时必须清掉，否则"换了接口模型名不变"
+    _llm.set_active("deepseek")
+    settings.set_value("model", "只对上一个档案有意义的名字")
+    _act = asyncio.run(instructions.parse("/模型 local", conv="u1", is_master=True))
+    check("切档案会清掉模型名覆盖，并且回执里说明了",
+          settings.get("model") == "" and "清掉了模型名覆盖" in _act.reply, _act.reply[:130])
+    check("清完之后生效的模型名是**新档案自带的**",
+          _llm.model_name() == _llm.active()["model"], _llm.model_name())
+    _act = asyncio.run(instructions.parse("/模型 local", conv="u1", is_master=False))
+    check("群友不能换模型", _act.handled and not _act.ok, _act.reply[:60])
+finally:
+    settings.set_value("model", _old_model_setting)
+    config.LOG_DIR = _old_logdir_llm  # type: ignore[misc]
+    shutil.rmtree(_llm_dir, ignore_errors=True)
 
 # --------------------------------------------------------------------- 收尾
 # **先把还开着的 sqlite 句柄关掉**：Windows 上句柄没释放时 `rmtree` 会失败，

@@ -22,13 +22,11 @@ from typing import Any
 
 from nonebot import get_bots
 from nonebot.adapters.onebot.v11 import MessageSegment
-from openai import AsyncOpenAI
 
-from . import chatlog, clock, config, context, mode, settings, stickers
+from . import chatlog, clock, config, context, llm, mode, settings, stickers
 
 logger = logging.getLogger("ai_chat.proactive")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 SKIP_TOKEN = "[SKIP]"
 _STATE_FILE = "proactive_state.json"
@@ -145,8 +143,7 @@ async def _compose(conv: str) -> str:
 
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 # 走统一组装：人设 + 运行时风格 + 时间 + 长期记忆都在里面。
                 # 主动发言最怕"像个复述上文的客服"，而长期记忆正好给了它
                 # "接着昨天那件事说一句"的素材。

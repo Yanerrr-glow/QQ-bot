@@ -73,8 +73,8 @@ async def extract_batch(lines: list[str], existing: str) -> dict:
     for attempt in range(2):
         try:
             resp = await asyncio.wait_for(
-                mem._client.chat.completions.create(
-                    model=_pkg.settings.get("model"),
+                # 走统一入口：用的是**控制台里当前选中的那个接口档案**（不再是 .env 那一份）
+                _pkg.llm.chat(
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
                     max_tokens=2000,

@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import clock, config, settings, untrusted
+from . import clock, config, llm, settings, untrusted
 
 logger = logging.getLogger("ai_chat.search_memory")
 
@@ -431,7 +431,7 @@ _SUMMARY_PROMPT = """下面是关于「{query}」的联网搜索摘录。请用�
 """
 
 
-async def summarize(query: str, results: list[dict[str, str]], client: Any) -> str:
+async def summarize(query: str, results: list[dict[str, str]]) -> str:
     """把搜索结果压成一句释义。失败返回空串（调用方就不入库）。"""
     if not results:
         return ""
@@ -440,8 +440,7 @@ async def summarize(query: str, results: list[dict[str, str]], client: Any) -> s
     )[:1500]
     try:
         resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[
                     {"role": "user", "content": _SUMMARY_PROMPT.format(query=query) + "\n\n" + blob}
                 ],

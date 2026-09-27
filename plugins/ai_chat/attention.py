@@ -55,13 +55,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import AsyncOpenAI
 
-from . import config, settings
+from . import config, llm, settings
 
 logger = logging.getLogger("ai_chat.attention")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 # 衰减模型的内置系数：不暴露成参数，够用且少几个旋钮。
 #
@@ -181,7 +179,7 @@ def _effective_threshold(item: _Focus) -> float:
 # ------------------------------------------------------------------ 相关性打分
 async def score_relevance(topic: str, text: str) -> float:
     """让模型给「这条发言跟当前话题的相关度」打分 0~1。失败按无关处理。"""
-    if not config.API_KEY:
+    if not llm.api_key():
         return 0.0
     prompt = (
         "下面是群里正在聊的话题，以及随后出现的一条新发言。\n"
@@ -196,8 +194,7 @@ async def score_relevance(topic: str, text: str) -> float:
     )
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 # 推理模型会先思考，max_tokens 给小了 content 会是空的

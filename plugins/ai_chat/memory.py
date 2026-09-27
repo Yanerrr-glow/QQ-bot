@@ -54,13 +54,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
 
-from . import clock, config, memstore, settings
+from . import clock, config, llm, memstore, settings
 
 logger = logging.getLogger("ai_chat.memory")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 _FILE = "memories.json"
 _MAX_TEXT = 300      # 事实一句话的上限。原来是 200 —— 实测最长才 63 字，200 是浪费
@@ -1209,8 +1207,7 @@ async def rewrite_angles(query: str) -> list[str]:
     )
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=120,
             ),
@@ -1608,8 +1605,7 @@ async def _extract(lines: list[str]) -> dict[str, Any]:
     )
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 max_tokens=800,
@@ -1834,7 +1830,7 @@ async def drain_extraction(conv: str, *, max_messages: int = 0, only_rolled: boo
     from . import chatlog  # 局部导入，避免循环依赖
 
     _db.ensure()
-    if not config.API_KEY or not settings.get("memory_enabled"):
+    if not llm.api_key() or not settings.get("memory_enabled"):
         return 0
     if not _budget_ok(1):
         return 0

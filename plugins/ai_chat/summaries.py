@@ -42,13 +42,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
 
-from . import chatlog, clock, config, settings
+from . import chatlog, clock, config, llm, settings
 
 logger = logging.getLogger("ai_chat.summaries")
 
-_client = AsyncOpenAI(api_key=config.API_KEY or "sk-not-configured", base_url=config.BASE_URL)
 
 _FILE = "session_summaries.json"
 _MAX_TEXT = 240        # 单条摘要上限（提示词里也要求 200 字以内）
@@ -203,8 +201,7 @@ async def _summarize(msgs: list[dict[str, Any]]) -> str:
     prompt = _SUMMARY_PROMPT.replace("{limit}", str(_MAX_TEXT)).replace("{lines}", lines)
     try:
         resp = await asyncio.wait_for(
-            _client.chat.completions.create(
-                model=settings.get("model"),
+            llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=500,
             ),
@@ -222,7 +219,7 @@ async def _summarize(msgs: list[dict[str, Any]]) -> str:
 
 async def summarize_session(conv: str, session: int) -> dict[str, Any] | None:
     """给指定会话轮次生成并保存摘要。返回条目或 None。"""
-    if not settings.get("summary_enabled") or not config.API_KEY:
+    if not settings.get("summary_enabled") or not llm.api_key():
         return None
     log = chatlog.get_log_sync(conv)
     if log is None:

@@ -117,12 +117,12 @@ print("配对 %d 组（每组 = 自己一句 + 随后群友一句）" % len(pair
 
 
 async def main() -> int:
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=config.API_KEY, base_url=config.BASE_URL)
+    # 接口与模型都取自**控制台当前选中的档案**：排查的必须是线上那套配置，
+    # 否则查出来的结论跟机器人实际行为对不上。
+    from plugins.ai_chat import llm
     total = wrong = 0
 
-    print("\n--- 归属判定 ---")
+    print("\n--- 归属判定 ---（档案 %s / 模型 %s）" % (llm.active_id(), llm.model_name()))
     for b, u in pairs:
         q = (
             "判断下面两句是「鲸鱼娘（也就是你自己）」说的，还是「群里的其他人」说的。"
@@ -132,8 +132,8 @@ async def main() -> int:
         # ⚠ 陷阱一：追加，不替换
         m = list(built) + [{"role": "user", "content": q}]
         try:
-            r = await client.chat.completions.create(
-                model=settings.get("model"), messages=m, stream=False,
+            r = await llm.chat(
+                messages=m, stream=False,
                 response_format={"type": "json_object"}, max_tokens=2000)
             d = json.loads(r.choices[0].message.content or "{}")
         except Exception as exc:  # noqa: BLE001
@@ -160,8 +160,7 @@ async def main() -> int:
               "只回答一个数字：这段记录里**你自己**一共发了几条消息？"):
         m = list(built) + [{"role": "user", "content": q}]
         try:
-            r = await client.chat.completions.create(
-                model=settings.get("model"), messages=m, stream=False, max_tokens=3000)
+            r = await llm.chat(messages=m, stream=False, max_tokens=3000)
             out = (r.choices[0].message.content or "").strip()
         except Exception as exc:  # noqa: BLE001
             out = "调用失败：%s" % exc

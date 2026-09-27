@@ -63,6 +63,37 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         raise AssertionError(label)
 
 
+
+
+# ---- 打桩点：十个模块各自的 `_client` 已收敛成 `llm.chat` 一处 ----
+_LLM_CHAT_ORIG = None
+
+
+def patch_chat(fake):
+    """把 `llm.chat` 换成假实现。`fake` 是带 `chat.completions.create` 的假客户端。
+
+    **可以反复调用**（每次换一个假回答），还原统一用 `unpatch_chat()` ——
+    原先的写法是逐次替换 `gr._client`、最后把最初那份存下来还原，
+    一旦中间哪次忘了存就会把假客户端留在模块里。这里把"最初那份"收进一个变量。
+    """
+    global _LLM_CHAT_ORIG
+    from plugins.ai_chat import llm
+    if _LLM_CHAT_ORIG is None:
+        _LLM_CHAT_ORIG = llm.chat
+
+    async def _fake_chat(messages, *, profile=None, model=None, **kw):  # noqa: ANN001, ANN003, ANN202
+        return await fake.chat.completions.create(messages=messages, **kw)
+
+    llm.chat = _fake_chat
+    return fake
+
+
+def unpatch_chat() -> None:
+    from plugins.ai_chat import llm
+    if _LLM_CHAT_ORIG is not None:
+        llm.chat = _LLM_CHAT_ORIG
+
+
 try:
     plugins = nonebot.load_plugins("plugins")
     names = [getattr(p, "name", "?") for p in plugins]
@@ -178,10 +209,20 @@ try:
     except KeyError:
         check("未知参数被拒绝", True)
     check("spec 表能驱动 UI", len(st.describe()) >= 4, f"{len(st.describe())} 个分组")
+    # 模型名的来源变了：`.env` 的 DEEPSEEK_MODEL 现在**只用来播种档案**，
+    # `settings.model` 退回"纯覆盖"（留空 = 用当前档案里写的那个）。
+    # 原先这里验的是"spec 覆盖生效"，那条机制由上面的 read_budget 覆盖着。
     check(
-        "模型项可热切换",
-        st.get("model") in ("deepseek-flash", "deepseek-v4-pro", "deepseek-chat"),
-        f"model={st.get('model')}（本项来自 init 传参，说明 spec 覆盖生效）",
+        "模型名不再是全局覆盖（留空 = 用当前档案自带的）",
+        st.get("model") == "",
+        f"model={st.get('model')!r}（.env 的 DEEPSEEK_MODEL 只用于播种档案）",
+    )
+    from plugins.ai_chat import llm as _llm_mod
+
+    check(
+        "模型名改由「档案」承担",
+        _llm_mod.model_name() == _llm_mod.active()["model"] == config.MODEL,
+        f"档案 {_llm_mod.active_id()} → {_llm_mod.model_name()}（config.MODEL={config.MODEL}）",
     )
 
     # ---------------------------------------------------------- 表情包库
@@ -961,26 +1002,29 @@ try:
             self.chat = _Chat(self)
 
     st.set_value("greet_max_chars", 200)
-    real_key = tcfg.API_KEY
-    real_client = gr._client
+    # 「有没有 Key」改造后看的是**当前档案**，不再是 config.API_KEY ——
+    # 所以造一个没密钥的档案来验兜底话术（否则只用本地端点的人永远拿不到问候）。
+    from plugins.ai_chat import llm as _llm_mod
 
-    tcfg.API_KEY = ""
+    _llm_mod.upsert({"id": "nokey", "label": "无密钥（验证用）", "base_url": "http://127.0.0.1:9/v1",
+                     "api_key": "", "api_key_env": "", "model": "m",
+                     "vision": False, "tools": False, "logprobs": False})
+    _llm_mod.set_active("nokey")
     fallback = asyncio.run(gr.compose("morning"))
-    check("没配 Key 时用内置话术（到点不能一个字都没有）", "早安" in fallback, fallback)
-    tcfg.API_KEY = real_key
+    check("档案没配 Key 时用内置话术（到点不能一个字都没有）", "早安" in fallback, fallback)
+    _llm_mod.set_active("deepseek")
 
-    fake = _FakeClient("早安主人~今天也要开开心心的呀。")
-    gr._client = fake
+    fake = patch_chat(_FakeClient("早安主人~今天也要开开心心的呀。"))
     got = asyncio.run(gr.compose("morning"))
     check("模型文案被采用", got.startswith("早安主人"), got)
 
     st.set_value("greet_max_chars", 20)  # spec 允许的最小值，也算边界
-    gr._client = _FakeClient("早安主人~" * 30)
+    patch_chat(_FakeClient("早安主人~" * 30))
     got = asyncio.run(gr.compose("morning"))
     check("超长问候按 greet_max_chars 截断", len(got) == 20, f"{len(got)} 字符")
     st.set_value("greet_max_chars", 200)
 
-    gr._client = _FakeClient("")
+    patch_chat(_FakeClient(""))
     got = asyncio.run(gr.compose("noon"))
     check("模型返回空则退回兜底话术", "午安" in got, got)
 
@@ -1061,7 +1105,7 @@ try:
     st.set_value("greet_allow_skip", False)
     st.set_value("greet_window", 90)
     _clear_greet()
-    gr._client = _FakeClient("早安主人，今天也一起加油~")
+    patch_chat(_FakeClient("早安主人，今天也一起加油~"))
 
     check("问候发出", asyncio.run(gr.greet("morning")) and bool(bot.private), str(bot.private))
     check("发出后记为今天已发", gr._state.sent_today("morning", today))
@@ -1080,13 +1124,13 @@ try:
     # 允许跳过时，模型回 [SKIP] 就真的不发；但仍记成已处理，免得每 30 秒再问一次模型
     _clear_greet()
     st.set_value("greet_allow_skip", True)
-    gr._client = _FakeClient("[SKIP]")
+    patch_chat(_FakeClient("[SKIP]"))
     check("允许跳过时模型可以拒发", not asyncio.run(gr.greet("noon")))
     check("拒发也记成今天已处理", gr._state.sent_today("noon", today))
     st.set_value("greet_allow_skip", False)
 
     # 收尾：别把打桩留在模块里，也别把开关留给真环境
-    gr._client = real_client
+    unpatch_chat()
     gr.get_bots = real_get_bots  # type: ignore[assignment]
     st.set_value("greet_enabled", False)
     st.set_value("greet_group", 0)
