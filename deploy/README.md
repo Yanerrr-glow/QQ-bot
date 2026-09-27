@@ -454,6 +454,56 @@ AI_CHAT_SEARCH_ENDPOINT=http://searxng:8080     # 容器名，不是 127.0.0.1
 
 ---
 
+## 6.7 定时开关：夜里关、早上开（**只动 bot**）
+
+不想让它 24 小时挂机（省 token、夜里安静、也不必让 QQ 一直在线）就用
+`deploy/bot-schedule.sh` —— **它的每一条 docker 命令都点名 `bot`**，绝不碰 NapCat，
+所以开关多少次都不影响扫码登录态。
+
+```bash
+cd /opt/qq-bot/deploy
+
+./bot-schedule.sh start                  # 起 bot（重建容器，顺手把重启策略恢复成 always）
+./bot-schedule.sh stop                   # 停 bot（并把重启策略改成 no，见下面第 1 条）
+./bot-schedule.sh restart                # 重开一次
+./bot-schedule.sh status                 # 容器 + 重启策略 + 定时器排期
+
+./bot-schedule.sh install 23:30 07:00    # 装/改定时器：每天 23:30 停、07:00 起（服务器本地时间）
+./bot-schedule.sh install - 07:00        # 只装早上启动，不装夜里停
+./bot-schedule.sh uninstall              # 卸掉定时器（容器本身不动）
+```
+
+它会在 `/etc/systemd/system/` 里装三个单元：
+
+| 单元 | 作用 |
+|---|---|
+| `qqbot-bot@.service` | 模板单元，`%i` 就是 `start` / `stop`，原样透给脚本 |
+| `qqbot-bot-off.timer` | 每天 `<关>` 跑 `stop` |
+| `qqbot-bot-on.timer` | 每天 `<开>` 跑 `start`（带 `Persistent=true`：错过了在开机后补跑） |
+
+看排期与日志：
+
+```bash
+systemctl list-timers | grep qqbot-bot
+journalctl -u 'qqbot-bot@*' -n 50
+```
+
+**两个真踩过的坑，脚本就是为它们才写成这样**：
+
+1. **重启策略是 `always`。** `docker compose stop` 之后容器不会自己回来，但**宿主重启
+   （Docker 守护进程重启）会把它带起来** —— "关了"其实没关住。所以 `stop` 顺手
+   `docker update --restart=no`，`start` 用 `up -d --force-recreate` 把 compose 里定义的
+   `always` 恢复回来。
+2. **`docker compose down`、或不点名服务名的 `restart`，会把 NapCat 一起带走。**
+   NapCat 的登录态虽然存在卷里（重建不用重新扫码），但每次重建都换设备特征，
+   是风控的诱因之一。这个脚本一条命令都不多碰。
+
+> 早上那次是 `--force-recreate`，即"全新进程" —— 这正是"重启"该有的样子。
+> 若你希望"已经在跑就别动它"，把 `cmd_start` 里的 `--force-recreate` 去掉即可，
+> 它就退化成"没起就起、起了不动"。
+
+---
+
 ## 7. 排错
 
 > 下面带 **【实测】** 的，都是第一次真实部署时踩到过的坑，不是推测。
