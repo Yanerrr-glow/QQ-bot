@@ -12,24 +12,33 @@
 | §4.2 微调后行为变化与向量投影强相关 | `run_round()` 出的基线分 + 历史 → 漂移曲线 |
 | §5 用向量预测候选的效果 | `shadow_evaluate()`：候选先测再给人看 |
 
-## 为什么没有照搬论文的"加权和"
+## 为什么没有照搬论文的"加权和"（这条**已被 API 侧的改动推翻**，留作记录）
 
-实测：DeepSeek 的 `top_logprobs` 里**除 top-1 以外几乎全是哨兵值 `-9999`**
+2026-09-26 实测：DeepSeek 的 `top_logprobs` 里**除 top-1 以外几乎全是哨兵值 `-9999`**
 （只有偶尔出现真实值，量级也是 -657 这种）。softmax 之后 top-1 压倒一切 ——
-**论文的加权和在这个 provider 上退化成 argmax**，多取 20 个 token 没有换来任何信息。
+当时结论是**论文的加权和在这个 provider 上退化成 argmax**。
 
-所以改成：**强制裁判只输出一个 0-100 整数 token**（`max_tokens=1`），
-精度靠**多次采样取均值**恢复（论文本来也是对 10 条 rollout 求平均）。
+**2026-09-28 复测：这条不再成立。** 同一个请求（`logprobs=True, top_logprobs=20,
+max_tokens=1`）现在返回 **20 个真实候选**：top-1 `-0.028`，其后 `-4.46`、`-5.58`……
+也就是说论文那套加权和**现在是可做的**。
+
+本模块仍用"多次采样取整数首 token 的均值"，理由与准确性无关：它**不依赖 logprobs 的稳定性**，
+而且已经过实测。要不要换成加权和，等真去校裁判（§B.2）时再一起定。
 
 ## 裁判模型的硬约束
 
 **只能用 `deepseek-chat`**：`deepseek-flash` / `deepseek-v4-pro` 是推理模型，
-`max_tokens=1` 时可见内容为空、也不返回 logprobs。实测：
+`max_tokens=1` 时可见内容为空、也不返回 logprobs。实测（2026-09-28 复测，结论不变）：
 
-| 模型 | 首个 token | top-20 里的整数 token |
+| 模型 | `max_tokens=1` 的首个 token | logprobs |
 |---|---|---|
-| `deepseek-chat` | `95`（整数 ✓） | 18~20 个 |
+| `deepseek-chat` | `42`（整数 ✓） | 20 个真实候选 ✓ |
 | `deepseek-flash` | 空 | 无 |
+| `deepseek-v4-pro` | 空 | 无 |
+
+> 注意 `deepseek-chat` **不在 `/models` 的返回列表里**（那一列只有 flash 与 v4-pro），
+> 但它**调用完全正常** —— 属未公开的兼容别名。所以判断"模型能不能用"要**看调得通不通**，
+> 不能只看列表（`_工具链/上手自检.py` 的模型检查就是这么做的）。
 
 ## 数据落在哪
 
@@ -80,8 +89,13 @@ def enabled() -> bool:
 
 
 def judge_model() -> str:
-    """裁判模型。默认 `deepseek-chat`，理由见模块头（推理模型给不出整数 token）。"""
-    return str(_sget("eval_judge_model", "deepseek-chat") or "deepseek-chat")
+    """裁判模型。默认取 Spec 表里的那个（只有 `deepseek-chat`），理由见模块头。
+
+    **从 `settings.choices_of` 取而不是在这里再写一遍字符串**：模型名一改名就会漂，
+    而这个位置最要命（裁判换了个给不出整数 token 的模型，分会静默变成空的）。
+    """
+    default = (settings.choices_of("eval_judge_model") or ("deepseek-chat",))[0]
+    return str(_sget("eval_judge_model", default) or default)
 
 
 def _rollouts() -> int:

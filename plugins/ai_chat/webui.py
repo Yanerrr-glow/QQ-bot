@@ -72,6 +72,20 @@ _HTML = """<!doctype html>
           margin-bottom:16px; }
   .card h2 { font-size:14px; margin:0 0 12px; color:var(--accent); font-weight:600; }
   .card h2 .count { color:var(--dim); font-weight:400; }
+  /* 参数页改成**折叠列表**：一行一个组（原来是 auto-fit 网格，一组占一个方块），
+     点标题才展开。`#settings` 用 id 选择器覆盖 `.grid` 的 grid。 */
+  #settings { display:flex; flex-direction:column; gap:10px; }
+  .card.acc { padding:0; margin-bottom:0; overflow:hidden; }
+  .acc-head { display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+              background:none; border:0; border-radius:0; padding:12px 16px; color:var(--fg);
+              font-size:14px; cursor:pointer; }
+  .acc-head:hover { background:rgba(255,255,255,.04); }
+  .acc-head .caret { color:var(--dim); font-size:11px; transition:transform .15s; }
+  .card.acc.open .acc-head .caret { transform:rotate(90deg); }
+  .acc-head .title { color:var(--accent); font-weight:600; }
+  .acc-head .meta { margin-left:auto; color:var(--dim); font-size:11px; }
+  .acc-body { display:none; padding:2px 16px 14px; border-top:1px solid var(--line); }
+  .card.acc.open .acc-body { display:block; }
   .row { display:flex; align-items:center; justify-content:space-between; gap:12px;
          padding:7px 0; border-bottom:1px dashed rgba(255,255,255,.05); }
   .row:last-child { border-bottom:0; }
@@ -135,10 +149,15 @@ _HTML = """<!doctype html>
       <button onclick="greet()">现在问候一次</button>
       <button onclick="resetAll()">全部恢复 .env 默认</button>
       <button onclick="load()">刷新</button>
+      <button onclick="accAll(true)">全部展开</button>
+      <button onclick="accAll(false)">全部收起</button>
     </div>
-    <div class="card">
-      <h2>时间校准 <span class="count">（宿主时钟漂了会连带把定时问候带到错误钟点）</span></h2>
-      <div id="timeCard"></div>
+    <div class="card acc open">
+      <button class="acc-head" onclick="toggleAcc(this)">
+        <span class="caret">▸</span><span class="title">时间校准</span>
+        <span class="meta">宿主时钟漂了会连带把定时问候带到错误钟点</span>
+      </button>
+      <div class="acc-body"><div id="timeCard"></div></div>
     </div>
     <div class="grid" id="settings"></div>
   </div>
@@ -237,10 +256,46 @@ function renderSettings(groups) {
   GROUPS = groups;
   const box = document.getElementById('settings');
   box.innerHTML = groups.map(g => `
-    <div class="card">
-      <h2>${g.group}</h2>
-      ${g.items.map(it => row(it)).join('')}
+    <div class="card acc" data-acc="${esc(g.group)}">
+      <button class="acc-head" onclick="toggleAcc(this)">
+        <span class="caret">▸</span><span class="title">${esc(g.group)}</span>
+        <span class="meta">${g.items.length} 项</span>
+      </button>
+      <div class="acc-body">${g.items.map(it => row(it)).join('')}</div>
     </div>`).join('');
+  applyAccState();
+}
+
+// 折叠状态记在浏览器本地（localStorage）：下次打开还是上次的样子。
+// 只影响这一页的显示 —— **接口与载荷完全不变**（/api/settings 的 key-value 形状照旧），
+// 所以控制台的任何调用方都不受影响。
+const ACC_KEY = 'qqbot.acc.v1';
+function accState() {
+  try { return JSON.parse(localStorage.getItem(ACC_KEY) || '{}'); } catch (e) { return {}; }
+}
+function toggleAcc(btn) {
+  const card = btn.closest('.card');
+  card.classList.toggle('open');
+  const name = card.dataset.acc;
+  if (name) {
+    const st = accState();
+    st[name] = card.classList.contains('open');
+    localStorage.setItem(ACC_KEY, JSON.stringify(st));
+  }
+}
+function applyAccState() {
+  const st = accState();
+  document.querySelectorAll('#settings .card.acc').forEach(c => {
+    if (c.dataset.acc) c.classList.toggle('open', !!st[c.dataset.acc]);
+  });
+}
+function accAll(open) {
+  const st = accState();
+  document.querySelectorAll('#settings .card.acc').forEach(c => {
+    c.classList.toggle('open', open);
+    if (c.dataset.acc) st[c.dataset.acc] = open;
+  });
+  localStorage.setItem(ACC_KEY, JSON.stringify(st));
 }
 
 function row(it) {

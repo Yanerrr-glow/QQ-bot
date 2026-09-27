@@ -44,8 +44,9 @@ _SPECS: list[Spec] = [
     # ---------------------------------------------------------- 基础
     Spec("model", str, "deepseek_model", "deepseek-flash", "对话模型", "基础",
          choices=("deepseek-flash", "deepseek-v4-pro", "deepseek-chat"),
-         hint="官方只认 deepseek-flash / deepseek-v4-pro；deepseek-chat 是兼容保留。"
-              "flash 和 v4-pro 都带推理，会多花一些 token"),
+         hint="`/models` 只列前两个（都带推理，会多花一些 token）；**deepseek-chat 仍然能用**，"
+              "只是没被列出 —— 实测调用与 logprobs 都正常，属未公开的兼容别名。"
+              "判断能不能用要看调得通不通，别只看列表"),
     Spec("master_qq", int, "ai_chat_master_qq", 100000001, "主人的 QQ 号", "基础",
          hint="只有这个人被当作「主人」；其他人不归类，按聊天记录里的名字认就行"),
     Spec("master_title", str, "ai_chat_master_title", "主人", "对主人的称呼", "基础"),
@@ -547,6 +548,19 @@ _SPECS: list[Spec] = [
 ]
 
 _SPEC_BY_KEY: dict[str, Spec] = {s.key: s for s in _SPECS}
+
+
+def choices_of(key: str) -> tuple[str, ...]:
+    """某个配置项的可选值。**模型名一类的东西只在这张 Spec 表里写一次。**
+
+    为什么要有这个函数：模型名原先散在四处（`config.MODEL` 的兜底、这张表的
+    `choices`、`/模型` 指令、人设评估台的裁判），API 一侧一改名就会漂 —— 实测已经漂过一次：
+    `/models` 现在只列 `deepseek-flash` / `deepseek-v4-pro`，而 `deepseek-chat`
+    **不在列表里**（但调用仍然正常，是未公开的兼容别名）。现在控制台的下拉、`/模型` 的
+    校验、评估台的裁判默认值都从这里取，只有一处要改。
+    """
+    spec = _SPEC_BY_KEY.get(key)
+    return tuple(getattr(spec, "choices", ()) or ()) if spec else ()
 
 
 def _settings_path() -> Path:

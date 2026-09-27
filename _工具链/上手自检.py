@@ -627,6 +627,38 @@ def check_ports(env: dict[str, str]) -> None:
         say(OK, f"控制台端口 {port} 空闲", f"启动后访问 http://{host}:{port}/ai/")
 
 
+def probe_model(base: str, key: str, model: str) -> tuple[bool, str]:
+    """发一个最小请求，判断这个模型**能不能真用**。
+
+    为什么不能只看 `/models` 列表：实测 `deepseek-chat` **不在列表里**（列表只有
+    `deepseek-flash` / `deepseek-v4-pro`），但调用完全正常 —— 它是未公开的兼容别名。
+    只看列表就会把用户一个能用的配置判成"模型不可用"，把人引去改一处本来没错的设置。
+    判据应该是"调得通吗"，代价是一个 `max_tokens=1` 的请求。
+    """
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "1"}],
+        "max_tokens": 1,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            json.loads(resp.read().decode("utf-8", "replace"))
+        return True, ""
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            err = json.loads(exc.read().decode("utf-8", "replace"))
+            detail = str(((err or {}).get("error") or {}).get("message") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        return False, (f"HTTP {exc.code} {detail}").strip()[:140]
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, str(exc)[:140]
+
+
 def check_online(env: dict[str, str], offline: bool) -> None:
     head("5. DeepSeek 连通性")
     if offline:
@@ -646,10 +678,16 @@ def check_online(env: dict[str, str], offline: bool) -> None:
         ids = [str(d.get("id", "")) for d in (payload.get("data") or [])]
         say(OK, f"Key 有效，可用模型 {len(ids)} 个", ", ".join(ids[:6]))
         model = env.get("DEEPSEEK_MODEL", "").strip() or "deepseek-flash"
-        if ids and model not in ids:
-            say(BLOCK, f"配置的模型 {model} 不在可用列表里", "改 .env 的 DEEPSEEK_MODEL，或用 /模型 切换")
-        elif ids:
+        if model in ids:
             say(OK, f"配置的模型可用：{model}")
+        else:
+            # 不在列表里 ≠ 不能用 —— 实测一次再下结论。
+            ok, why = probe_model(base, key, model)
+            if ok:
+                say(OK, f"配置的模型可用：{model}", "不在 /models 列表里，但实测调得通（兼容别名）")
+            else:
+                say(BLOCK, f"配置的模型 {model} 调不通",
+                    f"{why} —— 改 .env 的 DEEPSEEK_MODEL，或用 /模型 切换")
     except urllib.error.HTTPError as exc:
         reason = {401: "Key 无效", 402: "余额不足", 403: "无权限", 404: "地址不对"}.get(exc.code, f"HTTP {exc.code}")
         say(BLOCK, f"Key 实测失败：{reason}", "检查 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL")

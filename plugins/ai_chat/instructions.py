@@ -1096,12 +1096,14 @@ async def _cmd_model(rest: str, *, conv: str, is_master: bool, ctx: Any = None) 
     if not is_master:
         return _deny("model", "换模型只有主人能做。")
     name = _norm(rest)
-    if not name:
-        # 同 introspect：读 settings 而不是 config.MODEL，否则控制台改过模型后自述会不准
-        return _say("model", f"当前用的是 {settings.get('model')}。可用：deepseek-flash / deepseek-v4-pro / deepseek-chat。")
     from . import settings as st
 
-    choices = {s for s in ("deepseek-flash", "deepseek-v4-pro", "deepseek-chat")}
+    # **模型名只从 Spec 表取一处**（见 `settings.choices_of`）：原先这里又写了一份，
+    # API 一侧改名就会和应用/控制台漂开。
+    choices = set(st.choices_of("model")) or {"deepseek-flash"}
+    if not name:
+        # 同 introspect：读 settings 而不是 config.MODEL，否则控制台改过模型后自述会不准
+        return _say("model", f"当前用的是 {st.get('model')}。可用：{' / '.join(st.choices_of('model'))}。")
     if name not in choices:
         return _say("model", f"官方只认：{' / '.join(sorted(choices))}。")
     old = st.get("model")

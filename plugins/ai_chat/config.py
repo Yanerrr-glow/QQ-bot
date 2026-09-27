@@ -50,7 +50,10 @@ def _as_float(value: object, default: float) -> float:
 # ---------------------------------------------------------------- 模型
 API_KEY: str = getattr(_cfg, "deepseek_api_key", "") or ""
 BASE_URL: str = getattr(_cfg, "deepseek_base_url", "https://api.deepseek.com")
-MODEL: str = getattr(_cfg, "deepseek_model", "deepseek-chat")
+# 兜底值跟 `.env.example` 与 `settings.py` 的 Spec 默认值保持一致（都是 deepseek-flash）。
+# 原来这里写的是 `deepseek-chat` —— 那是旧名，现在**不在 `/models` 列表里**（虽然仍可调用），
+# .env 没写这一项时会静默用一个未公开的别名，三处默认值互相不一致也容易被误读。
+MODEL: str = getattr(_cfg, "deepseek_model", "deepseek-flash")
 TIMEOUT: float = _as_float(getattr(_cfg, "ai_chat_timeout", 60), 60.0)
 MAX_CONCURRENCY: int = _as_int(getattr(_cfg, "ai_chat_max_concurrency", 4), 4)
 
