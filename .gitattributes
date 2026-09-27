@@ -8,6 +8,11 @@
 # `text=auto` 让 git 自己判断哪些是文本，`eol=lf` 强制检出也用 LF。
 * text=auto eol=lf
 
+# **批处理必须是 CRLF**：cmd.exe 解析 LF 行尾的 .bat/.cmd 时，多行 `if (...)` 块会出错。
+# 这是上面那行的例外，别删 —— 删了 `start-bot.cmd` 就会在别人机器上莫名其妙地不工作。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # 二进制：别做任何转换（这些不进仓库，写在这里是留给以后）
 *.exe  binary
 *.png  binary
