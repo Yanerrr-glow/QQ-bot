@@ -24,6 +24,43 @@ logger = logging.getLogger("ai_chat.config")
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _migrate_data_layout(legacy: Path, runtime: Path) -> None:
+    """把旧的平铺 data/ 幂等迁到 data/runtime/；遇到同名冲突就停止启动。"""
+    if not legacy.is_dir():
+        return
+    runtime.mkdir(parents=True, exist_ok=True)
+    destinations = {
+        "persona_surface.txt": runtime / "persona" / "surface.txt",
+        "persona_changelog.json": runtime / "persona" / "changelog.json",
+        "persona_candidates.json": runtime / "persona" / "candidates.json",
+        "persona_signals.json": runtime / "persona" / "signals.json",
+        "persona_eval.json": runtime / "persona" / "eval.json",
+        "bot.log": runtime / "logs" / "bot.log",
+    }
+    pending: list[tuple[Path, Path]] = []
+    conflicts: list[str] = []
+    for source in legacy.iterdir():
+        if source.resolve() == runtime.resolve():
+            continue
+        target = destinations.get(source.name, runtime / source.name)
+        if target.exists() and source.name == "bot.log":
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            target = target.with_name(f"bot_legacy_{stamp}.log")
+        if target.exists():
+            conflicts.append(f"{source.name} -> {target.relative_to(runtime)}")
+            continue
+        pending.append((source, target))
+    if conflicts:
+        message = "旧 data/ 与 data/runtime/ 存在同名数据，未覆盖任何文件：" + "; ".join(conflicts)
+        logger.error(message)
+        raise RuntimeError(message)
+    for source, target in pending:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+    if pending:
+        logger.info("旧运行数据已迁移到 data/runtime/（%d 项）", len(pending))
+
+
 def _as_bool(value: object, default: bool) -> bool:
     """NoneBot2 从 .env 读到的可能是字符串，统一成 bool。"""
     if value is None or value == "":
@@ -104,15 +141,21 @@ def _persona_path(configured: str) -> Path:
 
 
 def _data_dir() -> Path:
-    """运行时数据目录（`data/`，容器里是挂载卷）。
+    """运行时数据目录（`data/runtime/`，容器里位于持久化 data 卷中）。
 
     **为什么单独抽一个函数**：`LOG_DIR` 在文件后半段才定义，而表层人设的路径
     必须在 `SYSTEM_PROMPT = compose_prompt()`（模块导入期就会执行）之前可用 ——
     否则导入时就 `NameError`（实测踩过）。`LOG_DIR` 也复用它，避免两处各算一遍。
     """
     configured = getattr(_cfg, "ai_chat_log_dir", "") or ""
-    path = Path(configured) if configured else _ROOT / "data"
-    return path if path.is_absolute() else _ROOT / path
+    legacy = _ROOT / "data"
+    runtime = legacy / "runtime"
+    path = Path(configured) if configured else runtime
+    path = path if path.is_absolute() else _ROOT / path
+    if path.resolve() in (legacy.resolve(), runtime.resolve()):
+        _migrate_data_layout(legacy, runtime)
+        return runtime
+    return path
 
 
 def bot_name() -> str:
@@ -134,19 +177,23 @@ def bot_name() -> str:
 
 
 def surface_file_path() -> Path:
-    """表层人设的**读写路径**：`data/persona_surface.txt`（卷内，跨重建保留）。
+    """表层人设的**读写路径**：`data/runtime/persona/surface.txt`（卷内持久化）。
 
     改这个函数就等于改了"自我学习存在哪"，所以 `persona.py` 的写入与
     `/人设` 的显示都走它，不各自拼路径。
     """
-    if not _SURFACE_CONFIGURED:
-        return _data_dir() / "persona_surface.txt"
-    return _data_dir() / Path(_SURFACE_CONFIGURED).name
+    name = Path(_SURFACE_CONFIGURED or "surface.txt").name
+    return _data_dir() / "persona" / name
+
+
+def persona_data_dir() -> Path:
+    """人格运行状态目录；和只读的人格源文件分开。"""
+    return LOG_DIR / "persona"
 
 
 def surface_seed_path() -> Path:
     """镜像内那份模板的路径（只用于首次播种；之后不再读写它）。"""
-    return _persona_path(_SURFACE_CONFIGURED or "persona_surface.txt")
+    return _persona_path(_SURFACE_CONFIGURED or "persona/active/surface.txt")
 
 
 def seed_surface() -> str:
@@ -161,13 +208,13 @@ def seed_surface() -> str:
     target = surface_file_path()
     if target.exists():
         try:
-            return "表层人设：读写 data/%s（%d 字，已存在，未覆盖）" % (
+            return "表层人设：读写 data/runtime/persona/%s（%d 字，已存在，未覆盖）" % (
                 target.name, len(target.read_text(encoding="utf-8")))
         except OSError:
-            return "表层人设：读写 data/%s（已存在）" % target.name
+            return "表层人设：读写 data/runtime/persona/%s（已存在）" % target.name
     seed = surface_seed_path()
     if not seed.exists():
-        return "表层人设：data/%s 与模板都缺失，本层为空" % target.name
+        return "表层人设：data/runtime/persona/%s 与模板都缺失，本层为空" % target.name
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp")
@@ -176,7 +223,7 @@ def seed_surface() -> str:
         # 但没必要引入这种差异 —— 二进制搬运保证**字节级一致**。
         tmp.write_bytes(seed.read_bytes())
         tmp.replace(target)
-        return "表层人设：已从模板播种到 data/%s（之后写在这里，重建不再丢）" % target.name
+        return "表层人设：已从模板播种到 data/runtime/persona/%s（重建不再丢）" % target.name
     except OSError as exc:
         return "表层人设：播种失败（%s），本次将退回读模板" % type(exc).__name__
 
@@ -187,8 +234,8 @@ def seed_surface() -> str:
 # | 层 | 文件 | 谁能写 | 进 prompt 的顺序 |
 # |---|---|---|---|
 # | 底层人设 | `persona.txt` | **只有用户**（直接编辑文件） | 第 1 位（最硬） |
-# | 禁止事项 | `persona_forbidden.txt` | **只有用户**（直接编辑文件） | 第 2 位 |
-# | 表层人设 | `persona_surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
+# | 禁止事项 | `persona/active/forbidden.txt` | **只有用户**（直接编辑文件） | 第 2 位 |
+# | 表层人设 | `persona/active/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
 #
 # 为什么这么分：原来「底色」和「可以学的东西」挤在同一个文件里（`persona.txt` 自己
 # 第 3 行就写着"下面写的是底色，改起来很慢"），而运行时槽位又是第三处 ——
@@ -198,18 +245,18 @@ def seed_surface() -> str:
 # 禁止事项单独成层而不是并进底层，是因为它要被**逐条解析出来做冲突判定**
 # （见 `persona.forbidden_items()`）—— 一条禁止事项能挡掉一条表层改动。
 _PERSONA_RAW = getattr(_cfg, "ai_chat_persona_file", None)
-# 分层之后**底层人设的默认文件换成了 `persona_base.txt`**。
+# 分层之后**底层人设的默认文件换成了 `persona/active/base.txt`**。
 # 旧名 `persona.txt` 仍然被识别（`_read_text_file` 会找到它），
 # 但默认值必须是新的那份 —— 否则会读到一个"包含三层内容"的旧文件，
 # 于是禁止事项被算进底层、闸门的相似度判定也跟着偏。
-_PERSONA_CONFIGURED = "persona_base.txt" if _PERSONA_RAW is None else str(_PERSONA_RAW).strip()
+_PERSONA_CONFIGURED = "persona/active/base.txt" if _PERSONA_RAW is None else str(_PERSONA_RAW).strip()
 _FORBIDDEN_RAW = getattr(_cfg, "ai_chat_forbidden_file", None)
 _FORBIDDEN_CONFIGURED = (
-    "persona_forbidden.txt" if _FORBIDDEN_RAW is None else str(_FORBIDDEN_RAW).strip()
+    "persona/active/forbidden.txt" if _FORBIDDEN_RAW is None else str(_FORBIDDEN_RAW).strip()
 )
 _SURFACE_RAW = getattr(_cfg, "ai_chat_surface_file", None)
 _SURFACE_CONFIGURED = (
-    "persona_surface.txt" if _SURFACE_RAW is None else str(_SURFACE_RAW).strip()
+    "persona/active/surface.txt" if _SURFACE_RAW is None else str(_SURFACE_RAW).strip()
 )
 
 BASE_PROMPT: str = (
@@ -231,7 +278,7 @@ def load_surface() -> str:
 
     ## 从 `data/` 读（这是「自我学习不该被重建覆盖」的修法）
     表层是**唯一会被自动迭代写入**的一层，而 `Dockerfile` 里有
-    `COPY persona_surface.txt ./` —— 于是"线上学到的"会被"本机那份"顶掉，
+    `COPY persona/active ./persona/active` —— 于是"线上学到的"会被"本机那份"顶掉，
     而且**不报错**，只表现为"它前几天学会的说话方式又变回去了"。
 
     现在读写都落在 `data/`（卷内），镜像里那份只作**首次播种**的模板
@@ -280,20 +327,20 @@ def _static_prompt() -> str:
 # 返回值是"打算用哪个路径"，不保证文件存在：底层/禁止事项允许缺失（那就没有这一层），
 # 表层缺失时由写入方创建。
 def persona_file_path() -> Path:
-    # 兜底名跟着默认值走（`persona_base.txt`）：留 `persona.txt` 会让
+    # 兜底名跟着默认值走（`persona/active/base.txt`）：留 `persona.txt` 会让
     # 「显式写成空串」这种配置把路径指回一个已经改名为备份的旧文件。
-    return _persona_path(_PERSONA_CONFIGURED or "persona_base.txt")
+    return _persona_path(_PERSONA_CONFIGURED or "persona/active/base.txt")
 
 
 def forbidden_file_path() -> Path:
-    return _persona_path(_FORBIDDEN_CONFIGURED or "persona_forbidden.txt")
+    return _persona_path(_FORBIDDEN_CONFIGURED or "persona/active/forbidden.txt")
 
 
 # ---------------------------------------------------------------- 特质注册表
 # 人格约束的**元数据**：每个特质是什么、怎么测、有哪些表达通道、闸门关键词。
 # 它是**配置**（随镜像走，不像表层那样会被运行时改写），所以解释器内缓存一次即可。
 # 规则正文仍然只在三层文件里 —— 注册表只做索引，不复制文本（见 README §5.6.14）。
-_TRAITS_NAME = "persona_traits.json"
+_TRAITS_NAME = "persona/active/traits.json"
 _traits_cache: list[dict[str, Any]] | None = None
 
 
@@ -522,8 +569,8 @@ def time_hint(when: float | None = None) -> str:
 #
 # 【语域说明（重要）】下面这些是**固定系统文案**：由代码写死、在特定时机
 # 原样发出，模型没有即兴发挥的余地。因此它们**不属于人格语域** ——
-# `persona_forbidden.txt` 的铁律管的是"模型自己怎么说"，不适用于这里。
-# 这个区分登记在 `persona_traits.json` 的 `fixed_notice_channels` 里，巡逻脚本会核对；
+# `persona/active/forbidden.txt` 的铁律管的是"模型自己怎么说"，不适用于这里。
+# 这个区分登记在 `persona/active/traits.json` 的 `fixed_notice_channels` 里，巡逻脚本会核对；
 # **以后新增固定文案时，记得去那里登记一条**（否则"谁在发什么"就没有清单了）。
 MSG_TIMEOUT: str = getattr(
     _cfg, "ai_chat_msg_timeout", "想太久了，脑子有点乱……等下再问我一次吧。"
@@ -535,7 +582,7 @@ MSG_ERROR: str = getattr(
 # 【判定】它**不是**人设化的兜底话术，措辞刻意中性 —— 因为空回复是**故障**，
 # 不该由人格接管。原来那句「我没想出要说什么，换个说法问？」自带问句，与人设铁律
 # 「不作话头抛回者」冲突；判定结果是"**改报错、不改人设**"，而不是把故障伪装成一句俏皮话。
-# 属"固定系统文案"语域，登记在 persona_traits.json 的 fixed_notice_channels。
+# 属"固定系统文案"语域，登记在 persona/active/traits.json 的 fixed_notice_channels。
 MSG_EMPTY: str = getattr(
     _cfg, "ai_chat_msg_empty", "【出错了】这一轮没能生成回复，已记进日志。"
 )
@@ -564,6 +611,12 @@ MAX_PER_GROUP: int = _as_int(getattr(_cfg, "ai_chat_max_messages", 0), 0)
 # ---------------------------------------------------------------- Web 控制台
 WEBUI_ENABLED: bool = _as_bool(getattr(_cfg, "ai_chat_webui_enabled", True), True)
 WEBUI_PREFIX: str = getattr(_cfg, "ai_chat_webui_prefix", "/ai") or "/ai"
+# 控制台认证令牌（2026-09-28 补）。**留空 = 不认证**（维持改造前的行为），
+# 此时唯一的安全边界是宿主侧把端口绑在回环上（`deploy/docker-compose.yml` 的
+# `127.0.0.1:8080:8080`）。配了就一律要凭证：`?token=`、`X-Auth-Token` 头或 cookie。
+# 为什么不做"非回环就拒绝"：容器里 HOST 必须是 0.0.0.0，而经 SSH 隧道进来的请求
+# 在容器看来源地址是 docker 网关 —— 按 IP 判会把正当访问一起挡掉（详见 `webui.auth_decision`）。
+WEBUI_AUTH_TOKEN: str = str(getattr(_cfg, "ai_chat_webui_auth_token", "") or "").strip()
 
 # 写盘时是否缩进美化（true 便于人工查看，但文件更大、写入更慢）。
 LOG_PRETTY: bool = _as_bool(getattr(_cfg, "ai_chat_log_pretty", False), False)

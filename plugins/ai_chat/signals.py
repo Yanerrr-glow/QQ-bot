@@ -57,7 +57,7 @@ from . import clock, config, settings
 
 logger = logging.getLogger("ai_chat.signals")
 
-_FILE = "persona_signals.json"
+_FILE = "signals.json"
 _MAX_ITEMS = 3000       # 账本上限（按时间淘汰最旧的）
 _DEDUP_SECONDS = 120    # 同一个人在同一会话里说同一句，两分钟内只记一次
 _MAX_TEXT = 120
@@ -239,7 +239,7 @@ class _Store:
         self._lock = threading.Lock()
 
     def _path(self) -> Path:
-        return config.LOG_DIR / _FILE
+        return config.persona_data_dir() / _FILE
 
     def ensure(self) -> None:
         if not self.loaded:

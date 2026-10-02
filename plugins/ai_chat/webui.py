@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -133,7 +134,7 @@ _HTML = """<!doctype html>
 </head>
 <body>
   <h1>🐋 鲸鱼娘 · 控制台</h1>
-  <div class="sub">改完即时生效，不需要重启机器人。参数存 data/settings.json，人格是三个文本文件（底色 / 禁止事项 / 表层），记忆存 data/memory.db。</div>
+  <div class="sub">改完即时生效，不需要重启机器人。参数存 data/runtime/settings.json，人格是三个文本文件（底色 / 禁止事项 / 表层），记忆存 data/runtime/memory.db。</div>
   <div class="badges" id="badges"></div>
 
   <div class="tabs">
@@ -221,7 +222,8 @@ _HTML = """<!doctype html>
         <b>只能由你直接编辑文件修改</b> —— 聊天指令、控制台、自动迭代都改不了它们。
         <b>表层人设</b>（怎么说话）是唯一会自动迭代的部分，
         而且与上面两层冲突的条目会被<b>直接丢弃、不写入</b>。
-        改完三个文件<b>不用重启</b>。
+        生效时机：<b>表层每轮现读、改完即生效</b>；
+        <b>底层人设与禁止事项是启动时读入的，改完要重启</b>。
       </div>
       <div id="personaList"></div>
     </div>
@@ -417,7 +419,8 @@ function renderPersona(p) {
       <br><code class="muted">${esc(r[2] || '')}</code></div>`).join('')}
   </div>
   <div class="muted" style="margin:8px 0">
-    改人格直接编辑上面三个文件，<b>改完不用重启</b>（每轮回复前重新读）。
+    改人格直接编辑上面三个文件。<b>表层</b>每轮回复前重新读，改完即生效；
+    <b>底层人设与禁止事项</b>是启动时读入的常量，<b>改完要重启</b>。
     自动迭代每 ${iter.interval || 0} 秒跑一次，最多写入 ${iter.max || 0} 条；
     与上面两层冲突的条目会被<b>直接丢弃</b>。
   </div>
@@ -833,6 +836,37 @@ load().catch(e => toast('加载失败：' + e.message, true));
 """
 
 
+def auth_decision(path: str, prefix: str, token: str, given: str) -> tuple[bool, str]:
+    """控制台认证的**唯一判据**（纯函数，便于离线验证）。
+
+    返回 `(是否放行, 不能放行的原因)`。
+
+    规则只有三条，能一句话说清：
+
+    1. **不是控制台的路径一律放行** —— `app` 是 NoneBot 共享的 FastAPI 实例，
+       还承载 OneBot 反向 WS（`/onebot/v11/ws`，NapCat 主动连入）。按前缀过滤是硬要求，
+       拦错了就是"机器人掉线"。
+    2. `AI_CHAT_WEBUI_AUTH_TOKEN` 没配 = 不认证（维持现状），但启动日志会醒目告警 ——
+       此时唯一的安全边界是宿主侧把端口绑在回环上（见 `deploy/README.md` 的安全清单）。
+    3. 配了就**必须**对上：`?token=`、`X-Auth-Token` 头、或已种下的 cookie，三者任一即可；
+       比较用 `hmac.compare_digest`（恒定时间），失败只回一句"未认证"，不回显任何东西。
+
+    ## 为什么不做"非回环就拒绝"
+
+    容器里 `HOST` 必须是 `0.0.0.0`（否则端口映射不通），而经由
+    `ssh -L 8080:127.0.0.1:8080` 进来的请求，在容器看来**源地址是 docker 网关**
+    （不是 127.0.0.1）—— 按源地址判"是不是本机"会把正当的 SSH 隧道访问一起挡在门外。
+    所以这道防线只能建在**凭证**上，不能建在 IP 上。
+    """
+    if not path.startswith(prefix):
+        return True, ""
+    if not token:
+        return True, ""
+    if given and hmac.compare_digest(str(given), str(token)):
+        return True, ""
+    return False, "未认证：在 URL 后带 ?token=…（或加 X-Auth-Token 头）"
+
+
 def _register() -> bool:
     driver = get_driver()
     app = getattr(driver, "server_app", None)
@@ -851,6 +885,33 @@ def _register() -> bool:
         return False
 
     prefix = config.WEBUI_PREFIX.rstrip("/")
+    token = config.WEBUI_AUTH_TOKEN
+    cookie_name = "ai_chat_webui_token"
+
+    @app.middleware("http")
+    async def _auth_guard(request: Request, call_next):  # noqa: ANN001, ANN202
+        """控制台认证（2026-09-28 补）。
+
+        改造前控制台**没有任何认证**：只靠"端口绑回环 + SSH 隧道"这一层部署约定，
+        一旦有人把 8080 映射到公网，读全部群聊/改全部配置/以机器人身份发言全都敞开。
+        这里把约定升级成技术约束 —— 配了 token 就一律要凭证。
+        """
+        given = (
+            request.query_params.get("token")
+            or request.headers.get("x-auth-token")
+            or request.cookies.get(cookie_name)
+            or ""
+        )
+        ok, why = auth_decision(request.url.path, prefix, token, given)
+        if not ok:
+            logger.warning("控制台拒绝未认证请求：%s %s", request.method, request.url.path)
+            return JSONResponse({"ok": False, "error": why}, status_code=401)
+        resp = await call_next(request)
+        # 首次用 `?token=` 打开页面时种一个 cookie，之后前端那些 fetch 不用再带参数
+        _q = request.query_params.get("token") or ""
+        if token and _q and hmac.compare_digest(_q, token):
+            resp.set_cookie(cookie_name, token, httponly=True, samesite="strict")
+        return resp
 
     async def _body(request: Request) -> dict:
         try:
@@ -1145,7 +1206,19 @@ def _register() -> bool:
             }
         )
 
-    logger.info("Web 控制台已挂载：http://127.0.0.1:%s%s/", getattr(driver.config, "port", 8080), prefix)
+    _host = str(getattr(driver.config, "host", "") or "127.0.0.1")
+    _port = getattr(driver.config, "port", 8080)
+    logger.info("Web 控制台已挂载：http://%s:%s%s/", _host, _port, prefix)
+    if _host not in ("127.0.0.1", "localhost", "::1"):
+        # 控制台目前**没有认证**（见 deploy/README.md 的 4.5 安全清单）：
+        # 只靠"端口绑回环 + SSH 隧道"这一层。容器里 HOST 必须是 0.0.0.0（否则端口映射不通），
+        # 所以真正的边界在宿主侧的 `127.0.0.1:8080:8080` 端口映射上 —— 这里只负责把事实说清楚，
+        # 免得日志里那句硬编码的 127.0.0.1 让人误判成"只有本机能访问"。
+        logger.warning(
+            "Web 控制台监听在 %s（非回环）且没有任何认证：确认端口映射只绑了 127.0.0.1，"
+            "或自己加一层代理/防火墙。",
+            _host,
+        )
     return True
 
 

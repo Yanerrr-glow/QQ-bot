@@ -7,7 +7,7 @@
 别的厂商的 OpenAI 兼容端点）必须改 `.env` 再重启；更麻烦的是**十个模块各自在 import 时
 建了一个 client**（`AsyncOpenAI(...)`），所以运行期根本换不动。
 
-现在：档案存在 `data/models.json`（卷内），`client()` 按「当前选中的档案」建并缓存，
+现在：档案存在 `data/runtime/models.json`（卷内），`client()` 按「当前选中的档案」建并缓存，
 调用方只写 `await llm.chat(messages=..., **kw)`。
 
 ## 档案长什么样
@@ -72,11 +72,11 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def _data_dir() -> Path:
-    """与聊天记录同一个目录（`AI_CHAT_LOG_DIR`，默认 `data`）。"""
+    """与聊天记录同一个目录（`AI_CHAT_LOG_DIR`，默认 `data/runtime`）。"""
     log_dir = getattr(config, "LOG_DIR", None)
     if log_dir:
         return Path(log_dir)
-    raw = os.environ.get("AI_CHAT_LOG_DIR", "") or "data"
+    raw = os.environ.get("AI_CHAT_LOG_DIR", "") or "data/runtime"
     path = Path(raw)
     if not path.is_absolute():
         path = Path(config.__file__).resolve().parent.parent.parent / path
@@ -271,7 +271,7 @@ def model_name(profile: dict[str, Any] | None = None) -> str:
     """这次调用实际用哪个模型名。
 
     `settings.model` 是**覆盖**（留空就用档案里的）—— 保留它是为了兼容：
-    改造前所有调用点写的都是 `settings.get("model")`，老 `data/settings.json` 里也存着它。
+    改造前所有调用点写的都是 `settings.get("model")`，老 `data/runtime/settings.json` 里也存着它。
     """
     item = profile or active()
     override = str(settings.get("model") or "").strip()

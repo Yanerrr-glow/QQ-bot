@@ -44,10 +44,8 @@ URL 是**模型给的**（间接来自网页），所以先假定它可能有害
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 import re
-import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -62,7 +60,7 @@ from typing import Any
 # （百度百科/知乎按机房 IP 段 403）。表现是"读某个链接就整条回复失败"，
 # 且只在渲染成功那一刻才暴露（渲染失败时 `rendered["text"]` 为空，
 # 走的是下面那个提前 return，反而躲开了这行）。
-from . import settings, untrusted
+from . import netguard, settings, untrusted
 
 logger = logging.getLogger("ai_chat.fetch")
 
@@ -144,44 +142,23 @@ def _tidy(text: str) -> str:
 
 
 # --------------------------------------------------------------------- 安全
+# 公网校验（SSRF）的**实现已抽到 `netguard.py`**（2026-09-28）：files / stickers 的下载路径
+# 原先不过这道校验，现在四处共用一份。这里保留同名转发，不动既有调用点。
 def _is_public_ip(host: str) -> bool:
-    """这个主机名解析出来的地址，是不是**全部**都是公网地址。
-
-    任一解析结果是私网/环回/链路本地/保留段，就判为不安全。
-    "全部"是关键：一个域名同时解析出公网 IP 和内网 IP 时，不能因为有个公网的放行。
-    """
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
-        return False
-    seen = 0
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr.split("%")[0])
-        except ValueError:
-            return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-                or ip.is_multicast or ip.is_unspecified):
-            return False
-        seen += 1
-    return seen > 0
+    """兼容旧调用点：实现在 `netguard.is_public_ip`。"""
+    return netguard.is_public_ip(host)
 
 
 def _check_url(url: str) -> tuple[bool, str]:
-    """放行前的检查。返回 (能不能读, 不能读的原因)。"""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-    except ValueError:
-        return False, "URL 解析不了"
-    if parsed.scheme not in ("http", "https"):
-        return False, "只支持 http/https"
-    host = parsed.hostname or ""
-    if not host:
-        return False, "没有主机名"
-    # 直接写 IP 字面量时 getaddrinfo 也能解析，这个判断覆盖两种情况
-    if not _is_public_ip(host):
-        return False, "目标是内网/本机地址，不允许访问"
+    """放行前的检查。返回 (能不能读, 不能读的原因)。
+
+    = `netguard.check_url`（安全）**加上本模块的网页策略**（`.zip`/`.pdf` 这类"不是给人看的页面"）。
+    `files` / `stickers` 只调 netguard 那一半 —— 它们要的正是二进制。
+    """
+    ok, reason = netguard.check_url(url)
+    if not ok:
+        return False, reason
+    parsed = urllib.parse.urlsplit(url)
     path = (parsed.path or "").lower()
     if path.endswith(_SKIP_SUFFIXES):
         return False, "这个链接不是网页（二进制/文档），不读"
@@ -190,14 +167,16 @@ def _check_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-class _SafeRedirect(urllib.request.HTTPRedirectHandler):
-    """重定向时再查一次安全 —— 首轮检查拦不住"公网域名 302 到内网"。"""
+# 重定向复检：安全判据在 netguard，这里再套一层本模块的网页策略
+class _SafeRedirect(netguard.SafeRedirect):
+    """重定向时再查一次 —— 首轮检查拦不住"公网域名 302 到内网"。"""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
         ok, reason = _check_url(newurl)
         if not ok:
             raise urllib.error.URLError(f"重定向被拒：{reason}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
 
 
 def _referer(url: str) -> str:

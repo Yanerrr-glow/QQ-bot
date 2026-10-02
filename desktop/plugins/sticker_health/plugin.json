@@ -1,0 +1,13 @@
+{
+  "id": "sticker_health",
+  "name": "表情包体检",
+  "version": "1.0.0",
+  "api_version": "1",
+  "entrypoint": "plugin.py:create_plugin",
+  "description": "示范插件：读表情包统计与列表，给出体检摘要，并演示受控 API 调用与权限边界。",
+  "author": "workbench",
+  "permissions": ["api.read.stickers", "api.read.status"],
+  "navigation": {"section": "插件", "order": 20},
+  "enabled_by_default": true,
+  "builtin": true
+}

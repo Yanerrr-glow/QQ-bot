@@ -8,12 +8,12 @@
 QQ 群/私聊  /dsh run <任务>
    │  bot（服务器容器）只做三件事：认前缀 → 校验是不是主人 → 落一个任务文件
    ▼
-/data/dsh_bridge/task-<id>.json          ← 服务器侧只写**数据**，从不执行任何命令
+/data/runtime/dsh_bridge/task-<id>.json          ← 服务器侧只写**数据**，从不执行任何命令
    │  本机 agent 每 2 秒轮询取走（SSH 方向是「本机→服务器」，不需要开任何入站端口）
    ▼
 本机执行 `dsh --profile headless "<任务>"`，把 stdout 写成 result-<id>.json
    ▲
-   │  bot 轮询 /data/dsh_bridge/result-<id>.json，取回后**原样转发**（不改写、不解释）
+   │  bot 轮询 /data/runtime/dsh_bridge/result-<id>.json，取回后**原样转发**（不改写、不解释）
 ```
 
 **为什么不能让 bot 直接执行**：bot 的输出与它读到的群消息都是不可信输入

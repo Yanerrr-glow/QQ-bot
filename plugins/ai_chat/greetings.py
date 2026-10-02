@@ -9,7 +9,7 @@
 
 四条设计约束：
 
-1. **一天一次，且落盘。** 状态写 `data/greet_state.json`。进程重启、容器重建都不会把
+1. **一天一次，且落盘。** 状态写 `data/runtime/greet_state.json`。进程重启、容器重建都不会把
    今天的问候再发一遍 —— 定时任务最讨嫌的就是"每重启一次就多问一句早安"。
 2. **只补发一个窗口内的。** 08:00 的早安在 08:00~09:30（`greet_window`）之间上线都会补，
    超过窗口就整天不补 —— 免得下午三点突然来一句「早安」。
@@ -52,7 +52,7 @@ _SLOTS: tuple[tuple[str, str, str, str], ...] = (
     # 或模型调用失败/超时时用），不是模型说的话 —— 所以它与铁律「不提时间，也不提睡眠」
     # **分属两个语域**：那条铁律管的是"模型即兴回复里别催睡"，管不到这里。
     # 正常情况下晚安是模型按下面的 ask 现写的（ask 里明确要求"别复述时间"）。
-    # 这个区分登记在 persona_traits.json 的 `fixed_notice_channels` 里。
+    # 这个区分登记在 persona/active/traits.json 的 `fixed_notice_channels` 里。
     ("night", "晚安", "greet_night", "晚安啦主人，今天也辛苦了，早点睡~"),
 )
 _LABEL: dict[str, str] = {slot: label for slot, label, _, _ in _SLOTS}
@@ -388,7 +388,7 @@ async def greet(slot: str, force: bool = False) -> bool:
             # 回到 prompt 里 —— 把兜底话术记进去，就等于每轮都在给她示范"我平时这么说话"。
             # 这恰恰是 `behavior.py` 里量出"写规则无效"的那个成因。
             #
-            # 依据：这些文案属于"固定系统文案"语域（persona_traits.json 的
+            # 依据：这些文案属于"固定系统文案"语域（persona/active/traits.json 的
             # fixed_notice_channels）—— 非人格语域的东西，**既不被铁律评判，
             # 也不构成人格的自我陈述**。
             logger.info("固定文案不写进聊天记录 slot=%s：%s", slot, text[:40])

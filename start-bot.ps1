@@ -40,17 +40,17 @@ if (-not $py) {
 }
 if (-not (Test-Path -LiteralPath $venvPy)) {
     Write-Host '还没建虚拟环境（.venv）—— 第一次用请先跑：' -ForegroundColor Yellow
-    Write-Host "    & '.\_工具链\安装依赖.ps1'" -ForegroundColor Yellow
+    Write-Host "    & '.\_工具链\启动\安装依赖.ps1'" -ForegroundColor Yellow
     Write-Host '下面先照常自检一遍，把还差的东西列清楚。' -ForegroundColor DarkGray
 }
 
 # ---------------------------------------------------------------- 2. 自检
 # 缺 .env 时会照模板生成，并就地问 API Key / 主人 QQ / 角色名（终端里才问，管道下不问）。
-& $py @($pre + @((Join-Path $root '_工具链\上手自检.py')))
+& $py @($pre + @((Join-Path $root '_工具链\启动\上手自检.py')))
 if ($LASTEXITCODE -ne 0) {
     Write-Host ''
     Write-Host '自检没通过 —— 上面「待办」里列的就是还差的东西，补齐后再双击一次。' -ForegroundColor Yellow
-    Write-Host "（只想跳过自检直接起：& '.\_工具链\启动机器人.ps1' -SkipCheck）" -ForegroundColor DarkGray
+    Write-Host "（只想跳过自检直接起：& '.\_工具链\启动\启动机器人.ps1' -SkipCheck）" -ForegroundColor DarkGray
     exit 1
 }
 
@@ -60,7 +60,7 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path -LiteralPath $venvPy)) {
     Write-Host ''
     Write-Host '还差虚拟环境 —— 本机运行必须先装依赖（只装一次）：' -ForegroundColor Yellow
-    Write-Host "    & '.\_工具链\安装依赖.ps1'" -ForegroundColor Yellow
+    Write-Host "    & '.\_工具链\启动\安装依赖.ps1'" -ForegroundColor Yellow
     Write-Host '装完再双击一次 start-bot.cmd。' -ForegroundColor Yellow
     exit 1
 }

@@ -114,9 +114,11 @@ def focus(conv: str, topic: str) -> None:
     topic = " ".join(str(topic).split())[:300]
     if not topic:
         return
+    _ensure_lease_loaded()
     now = time.time()
     initial = float(settings.get("attention_initial"))
     _focus[conv] = _Focus(topic=topic, started_at=now, last_eval=now, value=initial)
+    _push_focus()
     logger.info("注意力聚焦 conv=%s（初始 %.2f）话题=%.40s", conv, initial, topic)
 
 
@@ -127,12 +129,14 @@ def relax(conv: str) -> None:
     刚回完这一轮，接下来几句本来就该由租约接着（那是"在场的对话"），
     注意力不该再对同一件事插一句 —— 既省一次评估，也避免一段对话里出现两个声音。
     """
+    _ensure_lease_loaded()
     item = _focus.get(conv)
     if item is None:
         return
     item.value *= 0.5
     item.last_eval = time.time()
     item.muted_until = time.time() + float(settings.get("attention_reply_cooldown"))
+    _push_focus()
     logger.info(
         "注意力减半并静默 %.0fs conv=%s → %.2f",
         settings.get("attention_reply_cooldown"), conv, item.value,
@@ -140,10 +144,13 @@ def relax(conv: str) -> None:
 
 
 def clear(conv: str) -> None:
-    _focus.pop(conv, None)
+    _ensure_lease_loaded()
+    if _focus.pop(conv, None) is not None:
+        _push_focus()
 
 
 def state(conv: str) -> dict:
+    _ensure_lease_loaded()
     item = _focus.get(conv)
     if item is None:
         return {}
@@ -215,6 +222,7 @@ async def should_speak(conv: str, text: str) -> tuple[bool, float]:
     if not settings.get("attention_enabled"):
         return False, 0.0
 
+    _ensure_lease_loaded()
     item = _focus.get(conv)
     if item is None:
         return False, 0.0
@@ -253,6 +261,7 @@ async def should_speak(conv: str, text: str) -> tuple[bool, float]:
     score = await score_relevance(item.topic, text)
     item.value = min(1.0, item.value * _DECAY + score * _GAIN)  # 封顶 1.0
     threshold = _effective_threshold(item)
+    _push_focus()   # 值变了就落盘（评估本身至少隔 attention_interval 秒，写盘很便宜）
     logger.info(
         "注意力更新 conv=%s score=%.2f → value=%.2f（阈值已抬到 %.2f，话题过了 %.0f%%）",
         conv, score, item.value, threshold, _progress(item) * 100,
@@ -282,26 +291,60 @@ def _push_lease() -> None:
         _save_lease()
 
 
+def _push_focus() -> None:
+    """注意力话题的落盘（2026-09-28 补）。
+
+    为什么需要它：`_focus` 原来是纯内存态，重启/重建容器时**静默清零** ——
+    表现是"刚才还在跟着聊，重启后突然不接了"，而且日志里什么都没有。
+    与租约同一个文件、两个键；关掉落盘就是改造前的行为（纯内存）。
+    """
+    if settings.get("attention_persist"):
+        _save_lease()
+
+
+def _state_payload() -> dict[str, Any]:
+    """落盘内容：`lease` 与 `focus` **写在同一个文件里**（`attention_state.json`）。
+
+    两个键各受自己的 persist 开关控制：关掉的那个**不写**，
+    于是下次由另一个键触发保存时它也从文件里消失 —— 开关语义保持一致。
+
+    **刻意不落盘的东西**：`muted_until`（回复后的短静默，秒级，重启后重来即可）、
+    以及 `_recent_images` 里的图片字节（那是几十 KB 的二进制，不该进状态文件）。
+    """
+    payload: dict[str, Any] = {"updated_at": time.time()}
+    if settings.get("attention_lease_persist"):
+        payload["lease"] = {
+            conv: {"who": it.who, "expires_at": it.expires_at, "turns": it.turns}
+            for conv, it in _lease.items()
+        }
+    if settings.get("attention_persist"):
+        payload["focus"] = {
+            conv: {
+                "topic": it.topic,
+                "started_at": it.started_at,
+                "value": it.value,
+                "last_eval": it.last_eval,
+                "evaluated": it.evaluated,
+            }
+            for conv, it in _focus.items()
+        }
+    return payload
+
+
 def _save_lease() -> None:
-    """把租约落盘。失败只记日志 —— 租约丢了只是少一层便利，不该影响回复。"""
+    """把状态落盘。失败只记日志 —— 丢了只是少一层便利，不该影响回复。"""
     try:
         _lease_path().parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "lease": {
-                conv: {"who": it.who, "expires_at": it.expires_at, "turns": it.turns}
-                for conv, it in _lease.items()
-            },
-            "updated_at": time.time(),
-        }
+        payload = _state_payload()
         tmp = _lease_path().with_name(_lease_path().name + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(_lease_path())
     except OSError:
-        logger.warning("对话租约写盘失败（不影响回复）")
+        logger.warning("注意力状态写盘失败（不影响回复）")
 
 
 def _load_lease() -> None:
-    """启动时恢复租约；**过期的直接丢并记日志**（不静默）。"""
+    """启动时恢复租约与注意力话题；**过期的直接丢并记日志**（不静默）。"""
     global _lease_loaded
     _lease_loaded = True
     path = _lease_path()
@@ -310,7 +353,7 @@ def _load_lease() -> None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        logger.warning("对话租约文件损坏，已忽略：%s", path)
+        logger.warning("注意力状态文件损坏，已忽略：%s", path)
         return
     if not isinstance(raw, dict):
         return
@@ -335,6 +378,35 @@ def _load_lease() -> None:
         logger.info(
             "对话租约已从磁盘恢复：%d 个有效，%d 个已过期丢弃（文件 %s）",
             kept, dropped, path.name,
+        )
+
+    # 注意力话题：与租约同文件不同键。**已过期的不恢复**（本来也该清零），
+    # 且恢复时按"当时的话题"继续 —— `muted_until` 不落盘，所以静默重置为 0。
+    fkept = fdropped = 0
+    for conv, item in (raw.get("focus") or {}).items():
+        if not isinstance(item, dict):
+            fdropped += 1
+            continue
+        try:
+            foc = _Focus(
+                topic=str(item.get("topic") or ""),
+                started_at=float(item.get("started_at") or 0),
+                value=float(item.get("value") or 0),
+                last_eval=float(item.get("last_eval") or 0),
+                evaluated=int(item.get("evaluated") or 0),
+            )
+        except (TypeError, ValueError):
+            fdropped += 1
+            continue
+        if not foc.topic or _expired(foc):
+            fdropped += 1
+            continue
+        _focus[str(conv)] = foc
+        fkept += 1
+    if fkept or fdropped:
+        logger.info(
+            "注意力话题已从磁盘恢复：%d 个未过期，%d 个已过期丢弃（超活跃期 %.0fs 就不续）",
+            fkept, fdropped, float(settings.get("attention_window") or 0),
         )
 
 

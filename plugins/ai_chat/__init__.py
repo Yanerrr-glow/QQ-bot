@@ -3,14 +3,15 @@
 与"靠对话上下文记忆"的做法有本质区别：
 
 * 不再在内存里维护多轮 user/assistant 历史；
-* 群聊逐条落盘到 `data/chatlog_<会话>.json`，每条带**已读 / 未读**状态；
+* 群聊逐条落盘到 `data/runtime/chatlog_<会话>.json`，每条带**已读 / 未读**状态；
 * 被 @ 时临时组装 prompt —— 已读记录压缩成背景，未读记录原样呈现，
   回复后把这些未读标记为已读。模型每次只看到"该看的东西"，不背历史包袱。
 
 在此之上又加了三层（改造前没有，是"没有记忆 / 人设锁死 / 听不懂当场要求"的解法）：
 
 * `memory`  —— 长期记忆：跨会话、跨重启的事实条目，检索在本地做，不花 token；
-* `persona` —— 运行时人设：`/风格`、`/人设` 改的东西立即生效，不用重启；
+* `persona` —— 人格三层：底层人设 / 禁止事项只能由人编辑（代码里没有写它们的入口），
+  表层人设由自动迭代经冲突闸门写入、**每轮现读**；聊天里已无改人设的入口；
 * `instructions` —— 实时指令：把「不要保存这张图片」这类话翻译成真的状态变更。
 
 四个 handler / 任务分工：
@@ -74,6 +75,7 @@ from . import (
     state,
     stickers,
     summaries,
+    task_manager,
 )
 from . import webui  # noqa: F401 —— 导入即注册控制台路由（副作用）
 
@@ -84,14 +86,17 @@ _semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
 
 RESET_WORDS = {"清空对话", "重置对话", "清空记录", "reset", "/reset", "新对话"}
 
-# 持有后台任务的强引用，否则可能被 GC 提前回收
+# 持有后台任务的强引用，否则可能被 GC 提前回收。
+#
+# **2026-09-28 起统一交给 `task_manager`**：命名、异常日志、每类并发上限、停机收尾。
+# 下面这个 `_spawn(coro)` 外壳**必须保留**：`summaries.on_session_rolled(..., _spawn)`
+# 按 callable 注入它，`验证\离线验证_桩.py` 也按名 monkeypatch `pkg._spawn`
+# （签名是"单参数、调用即返回"）。
 _background: set[asyncio.Task] = set()
 
 
-def _spawn(coro) -> None:  # noqa: ANN001
-    task = asyncio.create_task(coro)
-    _background.add(task)
-    task.add_done_callback(_background.discard)
+def _spawn(coro, *, name: str = "", kind: str = "once", reject_over: int = 0):  # noqa: ANN001, ANN202
+    return task_manager.spawn(coro, name=name, kind=kind, reject_over=reject_over)
 
 
 # --------------------------------------------------------------------- 工具
@@ -331,7 +336,8 @@ async def _run_tool_calls(
             # 沉淀释义（异步，不占这次回复的等待时间）。
             # **判定用用户原话**：模型给的是搜索词（比如「鲸落」），不含「是什么」这类标记，
             # 拿它去判定必然为 False —— 这就是"搜到了却不沉淀"的原因。
-            _spawn(_remember_definition(query, payload["results"], raw=question or query))
+            _spawn(_remember_definition(query, payload["results"], raw=question or query),
+                   name="_remember_definition", kind="definition")
         elif name == "web_fetch":
             url = str(args.get("url") or "").strip()
             used += 1
@@ -437,7 +443,7 @@ async def _ask_with_tools(messages: list[dict], *, conv: str, question: str = ""
 def _split_for_qq(text: str, limit: int = 900) -> list[str]:
     """按段落切分长回答（实现搬到了 `context.split_for_qq`，这里保留同名出口）。
 
-    `_工具链/离线验证.py` 与外部脚本按这个名字引用它，所以不做重命名。
+    `验证/离线验证.py` 与外部脚本按这个名字引用它，所以不做重命名。
     """
     return context.split_for_qq(text, limit)
 
@@ -792,7 +798,10 @@ async def record_message(bot: Bot, event: MessageEvent) -> None:
     if images:
         conv_label = f"群 {group_id}" if group_id else "私聊"
         for seg in images:
-            _spawn(_ingest_image(event, seg, conv, conv_label, name, master))
+            # 一条消息带 N 张图 = N 个任务：给个并发上限，超了**跳过**（图片入库多了也没用，
+            # 而它是"下载 + 感知哈希 + 模型打分"的重活，不该把回复路径挤掉）。
+            _spawn(_ingest_image(event, seg, conv, conv_label, name, master),
+                   name="_ingest_image", kind="image", reject_over=6)
 
     # 以「文件」形式发来的图片单独走一条：它们要被打低权重，所以必须跟真·表情包
     # 分开传（混在一起就分不出谁是文件了）。QQ 的 PC 端拖拽图片就是这条路径，
@@ -802,16 +811,17 @@ async def record_message(bot: Bot, event: MessageEvent) -> None:
         _spawn(
             _ingest_image(
                 event, seg, conv, f"群 {group_id}" if group_id else "私聊", name, master, file_sent=True
-            )
+            ),
+            name="_ingest_image", kind="image", reject_over=6,
         )
 
     # 群聊消息计入"按消息数触发主动发言"的计数器（异步，不阻塞）
     if group_id is not None and text:
-        _spawn(proactive.on_group_message(conv))
+        _spawn(proactive.on_group_message(conv), name="proactive.on_group_message")
         # 注意力：若这个会话正处于「被唤醒后的活跃期」，评估这条新消息跟话题的相关度。
         # 已经在跟它说话的（被 @ / 提到唤醒词）不必再走这条。
         if not _is_addressed(event) and not _mentions_wake_word(event):
-            _spawn(_attention_check(bot, event, conv, text))
+            _spawn(_attention_check(bot, event, conv, text), name="_attention_check")
 
 
 # ----------------------------------------------------------- handler 2：回复
@@ -1060,7 +1070,8 @@ async def _maybe_prefetch(
         blocks.append(search.render_block(payload))
         # 判定传**原始问题**（question），不是拧过的 query —— 见 _remember_definition
         _spawn(_remember_definition(payload["query"] or query, payload["results"],
-                                    by="预取", raw=question))
+                                    by="预取", raw=question),
+               name="_remember_definition", kind="definition")
     return "\n\n".join(blocks)
 
 
@@ -1144,7 +1155,8 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
             _dsh_task = getattr(action, "effect", {}) or {}
             if _dsh_task.get("task_id"):
                 _spawn(_push_dsh_result(bot, event, str(_dsh_task["task_id"]),
-                                        float(dsh_bridge.TIMEOUT_SECONDS) + 30.0))
+                                        float(dsh_bridge.TIMEOUT_SECONDS) + 30.0),
+                       name="_push_dsh_result")
             await _send_instruction_reply(bot, event, action)
             return
         # 状态已改，让模型用人设口吻确认 —— 落到下面正常路径，带上这个 note
@@ -1295,7 +1307,7 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         #   ① `logger.error` 记 conv / trigger / 原话片段，供排查；
         #   ② 群里发一条**措辞中性的错误通报**（`config.MSG_EMPTY`），让人知道这轮出了故障，
         #      而不是被静默无视。该通报属"固定系统文案"语域，不受人格铁律约束
-        #      （见 persona_traits.json 的 fixed_notice_channels）。
+        #      （见 persona/active/traits.json 的 fixed_notice_channels）。
         logger.error(
             "模型返回空回复 conv=%s trigger=%s question=%r",
             conv, trigger, (question or "")[:60],
@@ -1362,7 +1374,7 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
     # 长期记忆：回复已经发出去了，现在才异步提炼。
     # 放最后是有意的 —— 抽取要调一次模型，绝不能让它占群友的等待时间。
     if memory.is_enabled():
-        _spawn(memory.extract_and_store(conv))
+        _spawn(memory.extract_and_store(conv), name="memory.extract_and_store", kind="extract")
 
 
 # ----------------------------------------------------------- 后台：主动发言与定时问候
@@ -1375,28 +1387,28 @@ async def _start_proactive() -> None:
     # 记忆、会话图片策略、时钟偏移都是懒加载的，启动时先读一次：
     # 一是不用等第一条消息才碰盘，二是出问题时能在启动日志里看见。
     #
-    # **人格不需要预热**：分层之后 `persona.render()` 每轮现读三个文件
-    # （底层/禁止事项/表层），没有内存副本可预热 —— 原来这里的
-    # `persona._store.ensure()` 随槽位机制一起删了。
+    # **人格不需要预热**：分层之后 `persona.render()` 每轮现读 —— 但现读的是**表层**，
+    # 底层人设与禁止事项是 `config` 在 import 期读入的常量（改完要重启），
+    # 注册表 `persona/active/traits.json` 同样只读一次。没有内存副本可预热。
     memory._db.ensure()  # noqa: SLF001
     state._state.ensure()  # noqa: SLF001
     # 时间校准：先把上次的偏移读回来（重启后到首次同步成功之间有段空窗，
     # 不恢复的话那几条消息会退回未校准的系统时钟），再起后台同步任务。
     clock._state.ensure()  # noqa: SLF001
-    _spawn(clock.loop())
-    _spawn(proactive.loop())
-    _spawn(greetings.loop())
+    _spawn(clock.loop(), name="clock.loop", kind="loop")
+    _spawn(proactive.loop(), name="proactive.loop", kind="loop")
+    _spawn(greetings.loop(), name="greetings.loop", kind="loop")
     # 后台补抽：把「有人聊过但没人 @ 它、或当时额度用完了」的记录补进记忆库。
     # 这是水位线的配套 —— 没有它，水位线只会被回复路径推着慢慢走。
-    _spawn(memory.drain_loop())
+    _spawn(memory.drain_loop(), name="memory.drain_loop", kind="loop")
     # 消息索引：增量给聊天记录建词面索引，供「翻旧账」查原话。
     # 它是**派生物**（删掉会自动重建），所以这里不关心失败。
-    _spawn(msgindex.index_loop())
+    _spawn(msgindex.index_loop(), name="msgindex.index_loop", kind="loop")
     # 使用计数落盘：`used` 每一轮回复都在涨，攒着批量写（不调模型、不花 token）。
-    _spawn(memory.usage_loop())
+    _spawn(memory.usage_loop(), name="memory.usage_loop", kind="loop")
     # 人格自我迭代（路线 C）：定期反思 → 候选 → 过冲突闸门 → 只写表层人设。
     # 它是三层结构里唯一有写权限的东西，且底层/铁律连写路径都不存在。
-    _spawn(persona_iter.reflect_loop())
+    _spawn(persona_iter.reflect_loop(), name="persona_iter.reflect_loop", kind="loop")
     logger.info(
         "后台任务已启动（主动发言：%s；定时问候：%s；长期记忆：%s/%s 条；"
         "会话摘要：%s/%s 轮；聊天记录索引：%s/%s 条；人格自我迭代：%s；当前时间：%s）",
@@ -1420,6 +1432,8 @@ async def _start_proactive() -> None:
         memory.stats()["used_once"],
         memory.stats()["confirmed"],
     )
+    # 后台任务的分类并发上限（见 task_manager）：报出来才知道背压在不在
+    logger.info("后台任务并发上限：%s", task_manager.stats()["limits"])
     # 人设信号账本：**只观察、不改人设**（自我迭代第 1 步）。
     # 启动时报一下条数，好知道它有没有在积累。
     _sig = signals.stats()
@@ -1455,7 +1469,7 @@ async def _start_proactive() -> None:
     ):
         logger.warning(
             "时间可能不可靠！宿主时钟与真实时间相差 %.0f 秒 —— 定时问候会在错误的钟点触发。"
-            "检查 _工具链\\诊断状态.py 或 /时间 校准。",
+            "检查 _工具链\\启动\\诊断状态.py 或 /时间 校准。",
             abs(_time_st["offset_seconds"]),
         )
     # 表层人设的**播种**：先把镜像里的模板落到 data/（卷内），之后自我迭代写在那里。
@@ -1484,3 +1498,28 @@ async def _start_proactive() -> None:
             "**注意：底层为空时自我迭代会拒绝运行** —— 没有约束就没有闸门的依据。",
             config.PERSONA_SOURCE,
         )
+
+
+# ----------------------------------------------------------- 停机收尾（2026-09-28 补）
+# 改造前全项目没有 `on_shutdown`：进程退出时后台任务被硬切，
+# 而 `msgindex.close()` 与 `render.shutdown()` 两个**为关闭准备的函数从来没人调**。
+#
+# 顺序有意如此：先停收新任务、再等短窗口、超时取消（见 task_manager.shutdown 的说明）。
+# `asyncio.wait(timeout=…)` 而不是 `gather` 全等 —— 后台里有 DSH 轮询这种
+# deadline 可达一分多钟的任务，等它等于拖住停机。
+@_driver.on_shutdown
+async def _stop_background() -> None:
+    try:
+        result = await task_manager.shutdown(timeout=5.0)
+        logger.info("后台任务已收尾：%s", result)
+    except Exception:  # noqa: BLE001 - 收尾失败也不该阻止进程退出
+        logger.exception("后台任务收尾时出错（继续退出）")
+    # 两个"等了好久"的清理函数：消息索引连接 + 共享浏览器
+    for label, fn in (("msgindex.close", msgindex.close), ("render.shutdown", render.shutdown)):
+        try:
+            out = fn()
+            if asyncio.iscoroutine(out):
+                await out
+            logger.info("%s 已执行", label)
+        except Exception:  # noqa: BLE001
+            logger.exception("%s 执行失败（继续退出）", label)

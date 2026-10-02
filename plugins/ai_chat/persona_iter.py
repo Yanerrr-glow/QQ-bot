@@ -3,9 +3,9 @@
 ## 它是三层结构里唯一有"写权限"的东西
 
 ```
-底层人设（persona_base.txt）    ← 只有用户能改；本模块**没有写它的代码**
-禁止事项（persona_forbidden.txt）← 同上
-表层人设（persona_surface.txt）  ← 本模块唯一的写入目标，且必须先过 persona.validate_surface()
+底层人设（persona/active/base.txt）    ← 只有用户能改；本模块**没有写它的代码**
+禁止事项（persona/active/forbidden.txt）← 同上
+表层人设（persona/active/surface.txt）  ← 本模块唯一的写入目标，且必须先过 persona.validate_surface()
 ```
 
 「没有写它的代码」不是修辞：本模块只调 `config.surface_file_path()`，
@@ -18,7 +18,7 @@
 **变成了一个可判定的问题**：候选与底层/铁律冲突吗？冲突就丢。
 
 真正无法验证的只剩"表层内部累积的自洽性"，而那一层：
-* 每次改动都进 `persona_changelog.json`（写入与丢弃都记）；
+* 每次改动都进 `data/runtime/persona/changelog.json`（写入与丢弃都记）；
 * `/人设 撤回` 一条命令撤销；
 * 改动后会**主动通知主人**（自动写入但不偷偷写）。
 
@@ -198,7 +198,7 @@ async def reflect_once(*, notify: bool = True) -> dict[str, Any]:
     base, forbidden, surface = persona.base_text(), persona.forbidden_text(), persona.surface_text()
     if not base.strip():
         # 没有底层人设就没有"约束"可言，闸门也就失去依据 —— 拒绝跑
-        return {"ok": False, "why": "底层人设是空的，没有约束可依，先写 persona_base.txt"}
+        return {"ok": False, "why": "底层人设是空的，没有约束可依，先写 persona/active/base.txt"}
 
     lines = _recent_lines(int(settings.get("persona_iter_min_lines")))
     if len(lines) < 3:

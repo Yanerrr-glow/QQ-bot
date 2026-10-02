@@ -22,7 +22,7 @@ A/B 实测（用真实对话各生成 12 次）也证实：**加规则量不出�
 ## 判据现在从哪来
 
 原来窗口、阈值、正则、抑制文案**全部硬编码在本文件里**，只覆盖"提时间"与"追问"两个特质。
-现在它们登记在 `persona_traits.json` 的 `guards` 下，本文件按注册表构造判定器 ——
+现在它们登记在 `persona/active/traits.json` 的 `guards` 下，本文件按注册表构造判定器 ——
 **于是"加一个可数守卫"变成加一条数据，而不是改这个文件。**
 
 **内置的 `TIME_RE` / `ASK_RE` 与默认窗口阈值继续保留**：注册表缺失或损坏时守卫照常工作。
@@ -105,7 +105,7 @@ def _positive_int(value: object, default: int) -> int:
 
 
 def _build_spec() -> tuple:
-    """按 `persona_traits.json` 的 guards 构造判定器；注册表用不上就退回内置默认。
+    """按 `persona/active/traits.json` 的 guards 构造判定器；注册表用不上就退回内置默认。
 
     返回 `(默认窗口, 默认阈值, rules)`，`rules` 每条是
     `(id, label, 正则, 抑制文案, window, threshold)`。

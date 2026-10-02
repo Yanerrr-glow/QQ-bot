@@ -10,7 +10,7 @@
 | 改昵称 | `set_qq_profile` | `nickname`（还有 `personal_note`） | 标准接口 |
 | 改群名片 | `set_group_card` | `group_id` / `user_id` / `card` | 只影响本群 |
 
-拿验证过的做法打底：`_工具链/设置头像.py` 早就用独立 WS 客户端调过 `set_qq_avatar`，
+拿验证过的做法打底：`_工具链/启动/设置头像.py` 早就用独立 WS 客户端调过 `set_qq_avatar`，
 返回 `{"status":"ok","retcode":0}`，并且能从 QQ 头像 CDN 拉回新图自证。
 机器人进程里可以直接走 `bot.call_api(...)`，不必再自己连一条 WS。
 
@@ -63,7 +63,7 @@ def unwrap(resp: Any) -> dict:
     本项目两条路都在用：
 
     * 插件里走 `bot.call_api()` —— NoneBot2 已经把响应信封剥掉了，拿到的是 `data` 的内容；
-    * `_工具链/设置头像.py` 直接连 WS 调 —— 拿到的是完整信封
+    * `_工具链/启动/设置头像.py` 直接连 WS 调 —— 拿到的是完整信封
       `{"status": "ok", "retcode": 0, "data": {...}}`。
 
     取字段前统一摊平，免得同一个接口因为"从哪调的"而解析出两种结果。

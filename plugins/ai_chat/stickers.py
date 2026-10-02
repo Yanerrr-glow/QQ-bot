@@ -27,7 +27,7 @@
 `sub_type`（1=表情 / 7=贴纸…）、文件大小、谁发的、是不是主人发的、前后文聊什么。
 两条路径下分数都是模型给的，区别只在**它有没有看到像素**。
 
-存储：data/stickers/ 下按内容哈希命名，索引写 data/stickers/index.json。
+存储：data/runtime/stickers/ 下按内容哈希命名，索引写 data/runtime/stickers/index.json。
 同一个文件在群里被转发多次只会存一份（哈希去重）。
 """
 
@@ -45,7 +45,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
-from . import config, llm, perceptual, settings, state
+from . import config, llm, netguard, perceptual, settings, state
 from .perceptual import distance as phash_distance
 
 logger = logging.getLogger("ai_chat.stickers")
@@ -86,9 +86,15 @@ def _download(url: str, timeout: float = 15.0) -> bytes:
 
     用 urllib 而不是引入 aiohttp/httpx：这个项目只在这一处需要拉图，
     不值得为一个功能多背一个 HTTP 依赖。
+
+    ⚠ 图片段的 `url` / `file` 是**外部可控输入**，所以这里必须过公网校验，
+    并且用带逐跳复检的 opener（默认 `urlopen` 不查重定向）—— 2026-09-28 补。
     """
+    ok, why = netguard.check_url(url)
+    if not ok:
+        raise OSError(f"拒绝下载：{why}")
     req = urllib.request.Request(url, headers={"User-Agent": "nonebot-ai-chat/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 来源是 OneBot 给的图片地址
+    with netguard.open_checked(req, timeout=timeout) as resp:
         return resp.read(_DOWNLOAD_LIMIT)
 
 

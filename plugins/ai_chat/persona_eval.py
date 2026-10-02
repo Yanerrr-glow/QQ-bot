@@ -8,7 +8,7 @@
 | §2.1 artifact ② 评测题（40 题 = 20 抽取 + 20 评估） | `eval_questions`（本项目的抽取集由 `gate_terms` 担任，所以这里只要评估集） |
 | §2.1 artifact ③ rubric（裁判按它输出 0-100） | `rubric` |
 | §B.1 取 top-20 logits 里 0-100 整数 token 做**加权和** | **改了**，见下 |
-| §B.2 人机一致率验证（论文 94.7%） | `_工具链/人机对齐.py` + 记进 `data/persona_eval.json` |
+| §B.2 人机一致率验证（论文 94.7%） | **未实现**（原计划放 `验证/人机对齐.py`，该脚本从未落地）+ 记进 `data/runtime/persona/eval.json` |
 | §4.2 微调后行为变化与向量投影强相关 | `run_round()` 出的基线分 + 历史 → 漂移曲线 |
 | §5 用向量预测候选的效果 | `shadow_evaluate()`：候选先测再给人看 |
 
@@ -38,11 +38,11 @@ max_tokens=1`）现在返回 **20 个真实候选**：top-1 `-0.028`，其后 `-
 
 > 注意 `deepseek-chat` **不在 `/models` 的返回列表里**（那一列只有 flash 与 v4-pro），
 > 但它**调用完全正常** —— 属未公开的兼容别名。所以判断"模型能不能用"要**看调得通不通**，
-> 不能只看列表（`_工具链/上手自检.py` 的模型检查就是这么做的）。
+> 不能只看列表（`_工具链/启动/上手自检.py` 的模型检查就是这么做的）。
 
 ## 数据落在哪
 
-**`data/persona_eval.json`（卷内，运行时）**，不写回 `persona_traits.json`。
+**`data/runtime/persona/eval.json`（卷内，运行时）**，不写回 `persona/active/traits.json`。
 理由与表层人设同一条：生成物不该被打进镜像 —— 重新生成一次不该需要重建镜像。
 注册表里那几个槽位保留为**结构声明**。
 
@@ -64,7 +64,7 @@ from . import config, llm, persona, settings
 
 logger = logging.getLogger("ai_chat.persona_eval")
 
-_FILE = "persona_eval.json"
+_FILE = "eval.json"
 _MAX_RUNS = 60           # 历史轮次上限（按时间淘汰最旧的）
 _NEUTRAL = 3.0           # 影子评估的"测不出差异"阈值（分）
 _GEN_TOKENS = 4000       # 生成素材用多少 max_tokens（见 `_ask()` 的说明）
@@ -121,7 +121,7 @@ def _questions_per_trait() -> int:
 
 # --------------------------------------------------------------------- 存取
 def _path():
-    return config.LOG_DIR / _FILE
+    return config.persona_data_dir() / _FILE
 
 
 def _load() -> dict[str, Any]:

@@ -239,7 +239,7 @@ _lock = asyncio.Lock()
 #   ② 当天额度用完之后进来的消息，永久不入库，第二天也不会补。
 # 水位线把「抽到哪了」记在盘上，配额不够只是**推迟**，不再是丢。
 #
-# 存储：`data/memory_extract_state.json`（**独立小文件**，不塞进 memories.json）。
+# 存储：`data/runtime/memory_extract_state.json`（**独立小文件**，不塞进 memories.json）。
 # 理由有两个：一是 memories.json 已有损坏只读逻辑，水位线跟着它一起坏没有好处；
 # 二是 M1 把记忆迁去 SQLite 时，这个文件可以原样搬过去，不需要改结构。
 _EXTRACT_STATE = "memory_extract_state.json"
@@ -1897,8 +1897,13 @@ async def drain_extraction(conv: str, *, max_messages: int = 0, only_rolled: boo
     )
     last_id = int(messages[-1].get("id", 0))
     dropped = compact()
-    _advance_watermark(conv, last_id, len(messages))
+    # **先落盘记忆，再推进水位线 —— 顺序不能反。**
+    # `_advance_watermark()` 内部是**同步写盘**的，它是"这批已经抽完了"的凭据。
+    # 若先推水位线再落盘，这两步之间被杀/掉电就会出现"水位线已永久前进、记忆却没了"，
+    # 而且当日额度也已经计入 —— 那一段话就等于**永久丢掉**（不可恢复）。
+    # 反过来最多把这批再抽一遍，而抽取对已有条目走覆盖/去重，是幂等的。
     await _persist()
+    _advance_watermark(conv, last_id, len(messages))
     flush_usage(force=True)  # 抽取是低频动作，顺手把使用计数收尾，免得攒着
     logger.info(
         "记忆抽取 conv=%s 处理 %d 条（到 #%d），新增/更新 %d 条，淘汰 %d 条",

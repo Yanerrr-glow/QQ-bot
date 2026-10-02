@@ -33,9 +33,9 @@ import { join } from "node:path";
 // 服务器地址与远端目录从环境变量取（默认值只是"照 deploy/README.md 部署"时的常见形态）。
 // 用环境变量而不是写死：这两项属于个人环境，不该固化进仓库。
 //     $env:QQBOT_SSH_HOST   = 'myserver'                  # ~/.ssh/config 里的别名
-//     $env:QQBOT_REMOTE_DIR = '/opt/qq-bot/data/dsh_bridge'
+//     $env:QQBOT_REMOTE_DIR = '/opt/qq-bot/data/runtime/dsh_bridge'
 const SSH_HOST = process.env.QQBOT_SSH_HOST || "qqbot";
-const REMOTE_DIR = process.env.QQBOT_REMOTE_DIR || "/opt/qq-bot/data/dsh_bridge";
+const REMOTE_DIR = process.env.QQBOT_REMOTE_DIR || "/opt/qq-bot/data/runtime/dsh_bridge";
 const INTERVAL_SEC = 2;                         // 轮询间隔（实测单次往返 ~800ms）
 const MAX_TASK_AGE_SEC = 600;                   // 超过这么久没被取走的任务直接丢弃
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;       // 单次 dsh 输出上限（防内存被拉爆）

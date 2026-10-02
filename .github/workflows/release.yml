@@ -2,7 +2,7 @@ name: Release
 
 # 打 tag（v*）就出 Release：**现构建** `上手自检.exe` 并附到 Release 上。
 #
-# 为什么交给 Actions 而不是本地打包：exe 把 `_工具链/上手自检.py` **烤进了二进制**，
+# 为什么交给 Actions 而不是本地打包：exe 把 `_工具链/启动/上手自检.py` **烤进了二进制**，
 # 本地忘了重打包就会发出旧逻辑 —— 仓库里那条时间戳提醒只能"提示"，不能"保证"。
 # 在 tag 上现构建，产物一定对应那一版源码，这个问题从根上消失。
 on:
@@ -37,7 +37,7 @@ jobs:
           python -m PyInstaller --onefile --console --noconfirm --clean `
             --name 上手自检 `
             --distpath dist --workpath build --specpath build `
-            _工具链/上手自检.py
+            _工具链/启动/上手自检.py
           if (-not (Test-Path 'dist/上手自检.exe')) { throw '打包没产出 exe' }
 
       - name: 算 SHA256（与本地打包脚本同一格式：无 BOM 的 UTF-8）
@@ -58,7 +58,7 @@ jobs:
           #    于是"被检出的阻塞"会直接把这一步判红、后面的发版步骤全部跳过 ——
           #    实测踩过：冒烟红、Release 没建成。
           # ② pwsh 步骤预先设了 `$ErrorActionPreference = 'stop'`，原生命令往 stderr
-          #    写一个字就会变成终止性错误（与 `_工具链/_打包上手exe.ps1` 里记的同源坑）。
+          #    写一个字就会变成终止性错误（与 `_工具链/发布/_打包上手exe.ps1` 里记的同源坑）。
           $ErrorActionPreference = 'Continue'
           $out = & 'dist/上手自检.exe' --no-input --offline 2>&1 | Out-String
           $code = $LASTEXITCODE
@@ -96,5 +96,5 @@ jobs:
             ## 自己构建
 
             ```powershell
-            & '.\_工具链\_打包上手exe.ps1'     # 产出 dist\上手自检.exe
+            & '.\_工具链\发布\_打包上手exe.ps1'     # 产出 dist\上手自检.exe
             ```

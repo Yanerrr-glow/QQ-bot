@@ -1,0 +1,19 @@
+# 桌面控制台（PySide6）的依赖 —— **与 requirements.txt（机器人本体）严格分开**。
+#
+# 为什么不合并成一个清单：
+#   机器人本体跑在服务器/容器里，多装一个 PySide6 就是几百 MB 的无用负载，
+#   而且容器里根本没有显示器。桌面端只有"要管机器人的人"才装。
+#
+# 安装（项目自带脚本会自动做这一步，且走阿里云镜像）：
+#   & '.\_工具链\启动\启动控制台.ps1'
+#
+# 手动装：
+#   python -m venv .venv-desktop
+#   .venv-desktop\Scripts\python.exe -m pip install -r requirements-desktop.txt `
+#       -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 核心层（desktop/core、desktop/sdk）**只用标准库**，所以：
+#   - 没装 PySide6 也能跑 `python -m desktop selfcheck`
+#   - 服务端安装不受本文件影响
+
+PySide6>=6.5,<7

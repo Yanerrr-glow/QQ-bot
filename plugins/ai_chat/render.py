@@ -36,7 +36,9 @@
 
 Chromium 冷启动要 1–3s。每次渲染都开关的话，一次搜索预读要白花好几秒，
 所以进程内**共享一个浏览器实例**，用完不关；崩了下次重建。
-`shutdown()` 供进程退出时调用（`__init__.py` 的清理钩子里）。
+`shutdown()` 用来关掉共享浏览器。**注意：目前没有任何调用方** ——
+插件侧还没接停机钩子（`__init__.py` 只有 `on_startup`），所以进程退出时 Chromium 由系统回收。
+接优雅停机时（`@_driver.on_shutdown`）要记得把 `render.shutdown()` 与 `msgindex.close()` 一起调上。
 
 ## 与 fetch.py 一致的三条底线
 

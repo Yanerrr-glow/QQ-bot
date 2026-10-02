@@ -1,7 +1,7 @@
 """表层人设落在 data/ 的验证（纯逻辑、不连网、不调模型）。
 
 为什么需要它：表层是**唯一会被自动迭代写入**的一层，而它原来躺在镜像里
-（`Dockerfile` 的 `COPY persona_surface.txt ./`）—— 每次重建都会用"本机那份"
+（`Dockerfile` 的 `COPY persona/active ./persona/active`）—— 每次重建都会用"本机那份"
 把"线上学到的"顶掉，而且**不报错**。2026-09-26 找现场时才发现
 （服务器 surface 49 行、本地 48 行，多出来的正是一条迭代成果）。
 
@@ -20,11 +20,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 PROJ = HERE.parent
 PKG = PROJ / "plugins" / "ai_chat"
 # 自定位回退：脚本被拷到别处（例如容器里的 /tmp）时，按自身位置推出来的 PROJ 是错的
-# （会推成 `/`，于是找不到 persona_*.txt）。允许用参数指定，或退到容器标准路径 `/app`。
+# （会推成 `/`，于是找不到 `persona/active/`）。允许用参数指定，或退到容器标准路径 `/app`。
 if len(sys.argv) > 1:
     PROJ = pathlib.Path(sys.argv[1]).resolve()
     PKG = PROJ / "plugins" / "ai_chat"
-elif not (PROJ / "persona_surface.txt").is_file() and (pathlib.Path("/app") / "persona_surface.txt").is_file():
+elif not (PROJ / "persona/active/surface.txt").is_file() and (pathlib.Path("/app") / "persona/active/surface.txt").is_file():
     PROJ = pathlib.Path("/app")
     PKG = PROJ / "plugins" / "ai_chat"
 
@@ -44,8 +44,9 @@ def check(name, cond, detail=""):
 
 # ---- 造一个干净的项目根：模板放根目录，LOG_DIR 指向临时 data/ ----
 root = pathlib.Path(tempfile.mkdtemp(prefix="dsh_surface_"))
-(root / "data").mkdir()
-for f in ("persona_surface.txt", "persona_base.txt", "persona_forbidden.txt"):
+(root / "data" / "runtime" / "persona").mkdir(parents=True)
+(root / "persona" / "active").mkdir(parents=True)
+for f in ("persona/active/surface.txt", "persona/active/base.txt", "persona/active/forbidden.txt"):
     shutil.copy(PROJ / f, root / f)
 
 sys.modules["ai_chat"] = types.ModuleType("ai_chat")
@@ -73,8 +74,8 @@ except Exception as exc:  # noqa: BLE001
 c = sys.modules["ai_chat.config"]
 
 print("-- 1. 路径归属 --")
-check("读写路径在 data/ 内（卷内，跨重建保留）",
-      c.surface_file_path().parent == root / "data", c.surface_file_path())
+check("读写路径在 data/runtime/persona/ 内（卷内持久化）",
+      c.surface_file_path().parent == root / "data" / "runtime" / "persona", c.surface_file_path())
 check("模板路径在项目根（只作播种用）",
       c.surface_seed_path().parent == root, c.surface_seed_path())
 check("模块导入期不炸（`SYSTEM_PROMPT = compose_prompt()` 会提前调它）",
@@ -82,7 +83,7 @@ check("模块导入期不炸（`SYSTEM_PROMPT = compose_prompt()` 会提前调�
 
 print("-- 2. 首次启动：播种 --")
 msg = c.seed_surface()
-check("播种到 data/", c.surface_file_path().exists(), msg)
+check("播种到 data/runtime/persona/", c.surface_file_path().exists(), msg)
 check("播种是**字节级**搬运（不引入 CRLF↔LF 差异）",
       c.surface_file_path().read_bytes() == c.surface_seed_path().read_bytes())
 check("读得到内容", len(c.load_surface()) > 0)

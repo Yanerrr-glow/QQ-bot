@@ -3,7 +3,7 @@
 启动方式：
     python bot.py
 或使用项目内脚本：
-    _工具链\\启动机器人.ps1
+    _工具链\\启动\\启动机器人.ps1
 
 它做三件事：
 1. nonebot.init() 读取同目录 .env 完成配置；
@@ -22,7 +22,7 @@ nonebot.init()
 
 # 标准 logging 默认不挂 handler，插件里 logger.info(...) 会被直接丢掉 ——
 # 排查问题时日志一片空白，只能靠猜。这里桥接到控制台（stderr），
-# 由启动脚本一并写进 data/bot.log。
+# 由启动脚本一并写进 data/runtime/logs/bot.log。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",

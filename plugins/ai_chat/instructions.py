@@ -440,9 +440,9 @@ def mark_current_image_ignored(conv: str) -> None:
 #   /人设 重跑      立刻触发一次自我反思（后台也会定期跑）
 def _persona_readonly_hint() -> str:
     return (
-        "（改人格的指令已经删掉了 —— 现在只能直接编辑文件，"
-        "改完不用重启：\n"
-        "  底层人设 / 禁止事项 / 表层人设 三个文件的路径见 /人设 状态）"
+        "（改人格的指令已经删掉了 —— 现在只能直接编辑文件：\n"
+        "  底层人设 / 禁止事项 / 表层人设 三个文件的路径见 /人设 状态。\n"
+        "  生效时机：表层改完即生效；底层人设与禁止事项改完**要重启**）"
     )
 
 
@@ -782,7 +782,7 @@ async def _cmd_time(rest: str, *, conv: str, is_master: bool, ctx: Any = None) -
         return _say(
             "time",
             f"时间戳 {int(now)}（{config.now_stamp()}）\n"
-            "把它当 Unix 秒用就行；_工具链/离线验证_桩.py 里有时间计算的用例。",
+            "把它当 Unix 秒用就行；验证/离线验证_桩.py 里有时间计算的用例。",
         )
 
     # /时间 校准 —— 立刻跟 NTP 对一次，不用等后台周期

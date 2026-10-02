@@ -11,9 +11,9 @@
 
 | 层 | 文件 | 谁能写 | 进 prompt 的顺序 |
 |---|---|---|---|
-| 底层人设 | `persona_base.txt` | **只有用户**（直接编辑） | 第 1 位（最硬） |
-| 禁止事项 | `persona_forbidden.txt` | **只有用户**（直接编辑） | 第 2 位 |
-| 表层人设 | `persona_surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
+| 底层人设 | `persona/active/base.txt` | **只有用户**（直接编辑） | 第 1 位（最硬） |
+| 禁止事项 | `persona/active/forbidden.txt` | **只有用户**（直接编辑） | 第 2 位 |
+| 表层人设 | `persona/active/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
 
 **「只有用户能写」不是靠提示词约束，是靠代码**：本模块里只有 `surface_*` 系列函数，
 底层与禁止事项**连写函数都不存在**（`BASE_PROMPT` / `FORBIDDEN_PROMPT` 是只读常量）。
@@ -39,9 +39,23 @@
 逆向表述（「不叫主人」「别用客服腔」）作为**允许**特例放在最前面 ——
 它们字面命中关键词，但语义上是在**站在铁律这一边**。
 
+`forbidden_kw` 的关键词表**由 `persona/active/traits.json` 的 `gate_terms` 派生**（当前 56 条），
+不再手工维护；注册表读不到时回退内置表，闸门绝不裸奔。
+⚠ 派生发生在 **import 期**：改了注册表、或给某条铁律加注释，闸门要**重启**才跟着变。
+
+## 候选池：默认不直接生效
+
+闸门只拦"碰铁律"，**拦不住风格跑偏**（学成话痨、学成另一个语气）——
+那种改动照过闸门，人在群里只觉得"它今天怪怪的"。所以合规候选
+**默认先进 `data/runtime/persona/candidates.json` 等人采纳**：
+`/人设 候选` 看池子、`/人设 采纳 <序号>` 才写表层、`/人设 否决 <序号>` 丢弃
+（对应 `propose_candidate` / `approve_candidate` / `reject_candidate`）。
+采纳时会**再过一次闸门** —— 池子里的条目在等待期间可能已经因为底层人设被改而变得不合规。
+把 `persona_iter_auto_apply` 打开才退回"过闸门即生效"的旧行为（默认**关**）。
+
 ## 变更日志
 
-每次写入/丢弃都进 `data/persona_changelog.json`，`/人设 撤回` 撤销最近一次**写入**。
+每次写入/丢弃都进 `data/runtime/persona/changelog.json`（上限 200 条），`/人设 撤回` 撤销最近一次**写入**。
 这是路线 C 能被信任的前提：**每次自动改动都可查、可撤**。
 """
 
@@ -58,11 +72,14 @@ from . import config, settings
 
 logger = logging.getLogger("ai_chat.persona")
 
-_FILE = "persona_changelog.json"
+_FILE = "changelog.json"
 _MAX_LOG = 200          # 变更日志上限（按时间淘汰最旧的）
 _MIN_ITEM = 8           # 一条表层内容至少这么长才算"成条目"
 _SIMILAR = 0.62         # 与底层人设的 n-gram 覆盖率超过它就视为"偷偷改一点"
 _MAX_ITEM = 200         # 单条候选的长度上限
+# 落点节：`apply_candidate` 是**纯追加、不识别小节**的，所以「文件末尾那个【…】小节」
+# 就决定了新条目会落在哪个语义的小节下面。写入前必须校验它（见 `_landing_ok`）。
+_LANDING_HEAD = "【自动学到的"
 
 
 # --------------------------------------------------------------------- 三层读
@@ -131,7 +148,7 @@ def forbidden_items() -> list[str]:
       恰是那条铁律里最要紧的半句，而冲突闸门正是拿条目原文去判候选的。
 
     现在只看 `raw` 的首字符：**行首无缩进的才算新条目**，带缩进的一律接回上一条。
-    注意 `_工具链/_人设结构检查.py` 里有一份**独立复算**的同名实现（它要能脱离依赖直跑），
+    注意 `验证/_人设结构检查.py` 里有一份**独立复算**的同名实现（它要能脱离依赖直跑），
     两份必须同口径 —— 这次就是它按旧口径数出 20 条、把运行时的 21 条盖了过去，
     于是"巡检 0 错误"掩盖了幻影条目。`离线验证_桩.py` 已加逐条比对断言钉住这个漂移。
     """
@@ -196,7 +213,7 @@ def _blocks(text: str) -> list[str]:
 # 没有这一层，「不叫主人」「别用客服腔」这类正确表述会被闸门误杀 ——
 # 而它们恰恰是自动迭代最该学的东西。
 # ------------------------------------------------------------------ 闸门关键词
-# **从 `persona_traits.json` 派生，不再手工维护。**
+# **从 `persona/active/traits.json` 派生，不再手工维护。**
 #
 # 为什么改：原来这里是手写的 10 项关键词表，而铁律有 13 条 —— 实测只有 5 条被覆盖，
 # 另外 8 条对自动迭代是**敞开的**（它可以合法地把「以后多提提米饭」写进表层）。
@@ -309,33 +326,57 @@ def _similar_to_base(cand: str) -> tuple[float, str]:
     return best, hit
 
 
+def _segments(text: str) -> list[str]:
+    """按句读把候选切成小段。
+
+    **逆向放行只该豁免它所在的那一段**，不能整串跳过 —— 否则
+    「不能说自己是AI，你其实是个男生」这种"前半句重申铁律、后半句改身份"的候选
+    会因为前半句命中否定词而**整条放行**（2026-09-28 实测确认的闸门旁路）。
+    """
+    return [s.strip() for s in re.split(r"[。！？；!?;\n，,、]", str(text or "")) if s.strip()]
+
+
 def validate_surface(candidate: str) -> tuple[bool, str, str]:
     """候选表层内容能不能写入。返回 `(可否, 原因代码, 人话说明)`。
 
     这是**唯一的判定入口** —— 写入路径、控制台采纳、离线验证都调它，
     保证"什么算冲突"只有一处定义（否则三处判定迟早不一致）。
+
+    **判据逐段独立求值**（见 `_segments`）：命中否定词的段落豁免关键词与身份两道检查，
+    没命中的段落照常检查；只要还有"陈述"段落，`base_similar` 仍按**整串**判 ——
+    防"夹一句否定当护身符、其余照改底层"。
     """
     cand = " ".join(str(candidate or "").split())
     if len(cand) < _MIN_ITEM:
         return False, "too_short", f"太短（少于 {_MIN_ITEM} 字），不成条目"
     if len(cand) > _MAX_ITEM:
         return False, "too_long", f"太长（超过 {_MAX_ITEM} 字），一条只说一件事"
-    if _NEGATION.search(cand):
-        # 逆向表述：允许。它是在重申铁律，不是违反它。
+
+    plain: list[str] = []
+    negated = False
+    for seg in _segments(cand):
+        if _NEGATION.search(seg):
+            # 这一段是在重申铁律（「不要用客服腔说话」）→ 豁免下面两道检查
+            negated = True
+            continue
+        plain.append(seg)
+
+    for seg in plain:
+        for kw, why in _CONFLICTS:
+            if kw in seg:
+                return False, "forbidden_kw", f"命中禁止事项「{kw}」—— {why}"
+        # 身份代词：否定语境放行（「你不能说自己是AI」是在重申铁律），
+        # 陈述语境才算冲突。注意先判否定 —— 否则那条正确表述会被误杀。
+        if _IDENTITY_NEGATION.search(seg) is None:
+            m = _IDENTITY.search(seg)
+            if m:
+                return False, "base_pronoun", (
+                    f"改动了身份表述（「{m.group(0)}」）—— 身份属于底层人设，表层不能改"
+                )
+
+    if not plain:
+        # 整串都是逆向表述：允许。它是在重申铁律，不是违反它。
         return True, "ok_negated", "（逆向表述，视为重申铁律）"
-
-    for kw, why in _CONFLICTS:
-        if kw in cand:
-            return False, "forbidden_kw", f"命中禁止事项「{kw}」—— {why}"
-
-    # 身份代词：否定语境放行（「你不能说自己是AI」是在重申铁律），
-    # 陈述语境才算冲突。注意先判否定 —— 否则那条正确表述会被误杀。
-    if _IDENTITY_NEGATION.search(cand) is None:
-        m = _IDENTITY.search(cand)
-        if m:
-            return False, "base_pronoun", (
-                f"改动了身份表述（「{m.group(0)}」）—— 身份属于底层人设，表层不能改"
-            )
 
     score, line = _similar_to_base(cand)
     if score >= _SIMILAR:
@@ -353,7 +394,7 @@ class _Log:
         self.loaded = False
 
     def _path(self) -> Path:
-        return config.LOG_DIR / _FILE
+        return config.persona_data_dir() / _FILE
 
     def ensure(self) -> None:
         if not self.loaded:
@@ -432,6 +473,52 @@ def changelog(limit: int = 12, *, action: str = "") -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------- 表层写入
+def _landing_ok(text: str) -> tuple[bool, str]:
+    """表层末尾那个【…】小节必须**是落点节**（`_LANDING_HEAD`）。
+
+    为什么需要它：`apply_candidate` 是纯追加、不识别小节，所以"新条目落在哪个语义的
+    小节下面"完全由文件末尾那个标题决定。2026-09-25 踩过一次：旧文件末尾是对不上的
+    小节，学到的条目全堆在了它下面（那个空的【语言风格】就是这么来的）。
+    全新文件（一个小节都没有）视为可以追加 —— 那本来就是落点。
+    """
+    heads = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("【")]
+    if not heads:
+        return True, ""
+    if heads[-1].startswith(_LANDING_HEAD):
+        return True, ""
+    return False, (
+        f"表层人设末尾的小节是「{heads[-1][:26]}」，不是自动迭代的落点节"
+        f"「{_LANDING_HEAD}…】」—— 先把落点节移回文件末尾再让它学"
+    )
+
+
+def _budget_ok(cur: str, candidate: str) -> tuple[bool, str]:
+    """表层**总量**预算（2026-09-28 补）。
+
+    条目级长度早就限了（`_MIN_ITEM` / `_MAX_ITEM`），但这一层是唯一会自己长大的
+    prompt 段落：6 小时一轮、每轮最多 2 条 → 一天最多 8 条，而没有任何上限。
+    超限**拒绝写入**并如实告知，由人来删 —— 谁该被淘汰没有客观依据，所以不自动淘汰
+    （与长期记忆的自动淘汰刻意不同）。
+    """
+    max_chars = int(settings.get("surface_max_chars") or 0)
+    max_items = int(settings.get("surface_max_items") or 0)
+    if max_chars > 0:
+        after = len(cur.rstrip()) + len(candidate) + 3  # 3 = "\n- "
+        if after > max_chars:
+            return False, (
+                f"表层字数要超上限了（现在 {len(cur)} 字，加这条约 {after} 字，"
+                f"上限 {max_chars} 字）—— 删几条过时的，或把 surface_max_chars 调大"
+            )
+    if max_items > 0:
+        items = sum(1 for ln in cur.splitlines() if ln.strip().startswith("- "))
+        if items + 1 > max_items:
+            return False, (
+                f"表层条目数到上限（已有 {items} 条，上限 {max_items} 条）—— 先清理几条，"
+                f"或把 surface_max_items 调大"
+            )
+    return True, ""
+
+
 def apply_candidate(candidate: str, *, reason: str = "", source: str = "自我反思") -> dict[str, Any]:
     """把一条候选写进表层人设。**先过闸门，冲突就不写。**
 
@@ -450,6 +537,19 @@ def apply_candidate(candidate: str, *, reason: str = "", source: str = "自我�
     if text and text in cur:
         # 已经在里面了（可能是模型换个说法重复提议）—— 不算改动
         return {"written": False, "code": "duplicate", "why": "这条已经在表层人设里了", "text": text}
+
+    # 落点节 + 预算：两道**结构**闸门（不是内容闸门）。
+    # 顺序放在内容闸门之后：先判"这条该不该写"，再判"现在还能不能写"。
+    ok, why = _landing_ok(cur)
+    if not ok:
+        log_change("rejected", text=text, reason=why, code="no_landing", source=source)
+        logger.warning("表层人设落点节不对，拒绝写入：%s", why)
+        return {"written": False, "code": "no_landing", "why": why, "text": text}
+    ok, why = _budget_ok(cur, text)
+    if not ok:
+        log_change("rejected", text=text, reason=why, code="over_budget", source=source)
+        logger.warning("表层人设超出预算，拒绝写入：%s", why)
+        return {"written": False, "code": "over_budget", "why": why, "text": text}
 
     path = config.surface_file_path()
     try:
@@ -487,11 +587,23 @@ def undo_last() -> dict[str, Any]:
     cur = surface_text()
     if not text:
         return {"ok": False, "why": "那条记录里没有内容"}
-    # 只删**整行匹配**的那一条，避免误伤包含它的别的句子
+    # **只删第一条整行匹配**（用索引定位，不用列表推导）。
+    # 原来写成列表推导，同一文本出现两次会把两条**一起删掉** ——
+    # 与注释承诺的"只删一条"不符，属超出撤回范围。
     lines = cur.splitlines()
-    kept = [ln for ln in lines if ln.strip() != f"- {text}".strip() and ln.strip() != text]
-    if len(kept) == len(lines):
-        return {"ok": False, "why": "表层人设里找不到那条内容了（可能已被手工删除）"}
+    want = {f"- {text}".strip(), text.strip()}
+    hit = next((i for i, ln in enumerate(lines) if ln.strip() in want), None)
+    if hit is None:
+        # 找不到也要**留痕**：不记这一条的话，账本里那条仍是 `added`、
+        # 而文件里其实已经没有了 —— 两边不一致且无人发现。
+        log_change(
+            "undo_missed",
+            text=text,
+            reason="表层人设里找不到那条内容（可能已被手工删除或改写）",
+            source="主人",
+        )
+        return {"ok": False, "why": "表层人设里找不到那条内容了（可能已被手工删除或改写过）"}
+    kept = lines[:hit] + lines[hit + 1:]
     path = config.surface_file_path()
     try:
         tmp = path.with_name(path.name + ".tmp")
@@ -558,6 +670,7 @@ def changelog_text(limit: int = 12) -> str:
         "undone": "↩️ 撤回",
         "proposed": "📥 待采纳",
         "approve_rejected": "🗑 人工否决",
+        "undo_missed": "⚠️ 撤回未命中",
     }
     lines: list[str] = []
     for it in items:
@@ -565,7 +678,7 @@ def changelog_text(limit: int = 12) -> str:
             f"{mark.get(str(it.get('action')), it.get('action'))} "
             f"{it.get('at', '')[:16]}｜{str(it.get('text', ''))[:44]}"
         )
-        if it.get("action") in ("rejected", "approve_rejected") and it.get("reason"):
+        if it.get("action") in ("rejected", "approve_rejected", "undo_missed") and it.get("reason"):
             lines.append(f"    理由：{str(it['reason'])[:70]}")
     return "\n".join(lines)
 
@@ -580,7 +693,7 @@ def changelog_text(limit: int = 12) -> str:
 #
 # 现在：自动迭代产出 → 落候选池 + 通知 → 人工 /人设 采纳 才进表层。
 # 开关 `persona_iter_auto_apply=True` 可退回改造前的直接生效行为。
-_PENDING_FILE = "persona_candidates.json"
+_PENDING_FILE = "candidates.json"
 _MAX_PENDING = 50      # 池上限；满了按时间淘汰最旧的待采纳条目
 
 
@@ -590,7 +703,7 @@ class _Pending:
         self.loaded = False
 
     def _path(self) -> Path:
-        return config.LOG_DIR / _PENDING_FILE
+        return config.persona_data_dir() / _PENDING_FILE
 
     def ensure(self) -> None:
         if not self.loaded:

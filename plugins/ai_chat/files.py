@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from . import settings
+from . import netguard, settings
 
 logger = logging.getLogger("ai_chat.files")
 
@@ -74,6 +74,9 @@ def _download_httpx2(url: str, timeout: float) -> bytes:
     """
     import httpx2
 
+    ok, why = netguard.check_url(url)
+    if not ok:
+        raise OSError(f"拒绝下载：{why}")
     resp = httpx2.get(url, timeout=timeout, follow_redirects=True)
     if resp.status_code >= 400:
         raise OSError(f"HTTP {resp.status_code}")
@@ -81,11 +84,12 @@ def _download_httpx2(url: str, timeout: float) -> bytes:
 
 
 def _host_ips(host: str) -> list[str]:
-    """解析出该主机的全部 IPv4 地址（按 DNS 顺序，去重）。"""
-    try:
-        return list(dict.fromkeys(i[4][0] for i in socket.getaddrinfo(host, None, socket.AF_INET)))
-    except OSError:
-        return []
+    """解析出该主机的全部 **公网** IPv4 地址（按 DNS 顺序，去重）。
+
+    ⚠ 只保留公网地址：这个函数的结果会当**连接目标**用，
+    不能因为 DNS 里混了一个内网地址就去连它（见 `netguard` 的说明）。
+    """
+    return netguard.public_ips(host)
 
 
 def _download_via_ips(url: str, timeout: float) -> bytes:
@@ -112,10 +116,13 @@ def _download_via_ips(url: str, timeout: float) -> bytes:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or not parts.hostname:
         raise OSError("只有 https 才按 IP 重试")
+    ok, why = netguard.check_url(url)
+    if not ok:
+        raise OSError(f"拒绝下载：{why}")
 
     ips = _host_ips(parts.hostname)
     if not ips:
-        raise OSError("解析不出 IP")
+        raise OSError("解析不出公网 IP")
     # **打乱顺序**：可用 IP 的分布是随机的（实测 1/5），打乱后平均试 2~3 个就命中。
     random.shuffle(ips)
     host = parts.hostname
@@ -126,30 +133,34 @@ def _download_via_ips(url: str, timeout: float) -> bytes:
     #    结果那个唯一能握手的 IP 还没握完就被掐了 —— 表现就是"全部 IP 都失败"。
     per_ip = max(5.0, float(timeout))
 
-    try:
-        for ip in ips:
-            def _pinned(h, p, *args, **kw):  # noqa: ANN001, ANN202
-                # 只把目标域名钉到当前 IP，其它查询照旧（避免影响别的解析）
-                if h == host:
-                    return real_getaddrinfo(ip, p, *args, **kw)
-                return real_getaddrinfo(h, p, *args, **kw)
+    # 下面要临时替换**全局** `socket.getaddrinfo`，那是进程级改动：
+    # 加锁保证同一时刻只有一次"钉 IP"下载（并发下载会互相把解析钉到对方的 IP 上）。
+    with netguard.PIN_LOCK:
+        try:
+            for ip in ips:
+                def _pinned(h, p, *args, **kw):  # noqa: ANN001, ANN202
+                    # 只把目标域名钉到当前 IP，其它查询照旧（避免影响别的解析）
+                    if h == host:
+                        return real_getaddrinfo(ip, p, *args, **kw)
+                    return real_getaddrinfo(h, p, *args, **kw)
 
-            socket.getaddrinfo = _pinned  # type: ignore[assignment]
-            try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "nonebot-ai-chat/1.0"})
-                with urllib.request.urlopen(req, timeout=per_ip) as resp:  # noqa: S310
-                    data = resp.read(_HARD_LIMIT)
-                logger.info("按 IP 下载成功：%s（%s，%d 字节）", host, ip, len(data))
-                return data
-            except Exception as exc:  # noqa: BLE001 - 这个 IP 坏了就换下一个
-                last = exc
-                # 带上真实信息（超时/握手失败/HTTP 码），而不是只记异常名
-                logger.info("IP %s 失败（%s: %s），试下一个", ip, type(exc).__name__, str(exc)[:70])
-            finally:
-                socket.getaddrinfo = real_getaddrinfo  # type: ignore[assignment]
-    finally:
-        socket.getaddrinfo = real_getaddrinfo  # type: ignore[assignment]
+                socket.getaddrinfo = _pinned  # type: ignore[assignment]
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "nonebot-ai-chat/1.0"})
+                    # 用带逐跳复检的 opener：默认 opener 不查重定向
+                    with netguard.open_checked(req, timeout=per_ip) as resp:
+                        data = resp.read(_HARD_LIMIT)
+                    logger.info("按 IP 下载成功：%s（%s，%d 字节）", host, ip, len(data))
+                    return data
+                except Exception as exc:  # noqa: BLE001 - 这个 IP 坏了就换下一个
+                    last = exc
+                    # 带上真实信息（超时/握手失败/HTTP 码），而不是只记异常名
+                    logger.info("IP %s 失败（%s: %s），试下一个", ip, type(exc).__name__, str(exc)[:70])
+                finally:
+                    socket.getaddrinfo = real_getaddrinfo  # type: ignore[assignment]
+        finally:
+            socket.getaddrinfo = real_getaddrinfo  # type: ignore[assignment]
 
     if isinstance(last, urllib.error.HTTPError):
         raise OSError(f"HTTP {last.code}")   # 能连上但服务端拒绝（链接过期/要鉴权）
@@ -171,6 +182,13 @@ def download_bytes(url: str, timeout: float = 25.0) -> bytes:
     排查"是过期、是鉴权、还是网络"时直接用。
     """
     errors: list[str] = []
+
+    # ⓪ **先过公网校验**（2026-09-28 补）：群文件的 url 是外部可控输入，
+    #    不过这道门就能让容器去访问 searxng / 169.254.169.254 这类内网目标。
+    #    放在最前面是为了让**四条传输路径**（含 curl 那条无法单独插检查的）都被覆盖。
+    ok, why = netguard.check_url(url)
+    if not ok:
+        raise OSError(f"拒绝下载：{why}")
 
     # ① curl
     try:
@@ -205,10 +223,10 @@ def download_bytes(url: str, timeout: float = 25.0) -> bytes:
     except Exception as exc:  # noqa: BLE001
         errors.append(f"按IP {str(exc)[:60]}")
 
-    # ④ urllib 默认（兜底）
+    # ④ urllib 默认（兜底）—— 仍走带逐跳复检的 opener
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "nonebot-ai-chat/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with netguard.open_checked(req, timeout=timeout) as resp:
             return resp.read(_HARD_LIMIT)
     except urllib.error.HTTPError as exc:
         errors.append(f"urllib HTTP {exc.code}")

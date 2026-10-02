@@ -1,0 +1,12 @@
+{
+  "id": "memory_stats",
+  "name": "记忆概览",
+  "version": "1.0.0",
+  "api_version": "1",
+  "entrypoint": "plugin.py:create_plugin",
+  "description": "第二个示范插件：只读记忆与状态，证明同一目录下多个插件互不影响、且不需要 Qt 也能加载。",
+  "permissions": ["api.read.memory", "api.read.status"],
+  "navigation": {"section": "插件", "order": 30},
+  "enabled_by_default": true,
+  "builtin": true
+}

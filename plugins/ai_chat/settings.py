@@ -1,11 +1,11 @@
-"""运行时设置：UI 改完立即生效，并持久化到 data/settings.json。
+"""运行时设置：UI 改完立即生效，并持久化到 data/runtime/settings.json。
 
 为什么不让 UI 直接写 .env：
 1. .env 是人手维护的，程序回写容易把注释和格式搅乱；
 2. 改 .env 必须重启才生效，而调概率这种事应该即改即见效。
 
 读取优先级（高 → 低）：
-    data/settings.json  >  .env  >  代码内置默认
+    data/runtime/settings.json  >  .env  >  代码内置默认
 
 _SPECS 表同时驱动三件事：取值校验、.env 默认值来源、Web UI 的表单渲染 ——
 加一个可调参数只需要在这里加一行。
@@ -25,6 +25,10 @@ logger = logging.getLogger("ai_chat.settings")
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
+# 密钥类参数的掩码。与 `llm.py` 对档案密钥的处理同一套约定：
+# **显示时替换成它，回写时见到它就原样保留**（见 `Spec.secret` 与 `_Store.set`）。
+_MASK = "***"
+
 
 @dataclass(frozen=True)
 class Spec:
@@ -38,13 +42,17 @@ class Spec:
     maximum: float | None = None
     hint: str = ""
     choices: tuple[str, ...] = ()  # 非空时 UI 渲染成下拉框
+    # **密钥类参数**：`describe()` 会把它掩码成 `***`，而 `set()` 收到 `***` 时
+    # **原样保留旧值**（否则控制台一回写就把密钥写成字面量 `***`）。
+    # 与 `llm.py` 的档案密钥同一套约定（`mask_key` / `"***"` 原样保留）。
+    secret: bool = False
 
 
 _SPECS: list[Spec] = [
     # ---------------------------------------------------------- 基础
     # **留空 = 用「模型」页当前档案里写好的那个模型名**；填了才覆盖它。
     # 保留这个键是为了兼容：改造前所有调用点读的都是 `settings.get("model")`
-    # （那时它既表示模型名、又隐含了接口），老 `data/settings.json` 里也存着它。
+    # （那时它既表示模型名、又隐含了接口），老 `data/runtime/settings.json` 里也存着它。
     # 现在**接口/密钥归档案管，这里只管名字** —— 这也是能随时换一家 API 的前提。
     #
     # ⚠ `env_name` 故意留空（与下面 `bot_name` 同一个道理）：`.env` 的 `DEEPSEEK_MODEL`
@@ -145,7 +153,7 @@ _SPECS: list[Spec] = [
     #
     # 人格分层之后：`style_note_max`（`/风格 <一句话>` 的条数上限）与整套运行时
     # 槽位一起**删掉了** —— 人格改成三层文件之后，聊天里不再有改人设的入口，
-    # 那个上限也就没有意义。旧值仍在 `data/settings.json` 里，不再读取。
+    # 那个上限也就没有意义。旧值仍在 `data/runtime/settings.json` 里，不再读取。
     # ---------------------------------------------------------- 人设信号（自我迭代第 1 步）
     # 路线 A 第 1 步：**只记账，不改人设**。把「他纠正我的说话方式」记进一本账，
     # 用来回答"阈值该定 2 次还是 3 次"。
@@ -177,6 +185,18 @@ _SPECS: list[Spec] = [
     Spec("persona_iter_min_lines", int, "ai_chat_persona_iter_min_lines", 20,
          "至少多少行对话才反思", "人设", 5, 500,
          hint="对话太少时没有判断依据，只会让它瞎猜"),
+    # ---------------------------------------------------------- 表层预算（闸门）
+    # 表层的**条目级**长度早就限了（`persona._MIN_ITEM` / `_MAX_ITEM`），但**总量**没有上限：
+    # 6 小时一轮 × 每轮最多 2 条 = 一天最多 8 条，而它是唯一会自己长大的 prompt 段落。
+    # 2026-09-28 补的闸门：超限就**拒绝写入**并记 rejected(over_budget)，由人来清理
+    # —— 谁该被淘汰没有客观依据，所以不自动删（与长期记忆的自动淘汰刻意不同）。
+    Spec("surface_max_chars", int, "ai_chat_surface_max_chars", 1500,
+         "表层人设字数上限（超了就拒绝继续写）", "人设", 200, 8000,
+         hint="只算表层这一层。到顶时自动迭代会**拒绝写入**并在通知里说明，"
+              "你要么删几条过时的，要么把这个数调大。0 = 不限（不推荐）"),
+    Spec("surface_max_items", int, "ai_chat_surface_max_items", 60,
+         "表层人设条目数上限（`- ` 开头的行）", "人设", 0, 500,
+         hint="与字数上限同时生效，任一超了就拒绝写。0 = 不限"),
     # ---------------------------------------------------------- 注意力
     # 唯一一套「看内容」的触发：被唤醒后记住话题，后续发言按相关性累积注意力，
     # 超过阈值就自己接话。另外三套（@/唤醒词、随机插话、主动发言）都跟内容无关。
@@ -228,6 +248,12 @@ _SPECS: list[Spec] = [
          "租约落盘（重启后仍在）", "注意力",
          hint="线上是常驻服务，重建容器不该把正在进行的问答打断。"
               "落盘到 data/attention_state.json；过期的条目启动时会丢弃并记日志"),
+    Spec("attention_persist", bool, "ai_chat_attention_persist", True,
+         "注意力话题落盘（重启后仍在）", "注意力",
+         hint="与租约同一个文件、两个键。**默认开**：`_focus` 以前是纯内存态，"
+              "重启/重建容器时静默清零 —— 表现是「刚才还在跟着聊，重启后突然不接了」，"
+              "而且日志里什么都没有。超过注意力活跃期的话题不恢复（本来也该清零）；"
+              "图片缓存与回复后的短静默仍然不落盘"),
     # ---------------------------------------------------------- 唤醒
     Spec("wake_enabled", bool, "ai_chat_wake_enabled", True, "关键词唤醒", "唤醒",
          hint="群里提到唤醒词时，即使没 @ 它也可能被叫出来"),
@@ -324,7 +350,7 @@ _SPECS: list[Spec] = [
     Spec("memory_store", str, "ai_chat_memory_store", "sqlite", "记忆库后端", "长期记忆",
          choices=("sqlite", "json"),
          hint="sqlite = 按行写入（默认）；json = 改造前那个整份重写的 memories.json，"
-              "留作回滚与人工查看。切换后端**不会自动搬数据**，用 _工具链/_记忆库迁移.py"),
+              "留作回滚与人工查看。切换后端**不会自动搬数据**，用 _工具链/维护/_记忆库迁移.py"),
     # ---------------------------------------------------------- 翻旧账（消息索引）
     # 补的是「盘上有全量记录、却没有任何路径能捞回 prompt」这个洞（README §7.4）。
     # 与长期记忆的分工：索引管「原话怎么说的」，记忆管「我一直知道什么」。
@@ -413,8 +439,9 @@ _SPECS: list[Spec] = [
               "tavily **留空即可**（用内置官方地址）；"
               "json 填完整查询地址，可用 {query} 占位符。留空且非 tavily = 不启用搜索"),
     Spec("search_api_key", str, "ai_chat_search_api_key", "", "搜索 API Key", "联网搜索",
+         secret=True,
          hint="只有 tavily 需要（它把密钥放在请求体里）。searxng / json 留空。"
-              "这个值不会出现在任何回复或机制说明里"),
+              "这个值不会出现在任何回复或机制说明里；控制台里显示为 ***（留 `***` 不动就是不改）"),
     Spec("search_depth", str, "ai_chat_search_depth", "basic", "Tavily 检索深度", "联网搜索",
          choices=("basic", "advanced"),
          hint="只对 tavily 生效。basic = 便宜快；advanced = 更全但更贵更慢"),
@@ -656,6 +683,10 @@ class _Store:
         spec = _SPEC_BY_KEY.get(key)
         if spec is None:
             raise KeyError(f"未知参数：{key}")
+        # 密钥类：控制台看到的是 `***`，原样回写时**不要**把真值覆盖成字面量。
+        # 这条与 `llm.py:456` 对档案密钥的处理完全一致。
+        if spec.secret and str(value) == _MASK:
+            return self.get(key)
         coerced = _coerce(spec, value)
         self._runtime[key] = coerced
         self.save()
@@ -672,23 +703,35 @@ class _Store:
         return {spec.key: self.get(spec.key) for spec in _SPECS}
 
     def describe(self) -> list[dict[str, Any]]:
-        """给 Web UI 渲染表单用。"""
+        """给 Web UI 渲染表单用。
+
+        **密钥类参数（`Spec.secret`）在这里就被掩码**，不留到前端去处理 ——
+        否则 `GET /api/state` 会把明文密钥发给浏览器（2026-09-28 实测确认过这条泄露路径）。
+        """
         if not self._loaded:
             self.load()
         groups: dict[str, list[dict[str, Any]]] = {}
         for spec in _SPECS:
+            value = self.get(spec.key)
+            env_value = self._env.get(spec.key)
+            if spec.secret:
+                if str(value or "").strip():
+                    value = _MASK
+                if str(env_value or "").strip():
+                    env_value = _MASK
             groups.setdefault(spec.group, []).append(
                 {
                     "key": spec.key,
                     "kind": spec.kind.__name__,
                     "label": spec.label,
-                    "value": self.get(spec.key),
+                    "value": value,
                     "min": spec.minimum,
                     "max": spec.maximum,
                     "hint": spec.hint,
                     "default": spec.default,
-                    "env_value": self._env.get(spec.key),
+                    "env_value": env_value,
                     "choices": list(spec.choices),
+                    "secret": spec.secret,
                 }
             )
         return [{"group": g, "items": items} for g, items in groups.items()]
