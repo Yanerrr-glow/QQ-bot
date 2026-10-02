@@ -61,13 +61,21 @@ RUN python -m playwright install-deps chromium \
 RUN pip install --no-cache-dir pymupdf \
         -i https://mirrors.aliyun.com/pypi/simple/
 
-# 代码。**人格三层文件必须一起进镜像** —— config.py 按项目根解析这三个路径：
-#   persona_base.txt     底层人设（只有用户能改）
-#   persona_forbidden.txt 禁止事项（只有用户能改）
-#   persona_surface.txt  表层人设（只有自动迭代会写）
+# 代码。**人格资产必须一起进镜像** —— config.py 按"当前人格包"解析路径：
+#   persona/_registry.json       默认激活哪个包（运行时切换会写 data/ 里的标记）
+#   persona/packs/<id>/base.txt      底层人设（只有用户能改）
+#   persona/packs/<id>/forbidden.txt 禁止事项（只有用户能改）
+#   persona/packs/<id>/surface.txt   表层模板（只作首次播种）
 # 注意：.env 不进镜像（含密钥，由 compose 的 env_file 注入）；
 #       data/ 也不进镜像（是运行时数据，由卷挂载）。
-COPY bot.py persona_base.txt persona_forbidden.txt persona_surface.txt ./
+# persona/packs/<id>/traits.json 是**人格约束的元数据**（17 个特质 / 56 条闸门词 / 输出特征 / 可数守卫）：
+#   * `persona.py` 从它派生冲突关键词与否定白名单（读不到会回退到内置表）；
+#   * `behavior.py` 从它读可数守卫（读不到会回退到内置的 time / ask 两条）。
+# **必须进镜像**：漏了不会报错，只会静默退回旧行为 —— 那正是"改了没生效"最难查的形态。
+COPY bot.py ./
+# **整目录 COPY**（不是只 COPY 当前在用的那个包）：人格包是"插上就能用"的，
+# 新增/切换一个包不该要求重建镜像的 COPY 清单 —— 那正是包化要消掉的摩擦。
+COPY persona ./persona
 COPY plugins ./plugins
 
 # 运维脚本常驻镜像：`诊断状态.py` 是只读诊断（只用标准库），进镜像后
@@ -75,27 +83,14 @@ COPY plugins ./plugins
 # **为什么必须进镜像而不是临时 docker cp**：容器每次重建，手工放进去的路径就没了 ——
 # 2026-09-24 排查性格跑偏时正撞上"诊断脚本不在容器里"，只能另写一份临时的。
 #
-# 两个验证脚本同理常驻，且**必须进镜像**才验得准：
-#   * `离线验证.py` —— 全套回归（176 项），验的是"这份镜像能不能装起来"；
-#   * `PDF端到端验证.py` —— 扫描版 PDF 那条 OCR 路只有容器里能走通（本机没 rapidocr）。
-#     它验的必须是**镜像里这一份** pdf.py：若靠 docker cp 临时塞代码进去，
-#     验的就是临时文件而不是交付物（2026-09-24 踩过：差点漏掉一个真缺陷）。
-#   * `_搜索查询验证.py` —— 搜索词构造的回归（26 项）。线上那些误搜的句子抄在里面，
-#     换模型、改人设都不该让它再退化。
-COPY _工具链/诊断状态.py ./_工具链/诊断状态.py
-COPY _工具链/离线验证.py ./_工具链/离线验证.py
-COPY _工具链/PDF端到端验证.py ./_工具链/PDF端到端验证.py
-COPY _工具链/_搜索查询验证.py ./_工具链/_搜索查询验证.py
-# 水位线初始化（一次性，幂等）：升级到带水位线的版本后跑一次，把老会话的起点
-# 对齐到「最后一次会话切分点」，避免后台补抽把已经抽过的历史重抽一遍。
-# 详见 README 5.6.6.1。
-COPY _工具链/_水位线初始化.py ./_工具链/_水位线初始化.py
-# 记忆库迁移/回滚（一次性，幂等）：memories.json ↔ memory.db。
-# 记忆是唯一一份不可再生数据，所以它必须能看见（--dry-run）也能回滚（--to json）。
-COPY _工具链/_记忆库迁移.py ./_工具链/_记忆库迁移.py
+# 验证脚本整目录进镜像（`验证/`）：全套回归、PDF 端到端 OCR、搜索词构造、
+# 人设结构巡逻、自示监控、水位线初始化、记忆库迁移/回滚、fetch 自测，
+# 以及记忆/网络安全/注意力/任务这几套回归 —— 都是「只有容器里才验得准」的那批。
+# **整目录 COPY**：以后再加验证脚本不用改这里，也不用改 .dockerignore 的放行清单
+# （「两处都要改」那个坑踩过三次，`验证/_语法检查.py` 里有可执行检查钉着）。
+COPY 验证 ./验证
 
-# 卷挂载点：容器内若没有这个目录，Docker 会用 root 建它，属主可能不对
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data/runtime
 
 EXPOSE 8080
 
