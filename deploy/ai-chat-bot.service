@@ -31,10 +31,10 @@ NoNewPrivileges=true
 
 # 日志默认进 journald：
 #     journalctl -u qqbot -f
-# 想同时落一份文件到 data/bot.log，把下面两行取消注释
+# 想同时落一份文件到 data/runtime/logs/bot.log，把下面两行取消注释
 # （append: 需要 systemd 240+，Ubuntu 22.04 是 249，够）
-#StandardOutput=append:/opt/qq-bot/data/bot.log
-#StandardError=append:/opt/qq-bot/data/bot.log
+#StandardOutput=append:/opt/qq-bot/data/runtime/logs/bot.log
+#StandardError=append:/opt/qq-bot/data/runtime/logs/bot.log
 
 [Install]
 WantedBy=multi-user.target

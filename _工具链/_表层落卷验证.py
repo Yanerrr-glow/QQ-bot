@@ -1,7 +1,8 @@
 """表层人设落在 data/ 的验证（纯逻辑、不连网、不调模型）。
 
 为什么需要它：表层是**唯一会被自动迭代写入**的一层，而它原来躺在镜像里
-（`Dockerfile` 的 `COPY persona/active ./persona/active`）—— 每次重建都会用"本机那份"
+（当时 `Dockerfile` 是 `COPY persona/active ./persona/active`；包化后已改成 `COPY persona ./persona`）
+—— 每次重建都会用"本机那份"
 把"线上学到的"顶掉，而且**不报错**。2026-09-26 找现场时才发现
 （服务器 surface 49 行、本地 48 行，多出来的正是一条迭代成果）。
 

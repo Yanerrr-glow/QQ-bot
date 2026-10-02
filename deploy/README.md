@@ -121,8 +121,8 @@ cd <项目根目录>
 ssh root@你的公网IP "mkdir -p /opt/qq-bot"
 
 # 只传运行必需的东西 —— 注意这里没有 .venv、没有 data、没有 .env
-scp -r bot.py persona_base.txt persona_forbidden.txt persona_surface.txt `
-    requirements.txt Dockerfile .dockerignore plugins deploy `
+# persona/packs/<包>/ 必须整体保留目录层级，容器按该路径读取静态人设资产
+scp -r bot.py persona requirements.txt Dockerfile .dockerignore plugins deploy `
     root@你的公网IP:/opt/qq-bot/
 ```
 
@@ -302,7 +302,7 @@ docker compose logs -f bot
 | `data\settings.json` | **强烈建议带** | 44 个参数里你改过的值都在这。它优先级高于 `.env` |
 | `data\chatlog_*.json` | 想保留聊天记忆就带 | 群聊记录 |
 | `data\stickers\` | 想保留表情包库就带 | 表情包原图（注意来源与版权） |
-| `persona_base.txt` / `persona_forbidden.txt` / `persona_surface.txt` | 已经会带 | 见 3.2 的 scp 命令 |
+| `persona/packs/<包>/` | 已经会带 | 见 3.2 的 scp 命令。保持整个目录层级，容器按该路径读取人设资产 |
 | `.env` | **不要带** | 用 `.env.server` 在服务器上重新生成 |
 | `.venv\` | **不要带** | Windows 的，Linux 用不了 |
 | `_工具链\` | 不要带 | 是 Windows 本机脚本，服务器上用不上。镜像里另有几个脚本走 Dockerfile 的 COPY |
