@@ -33,12 +33,21 @@ $ErrorActionPreference = 'Continue'
             }
 $root    = $ProjectRoot
 
-$checker = Join-Path $PSScriptRoot '上手自检.py'
+# 【自检脚本的位置】**不能写 `$PSScriptRoot`**：本脚本在 `_工具链\发布\`，而源码在
+# `_工具链\启动\`。这两处曾经写反过 —— 结果是 `Test-Path` 永远为 False、脚本每次都
+# `exit 1`，而报错只说"找不到 <路径>"，看起来像"环境没装好"。
+# 改用"项目根 + 候选相对路径"，这样以后再分组也不会坏。
+$checkerCandidates = @(
+    (Join-Path $root '_工具链\启动\上手自检.py'),
+    (Join-Path $root '_工具链\上手自检.py'),
+    (Join-Path $root '上手自检.py')
+)
+$checker = $checkerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 $dist    = Join-Path $root 'dist'
 $outExe  = Join-Path $dist '上手自检.exe'
 
-if (-not (Test-Path -LiteralPath $checker)) {
-    Write-Host ("找不到 " + $checker) -ForegroundColor Red
+if (-not $checker) {
+    Write-Host ("找不到上手自检.py，试过：" + ($checkerCandidates -join '；')) -ForegroundColor Red
     exit 1
 }
 
@@ -131,9 +140,10 @@ Write-Host ("打包完成：" + $outExe + "（" + $size + " MB）") -ForegroundC
 Write-Host ("SHA256：" + $sha) -ForegroundColor Gray
 Write-Host ''
 Write-Host '下一步（Release 流程）：' -ForegroundColor Cyan
-Write-Host '  1. 在 GitHub 上建一个 Release（建议打 tag，如 v1.0.0）'
-Write-Host '  2. 把 dist\上手自检.exe 作为 asset 传上去'
-Write-Host '  3. 在 Release 说明里贴上上面那行 SHA256'
+Write-Host '  1. 打一个 tag 并推送（如 v1.1.0）—— `.github/workflows/release.yml` 会**在 CI 里**
+               现构建 exe 并自动建 Release（这样产物一定对应那一版源码，不会漏重打包）'
+Write-Host '  2. 只有想手工发版时才需要：把 dist\上手自检.exe 作为 asset 传上去'
+Write-Host '  3. 无论哪种方式，都把那行 SHA256 贴进 Release 说明'
 Write-Host '它自带解释器 —— 下载的人不需要装 Python，双击即可跑完整自检。' -ForegroundColor Gray
 Write-Host '注意：exe 检的是**那台机器/那个项目**的 Python 与 venv，与它自身无关。' -ForegroundColor Gray
 exit 0
