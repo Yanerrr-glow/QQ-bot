@@ -53,7 +53,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import clock, config, settings
+from . import clock, config, packs, settings
 
 logger = logging.getLogger("ai_chat.signals")
 
@@ -278,7 +278,26 @@ class _Store:
             logger.warning("人设信号账本写盘失败：%s", path.name)
 
 
+    def reset(self) -> None:
+        """丢掉内存副本，下次 `ensure()` 从**当前人格包**的目录重读。
+
+        账本按包分开存（`data/runtime/persona/<包>/signals.json`），
+        所以换人格时必须清 —— 否则新角色会带着旧角色的"他说过要这么说话"的记录，
+        而自我迭代会把这份记录当成**用户显式要求**（权重远高于自己猜的）。
+        """
+        self.items = []
+        self.loaded = False
+
+
 _store = _Store()
+
+
+def reset_store() -> None:
+    """换包时由 `packs` 回调：账本从当前包的目录重读。"""
+    _store.reset()
+
+
+packs.on_change(reset_store)
 
 
 def _same_recent(conv: str, uid: int, kind: str, text: str) -> bool:

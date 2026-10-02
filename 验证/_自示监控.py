@@ -12,7 +12,7 @@
 
 ## 判据
 
-用 `persona/active/traits.json` 的 **`output_markers`**（输出特征）—— 那是专门为
+用 `persona/packs/<包>/traits.json` 的 **`output_markers`**（输出特征）—— 那是专门为
 "在它自己的回复里找痕迹"写的一套词，与给候选用的 `gate_terms` 是**两套**词：
 `gate_terms` 判的是"候选人会怎么写"，`output_markers` 判的是"它已经说出来的话"。
 
@@ -54,7 +54,40 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)
-TRAITS_FILE = os.path.join(PROJ, "persona/active/traits.json")
+PACKS_DIR = os.path.join(PROJ, "persona", "packs")
+
+
+def active_pack_id() -> str:
+    """当前激活的包：运行时标记 > 注册表 > 唯一一个启用的包。
+
+    **与 `plugins/ai_chat/packs.py` 同序**，这里复算一遍是因为本脚本要能脱依赖直跑
+    （同 `_人设结构检查.py`）：它只读 traits.json，不需要起插件。
+    """
+    marker = os.path.join(PROJ, "data", "runtime", "persona", "_active")
+    try:
+        with open(marker, "r", encoding="utf-8") as fh:
+            got = fh.read().strip()
+        if got and os.path.isdir(os.path.join(PACKS_DIR, got)):
+            return got
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(PROJ, "persona", "_registry.json"), "r", encoding="utf-8") as fh:
+            got = str((json.load(fh) or {}).get("active") or "").strip()
+        if got and os.path.isdir(os.path.join(PACKS_DIR, got)):
+            return got
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        pass
+    try:
+        names = sorted(n for n in os.listdir(PACKS_DIR)
+                       if not n.startswith(("_", ".")) and os.path.isdir(os.path.join(PACKS_DIR, n)))
+    except OSError:
+        return ""
+    return names[0] if len(names) == 1 else ""
+
+
+# 特质注册表在**当前人格包**里（包化后不再有固定路径）；可用 `--pack` 覆盖。
+TRAITS_FILE = os.path.join(PACKS_DIR, active_pack_id(), "traits.json")
 
 
 def read_json(path: str):
@@ -198,7 +231,7 @@ def report(result: dict, skills, traits: list[dict], top: int, log_dir: str) -> 
                  "、".join("%s×%d" % (m, c) for m, c in top_marks)))
 
     print("\n== 被它自己的发言违反最多的铁律 ==")
-    # 一个 suppress 特质 ≈ 一条铁律（见 persona/active/traits.json 的 channels）
+    # 一个 suppress 特质 ≈ 一条铁律（见 persona/packs/<包>/traits.json 的 channels）
     ranked = [r for r in rows if r[0] > 0 and r[1] > 0]
     if not ranked:
         print("  没查出任何自我示范 —— 这阵子它说话很干净。")
@@ -261,10 +294,21 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=5, help="排行显示几个特质")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--selftest", action="store_true", help="用合成数据自验")
+    ap.add_argument("--pack", default="", help="指定人格包 id（默认用当前激活的那个）")
     args = ap.parse_args()
+
+    if args.pack:
+        global TRAITS_FILE
+        TRAITS_FILE = os.path.join(PACKS_DIR, args.pack, "traits.json")
 
     if args.selftest:
         return selftest()
+
+    if not os.path.isfile(TRAITS_FILE):
+        print("找不到特质注册表：%s" % TRAITS_FILE)
+        print("（它在当前人格包里。用 --pack <id> 指定，或先 /人设 包 看有哪些包）")
+        return 1
+    print("特质注册表：%s" % TRAITS_FILE)
 
     traits, fixed = load_registry()
     skills = compile_markers(traits)

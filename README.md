@@ -37,7 +37,8 @@
 
 - `plugins/ai_chat/`：机器人业务插件与[源码模块说明](plugins/ai_chat/README.md)
 - `desktop/`：独立桌面管理端，使用说明见 [`desktop/README.md`](desktop/README.md)
-- `persona/active/`：人格源文件与注册表
+- `persona/packs/<id>/`：**人格包**（一个目录 = 一套完整人格）；内容怎么写见[人格包内容规范](docs/人格包内容规范.md)，样本见 `persona/packs/example/`，脚手架 `persona/_TEMPLATE/`
+- `data/runtime/persona/<id>/`：每个人格自己的运行数据（表层、候选池、信号账本、审计）
 - `data/runtime/`：聊天记录、记忆、配置、状态和日志等运行数据
 - `验证/`：离线验证与结构检查脚本
 - `_工具链/`：项目专用启动、维护和发布脚本
@@ -50,6 +51,7 @@
 | 主题 | 文档 |
 |---|---|
 | 架构、配置、运行机制、数据文件与开发记录 | [`docs/开发日志.md`](docs/开发日志.md) |
+| **人格包每一份文件怎么写**（内容规范） | [`docs/人格包内容规范.md`](docs/人格包内容规范.md) |
 | 人格、目录、运行数据及日志写入规范 | [`docs/文档与日志规范.md`](docs/文档与日志规范.md) |
 | 服务器部署 | [`deploy/README.md`](deploy/README.md) |
 | 机器人源码模块地图 | [`plugins/ai_chat/README.md`](plugins/ai_chat/README.md) |

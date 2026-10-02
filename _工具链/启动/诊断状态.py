@@ -23,7 +23,14 @@ import pathlib
 import sys
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+# **项目根从脚本自身位置向上探测**，不写死层级。
+# 原来写的是 `.parent.parent` —— 那假定脚本就在 `_工具链\` 下一层；2026-10-02
+# 维护脚本按用途分组（启动 / 维护 / 发布）之后就多了一层，于是 ROOT 变成 `_工具链\`：
+# `.env` 报"不存在"、`data/runtime/` 全落空、每一节都显示"还没这个文件"。
+# 判据用"含 bot.py 且含 persona/"这一层（与工作区的自定位约定、与导出脚本一致）。
+ROOT = pathlib.Path(__file__).resolve().parent
+while ROOT.parent != ROOT and not (ROOT / "bot.py").is_file():
+    ROOT = ROOT.parent
 os.chdir(ROOT)
 
 # 优先用 nonebot 的 Config 读 .env —— 跟机器人启动时走同一条路径，
@@ -190,22 +197,68 @@ if _logdir0.resolve() == (ROOT / "data").resolve():
 
 
 def _layers_of_cfg() -> list[tuple[str, str, str]]:
-    """(层名, 环境变量名, 默认文件名)。"""
+    """(层名, 环境变量名, 默认文件名)。
+
+    默认值是**包内文件名**：没有显式配置时，这三层来自当前人格包
+    （`persona/packs/<id>/`）。人格包本身的判定见下一节的 `_pack_report()`。
+    """
     return [
-        ("底层人设（它是谁）", "ai_chat_persona_file", "persona/active/base.txt"),
-        ("禁止事项（铁律）", "ai_chat_forbidden_file", "persona/active/forbidden.txt"),
-        ("表层人设（怎么说话）", "ai_chat_surface_file", "persona/active/surface.txt"),
+        ("底层人设（它是谁）", "ai_chat_persona_file", "base.txt"),
+        ("禁止事项（铁律）", "ai_chat_forbidden_file", "forbidden.txt"),
+        ("表层人设（怎么说话）", "ai_chat_surface_file", "surface.txt"),
     ]
+
+
+def _active_pack(root: pathlib.Path) -> str:
+    """当前激活的包：运行时标记 > 注册表 > 唯一一个启用的包（与 packs.py 同序）。"""
+    packs_dir = root / "persona" / "packs"
+    marker = _logdir0 / "persona" / "_active"
+    for cand in (marker, root / "persona" / "_registry.json"):
+        try:
+            if cand.name == "_active":
+                got = cand.read_text(encoding="utf-8").strip()
+            else:
+                import json as _json
+                got = str((_json.loads(cand.read_text(encoding="utf-8")) or {}).get("active") or "").strip()
+        except (OSError, ValueError):
+            continue
+        if got and (packs_dir / got).is_dir():
+            return got
+    try:
+        names = sorted(n for n in os.listdir(packs_dir)
+                       if not n.startswith(("_", ".")) and (packs_dir / n).is_dir())
+    except OSError:
+        return ""
+    return names[0] if len(names) == 1 else ""
+
+
+_PACK = _active_pack(ROOT)
+_PACKS_DIR = ROOT / "persona" / "packs"
+try:
+    _PACK_LIST = sorted(n for n in os.listdir(_PACKS_DIR)
+                        if not n.startswith(("_", ".")) and (_PACKS_DIR / n).is_dir())
+except OSError:
+    _PACK_LIST = []
+kv("当前人格包", f"{_PACK or '（无）'}"
+                 + (f"（共 {len(_PACK_LIST)} 个可用：{'、'.join(_PACK_LIST)}）" if _PACK_LIST else ""))
+if _PACK:
+    kv("包目录", _PACKS_DIR / _PACK)
+    kv("运行数据目录", _logdir0 / "persona" / _PACK)
+else:
+    print("  ⚠ 没有可用的人格包 —— 只有 AI_CHAT_SYSTEM_PROMPT 兜底。"
+          "照 persona/_TEMPLATE/README.md 建一个包")
 
 
 for _label, _env, _default in _layers_of_cfg():
     _rawv = getattr(cfg, _env, None)
     if _rawv is None:
-        _name, _note = _default, "（.env 没写 → 用默认）"
+        # 没显式配 → 这一层来自当前人格包
+        _name = str(_PACKS_DIR / _PACK / _default) if _PACK else ""
+        _note = "（.env 没写 → 用当前人格包里的 %s）" % _default
     elif str(_rawv).strip() == "":
         _name, _note = "", "（**被写成空串 → 这一层不读文件**）"
     else:
-        _name, _note = str(_rawv).strip(), ""
+        _name, _note = str(_rawv).strip(), "（.env 显式指定，绕过人格包）"
     print(f"  · {_label}")
     kv("    文件", _name or "（无）", _note)
     if not _name:
@@ -227,9 +280,10 @@ for _label, _env, _default in _layers_of_cfg():
     kv("    状态", f"{len(_t)} 字", " ".join(_t.split())[:34] + "…")
 
 print("  → 三层的顺序就是权限：底色 → 铁律 → 表层，表层压不过上面两层")
-print("  → **改人格直接编辑这三个文件**；进程不用重启（每轮现读），"
-      "但**容器部署要重建镜像**才生效（这三个文件是 COPY 进镜像的，不是卷）")
-print("  → 聊天里的 /人设、/风格 只能「看」和「撤回」，改不了人设（这是刻意的）")
+print("  → **改人格直接编辑包里的三个文件**；进程不用重启（每轮现读），"
+      "但**容器部署要重建镜像**才生效（persona/ 是 COPY 进镜像的，不是卷）")
+print("  → 切人格：群里 /人设 切换 <id>，或控制台「人格」页；**立即生效**，不用重启")
+print("  → 聊天里的 /人设、/风格 只能「看」和「撤回」，改不了人设内容（这是刻意的）")
 
 _sysp = getattr(cfg, "ai_chat_system_prompt", None)
 if _sysp not in (None, ""):
@@ -240,7 +294,10 @@ if _sysp not in (None, ""):
 head("③ 人格自我迭代（表层是唯一会自动变的一层）")
 _iter = str(getattr(cfg, "ai_chat_persona_iter_enabled", "")).lower() not in ("false", "0", "no")
 kv("自我迭代开关", "开" if _iter else "关（AI_CHAT_PERSONA_ITER_ENABLED=false）")
-_log = _logdir0 / "persona" / "changelog.json"
+# **按包分开**：包化之后这些账本落在 `data/runtime/persona/<包>/` 下，
+# 找一个固定路径是找不到的（那正是"包化后旧的排查脚本读不到东西"的原因）。
+_pack_stage = (_logdir0 / "persona" / _PACK) if _PACK else (_logdir0 / "persona")
+_log = _pack_stage / "changelog.json"
 kv("变更日志", _log)
 if _log.exists():
     import json
@@ -266,7 +323,7 @@ if _log.exists():
 else:
     print("  （还没有这个文件 → 自我迭代还没改过任何东西）")
 
-_signals = _logdir0 / "persona" / "signals.json"
+_signals = _pack_stage / "signals.json"
 if _signals.exists():
     import json
 

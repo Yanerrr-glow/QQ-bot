@@ -88,7 +88,7 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         print(f"  [失败] {label}" + (f" —— {detail}" if detail else ""))
 
 
-# `persona/active/traits.json` 是否在场。**公开副本不随附这份文件**（它的 `channels` /
+# `persona/packs/<包>/traits.json` 是否在场。**公开副本不随附这份文件**（它的 `channels` /
 # `observed_bad_examples` 里含线上真实对话原话），所以依赖注册表的断言走 `check_reg()`：
 # 缺文件时**整组跳过并打印原因** —— 既不崩在读取那一行，也不伪装成"通过了"。
 # 活项目里它不该缺席：真缺了由 `_人设结构检查.py` 大声报错（退出码 1），不靠这份桩兜底。
@@ -106,6 +106,37 @@ def check_reg(label: str, condition: bool, detail: str = "") -> None:
     if REGISTRY_ABSENT:
         return
     check(label, condition, detail)
+
+
+def persona_layer_override(name: str, value) -> None:
+    """临时钉住某个"按人格算出来的"懒属性（`BASE_PROMPT` / `FORBIDDEN_PROMPT` / `SYSTEM_PROMPT`）。
+
+    **为什么需要它**：这三个名字在包化（2026-10）之后是模块级 `__getattr__`（惰性属性），
+    而 `__getattr__` 只在**正常属性查找失败**时才被调用 —— 也就是说
+    `config.BASE_PROMPT = ""` 会**永久**把那个名字钉在模块 `__dict__` 里，
+    之后连换人格都读不回新包的值（实测踩过：本节把 `BASE_PROMPT` 打了一次桩，
+    §35 的换包断言就全挂了，而且看不出是这里干的）。
+
+    所以测试里要打桩就走这个入口，`value=None` 表示**恢复成惰性**（删掉钉住的值）。
+    """
+    if value is None:
+        config.__dict__.pop(name, None)
+    else:
+        config.__dict__[name] = value
+
+
+def persona_cfg(key: str, value) -> None:
+    """改人格相关的"显式路径"配置，**并让按人格算出来的缓存失效**。
+
+    这是包化（2026-10）之后的写法。改造前这里直接改 `config._PERSONA_CONFIGURED`
+    这类私有常量，而路径现在是**现算**的（`config.persona_source_path()`）：
+    改常量已经不影响任何东西，改的必须是 driver 的配置字段。
+
+    为什么还要 `config.reset_persona_cache()`：三层正文按包缓存，
+    换了路径不清缓存就会继续读到上一份 —— 那正是"改了文件没生效"的老毛病。
+    """
+    _driver.config[key] = value
+    config.reset_persona_cache()
 
 
 # --------------------------------------------------------------------- 桩
@@ -325,7 +356,7 @@ sys.path.insert(0, str(ROOT / "plugins"))
 # --------------------------------------------------------------------- 开跑
 print(f"\n临时数据目录：{TMP}")
 print("\n=== 1. 模块导入 ===")
-from ai_chat import context, instructions, introspect, memory, persona, settings, state, stickers  # noqa: E402
+from ai_chat import context, instructions, introspect, memory, packs, persona, settings, state, stickers  # noqa: E402
 from ai_chat import chatlog, config  # noqa: E402
 
 # **必须在这里把落盘目录接到临时目录**（2026-09-25 第二批修）。
@@ -335,10 +366,17 @@ from ai_chat import chatlog, config  # noqa: E402
 # 后面 3300 多行用例（含 §31.5 之后新增的）**从来没被执行过**。
 # 这类"用例静默不跑"比用例失败更危险：绿的那半看起来一切正常。
 config.LOG_DIR = TMP  # type: ignore[misc]
-# 表层人设自 2026-09-26 起**读写都落在 `LOG_DIR`**（`data/runtime/persona/surface.txt`，卷内），
-# 镜像里那份只作首次播种的模板。所以把 LOG_DIR 换成临时目录之后，
+# **这一份快照是 §35（人格包）收尾时要还回去的**：包化之后"当前是哪个包"是一个
+# 全局状态，而 §35 会临时切到探针包。不还回去的话，之后所有"示例人格的正文长什么样"
+# 的断言（§19 等）都会在探针包上跑 —— 实测踩过：那一组直接
+# `ValueError: substring not found`，而且看不出是 §35 干的。
+_ACTIVE_PACK_SNAPSHOT = packs.active_id()
+# 表层人设自 2026-09-26 起**读写都落在 `LOG_DIR`**（`data/runtime/persona/<包>/surface.txt`，卷内），
+# 镜像里那份只作首次播种的模板。所以把数据目录换成临时目录之后，
 # **必须像真实启动那样播种一次**，否则 `persona.surface_text()` 读到空、下面两条会挂。
 # （这不是测试在迁就实现：播种本来就是生产启动路径上的一步，见 `config.seed_surface`。）
+# 包化之后多一步：把改造前平铺的运行数据按包归位（幂等，正常是"没有要迁的"）。
+packs.migrate_layout()
 config.seed_surface()
 from ai_chat import settings as _settings  # noqa: E402
 from ai_chat import memstore as _ms  # noqa: E402
@@ -388,7 +426,7 @@ check("strip_comments 不碰行内 #（人设里可能出现代码示例或句�
       config.strip_comments("A # 不是注释") == "A # 不是注释")
 _COMP = config.compose_prompt()
 # 2026-09-26：三处冲突都判完了 —— 三条铁律**全部恢复**。冲突是按"语域区分"解决的
-# （见 persona/active/traits.json 的 fixed_notice_channels / resolved_conflicts），不是靠停用铁律。
+# （见 persona/packs/<包>/traits.json 的 fixed_notice_channels / resolved_conflicts），不是靠停用铁律。
 for _rule in ("不作话头抛回者", "不主动谈论你自己", "不提时间，也不提睡眠"):
     check("铁律已恢复并进 prompt：%s" % _rule, _rule in _COMP)
 check("禁止事项里没有被 `#` 停用的残留",
@@ -404,16 +442,19 @@ check("MSG_EMPTY 的默认措辞是中性错误通报（从 config.py 源码取�
       "这一轮没能生成回复" in _EMPTY_DEFAULT, repr(_EMPTY_DEFAULT))
 check("错误通报里没有问句（原冲突点）",
       "？" not in _EMPTY_DEFAULT and "?" not in _EMPTY_DEFAULT, repr(_EMPTY_DEFAULT))
-_REG_PATH = pathlib.Path("persona/active/traits.json")
+# 特质注册表在**当前人格包里**（包化后不再有固定路径）。
+# 用 `config.traits_file_path()` 而不是拼字面量：它同时认"显式配置"这条路，
+# 所以测试里把人格指到临时目录时，这里读的也是那一份。
+_REG_PATH = config.traits_file_path()
 REGISTRY_ABSENT = not _REG_PATH.exists()
 if REGISTRY_ABSENT:
     skip_group("注册表相关断言（固定文案 / 闸门派生 / 守位表 / 输出特征 / 评估台特质数）",
-               "缺 persona/active/traits.json（公开副本不随附此文件）")
+               "缺 persona/packs/<包>/traits.json（公开副本不随附此文件）")
 _REG = {} if REGISTRY_ABSENT else json.loads(_REG_PATH.read_text(encoding="utf-8"))
 _FIXED = (_REG.get("fixed_notice_channels") or {}).get("items") or []
 check_reg("固定系统文案登记在册（与人格语域分开）", len(_FIXED) >= 6, "%d 条" % len(_FIXED))
 
-# ---- 闸门派生：关键词来自 persona/active/traits.json，且只取**当前生效**的特质 ----
+# ---- 闸门派生：关键词来自当前人格包的 traits.json，且只取**当前生效**的特质 ----
 _TRAITS = {t["slug"]: t for t in (_REG.get("traits") or [])}
 _TERMS = [kw for kw, _why in persona._CONFLICTS]
 check_reg("闸门关键词由注册表派生（远多于旧手工表的 10 条）",
@@ -470,7 +511,7 @@ _by_id = {r[0]: r for r in _beh._spec()[2]}
 if REGISTRY_ABSENT:
     # 没有注册表时 `behavior.py` 回退到内置表（只有 time / ask），"多了一条 commentary"
     # 这件事本身**无从验证**：既不能判它通过，也不能判它失败 —— 记为跳过。
-    skip_group("commentary 守卫（这条规则来自注册表）", "缺 persona/active/traits.json")
+    skip_group("commentary 守卫（这条规则来自注册表）", "缺 persona/packs/<包>/traits.json")
     check("守卫表回退到内置规则（time / ask 仍在）", {"time", "ask"} <= set(_by_id), str(list(_by_id)))
 else:
     check("守卫里多了 commentary（评论对话）", "commentary" in _by_id, str(list(_by_id)))
@@ -691,7 +732,12 @@ check("每条都真的是禁令（含否定词）",
 # 于是 `/人设 铁律` 多一条以 `*` 开头的残句（第 21 条），而巡检仍数 20 条并报 0 错误 ——
 # "巡检通过"把运行时的幻影条目盖了过去。这里对**同一份文本**跑两份实现并逐条比对，
 # 让这类漂移无法再静默发生（改任一侧都会当场失败）。
-_sc_path = ROOT / "_工具链" / "_人设结构检查.py"
+_sc_path = ROOT / "验证" / "_人设结构检查.py"
+if not _sc_path.is_file():
+    # **路径别写回 `_工具链\`**：那个脚本 2026-10-02 随"验证脚本整目录"一起搬到了
+    # `验证\`，而这里的路径没跟着改 —— 结果是整份桩回归在 §4.5 之后**全部没跑**
+    # （本节恰好是最早撞上它的一处）。宁可当场报清楚，也不要静默跳过。
+    raise SystemExit(f"找不到 {_sc_path}：巡检与运行时解析的一致性比对无法进行")
 _sc_spec = importlib.util.spec_from_file_location("_persona_struct", _sc_path)
 assert _sc_spec and _sc_spec.loader
 _sc_mod = importlib.util.module_from_spec(_sc_spec)
@@ -809,7 +855,10 @@ act = run_cmd("/风格 铁律")
 check("/风格 铁律 逐条列禁止事项", act.stop and "禁止事项" in act.reply, act.reply[:60])
 
 act = run_cmd("/人设 状态")
-check("/人设 也能看三层与文件路径", act.stop and "persona_surface" in act.reply, act.reply[:80])
+# 断言"报出了当前人格包与三层文件"而不是某个具体文件名：包化之后文件名随包走，
+# 写死 `persona_surface` 会让这条断言只对改造前的那份布局成立。
+check("/人设 也能看人格包与三层文件路径",
+      act.stop and "当前人格包" in act.reply and "surface.txt" in act.reply, act.reply[:80])
 
 act = run_cmd("/人设 日志")
 check("/人设 日志 能打开变更日志", act.stop and "自动改动" in act.reply, act.reply[:60])
@@ -1098,7 +1147,9 @@ print("\n=== 15. 中文标签都在 JSON/代码里可用 ===")
 _p15 = persona.stats()
 check("人格三层都能取到字数与路径",
       _p15["base_chars"] > 0 and _p15["forbidden_chars"] > 0 and _p15["surface_chars"] > 0
-      and "persona_base" in _p15["base_file"], str(_p15))
+      and _p15["base_file"].endswith("base.txt"), str(_p15))
+check("stats 报出当前人格包（排查人格问题的第一问）",
+      _p15["pack_id"] == packs.active_id() and bool(_p15["pack_dir"]), str(_p15.get("pack_id")))
 check("设置项可用中文分组", any(g["group"] == "长期记忆" for g in settings.describe()))
 check("图片策略有中文描述", "不再保存" in state.MODE_LABEL["ignore"])
 
@@ -1356,14 +1407,30 @@ check("uid==机器人QQ 但没有 is_bot/bot_uid 时仍认出是自己（关键�
 
 # 反向守卫：**绝不能**因为"名字等于机器人显示名"就把别人的话标成自己的。
 # 群里真有人叫同名时，那会把别人的话算到它头上 —— 比漏标更危险。名字不可信，QQ 号才可信。
-_al6 = ConversationLog("g782", TMP / "chatlog_g782.json")
-_same_name = _al6.append(999888, "鲸鱼娘", "我（群友）也叫这个名，但这话不是你（机器人）说的", is_bot=False)
+_al6 = ConversationLog("g782", TMP / "chatlog_g782.txt".replace(".txt", ".json"))
+# 用**当前显示名**造同名群友：写死名字会在包改名后失效（本机 2026-10-02 就换过一次显示名），
+# 而这条用例要验的正是"同名"这件事本身。
+_same = config.bot_name()
+_same_name = _al6.append(999888, _same, "我（群友）也叫这个名，但这话不是你（机器人）说的", is_bot=False)
 check("同名群友的话不会被误标成机器人自己的",
       "（你）" not in _al6.line(_same_name, 80, bot_uid=str(BOT_QQ)),
       _al6.line(_same_name, 80, bot_uid=str(BOT_QQ)))
 check("同名但无法确定时显式标注为「可能是你」（而不是静默当别人）",
       "可能是你" in _al6.line(_same_name, 80, bot_uid=""),
       _al6.line(_same_name, 80, bot_uid=""))
+
+# 改名之后：**别名/旧名也要认得出来**（`_pack.json` 的 `aliases` 就是为这个存在的）。
+# 老记录常常缺 bot_uid/is_bot，只比当前显示名的话它们会落到"当别人说的"那个分支 ——
+# 那正是「它把自己说过的话认知到别人身上」的漏洞（2026-10-02 包化时实测踩到）。
+_aliases = [str(x).strip() for x in (packs.active_pack().get("aliases") or []) if str(x).strip()]
+if _aliases:
+    _al7 = ConversationLog("g782b", TMP / "chatlog_g782b.json")
+    _old_name_msg = _al7.append(999889, _aliases[0], "这是我改名前说过的话", is_bot=False)
+    check(f"改名前的旧记录按别名认得出「{_aliases[0]}」可能是自己",
+          "可能是你" in _al7.line(_old_name_msg, 80, bot_uid=""),
+          _al7.line(_old_name_msg, 80, bot_uid=""))
+else:
+    print("  [跳过] 别名识别（当前人格包没声明 aliases）")
 
 # 读法说明要教会模型遇到「可能是你」怎么办（不许拿它去质问对方）
 _sys_with_uncertain = context.system_prompt(conv="g781", is_master=True)
@@ -1437,8 +1504,10 @@ check("记录带 bot_uid（跨改名也认得出是自己）",
 
 _sl.mark_read_until(int(_sent["id"]))
 _sbg = _sl.render_background(bot_uid=str(BOT_QQ))
-check("渲染成「鲸鱼娘（你）」—— 归属问题不再复现",
-      "鲸鱼娘（你）" in _sbg and stickers.SENT_IMAGE_TEXT in _sbg, _sbg)
+# **别写死角色名**：`record_sent_image` 落盘时用的是 `config.bot_name()`，而它现在来自
+# 当前人格包 —— 包改名（本机 2026-10-02 就换过一次显示名）就会让这条断言假失败。
+check("机器人自己发的图渲染成「<显示名>（你）」—— 归属问题不再复现",
+      f"{config.bot_name()}（你）" in _sbg and stickers.SENT_IMAGE_TEXT in _sbg, _sbg)
 check("自己发的图不出现在「刚才的新发言」里",
       stickers.SENT_IMAGE_TEXT not in _sl.render_unread(bot_uid=str(BOT_QQ)),
       _sl.render_unread(bot_uid=str(BOT_QQ)))
@@ -1459,55 +1528,82 @@ check("空会话不写记录", len(_sl.messages) == _before_n)
 
 # --------------------------------------------------------------------- 19. 人设重写
 print("\n=== 19. 人设重写：参考方案里的规则是否真的落地 ===")
+# 这一组验的是**随项目发布的示例人格**（包 id = whale）的正文体例。
+# 包化之后"人设正文"属于某一个包，所以先确认当前激活的确实是它；
+# 不是就整组跳过并说明原因 —— 既不崩在读取那一行，也不伪装成"通过了"
+# （与缺注册表时的 `check_reg()` 同一套态度）。
+_SAMPLE_PACK = "whale"
+if packs.active_id() != _SAMPLE_PACK:
+    skip_group("19. 人设重写（示例人格的正文体例）",
+               f"当前激活的是 {packs.active_id() or '（无包）'}，不是示例包 {_SAMPLE_PACK}")
+    _WHALE19 = False
+else:
+    _WHALE19 = True
 _P = config.SYSTEM_PROMPT
 # 人格分层之后，"人设体例"分散在三个文件里：
 #   底层人设（它是谁）/ 禁止事项（铁律）/ 表层人设（怎么说话）
 # 所以这一组验的是**三层合起来**是否覆盖了参考方案里的那些规则。
-_SRC = "\n".join([
-    pathlib.Path("persona/active/base.txt").read_text(encoding="utf-8"),
-    pathlib.Path("persona/active/forbidden.txt").read_text(encoding="utf-8"),
-    pathlib.Path("persona/active/surface.txt").read_text(encoding="utf-8"),
-])
+# **读包里的原件**，不走 `config.*_file_path()`：本组验的正是"文件里写了什么"，
+# 而别处（§33/34）会把表层临时指到测试目录，那会把这份断言变成"验测试自己的临时文件"。
+_PACK_WHALE = packs.pack_dir(_SAMPLE_PACK)
 
-check("底层人设文件被加载", config.PERSONA_SOURCE == "persona/active/base.txt", config.PERSONA_SOURCE)
+
+def _pack_text(role: str) -> str:
+    try:
+        return (packs.pack_file(_SAMPLE_PACK, role)).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+_SRC = "\n".join([_pack_text("base"), _pack_text("forbidden"), _pack_text("surface")])
+
+if _WHALE19:
+    check("底层人设文件被加载", config.persona_source() == _SAMPLE_PACK
+          and config.persona_file_path().name == "base.txt",
+          f"{config.persona_source()} / {config.persona_file_path()}")
 
 # 分层本身的守卫：**权限边界**要真的是那道边界。
 # 原来这里断言"底层不含【示例：这样回】"—— 那条假设已经被用户改掉了：
 # 他把"怎么说话"的完整规则（含示例）钉在**底层**，表层只留可迭代的几段。
 # 这是他的选择（示例不参与迭代 = 不被自动改写），所以断言跟着改成真正的边界：
-_BASE_SRC = pathlib.Path("persona/active/base.txt").read_text(encoding="utf-8")
-_FORB_SRC = pathlib.Path("persona/active/forbidden.txt").read_text(encoding="utf-8")
-_SURF_SRC19 = pathlib.Path("persona/active/surface.txt").read_text(encoding="utf-8")
-check("禁止事项只装禁令（不含语言风格段）", "【语言风格】" not in _FORB_SRC)
-check("底层与禁止事项是**两处**（铁律不混进底色）",
-      "【禁止事项】" not in _BASE_SRC and "【禁止事项】" in _FORB_SRC,
-      "")
-check("表层里有可迭代的段（否则自我迭代无处落笔）",
-      "【挑图进表情包库】" in _SURF_SRC19 or "【自然对话技巧】" in _SURF_SRC19, "")
+_BASE_SRC = _pack_text("base")
+_FORB_SRC = _pack_text("forbidden")
+_SURF_SRC19 = _pack_text("surface")
+if _WHALE19:
+    check("禁止事项只装禁令（不含语言风格段）", "【语言风格】" not in _FORB_SRC)
+    check("底层与禁止事项是**两处**（铁律不混进底色）",
+          "【禁止事项】" not in _BASE_SRC and "【禁止事项】" in _FORB_SRC,
+          "")
+    check("表层里有可迭代的段（否则自我迭代无处落笔）",
+          "【挑图进表情包库】" in _SURF_SRC19 or "【自然对话技巧】" in _SURF_SRC19, "")
 
 # 参考方案第 1 条：要写成「触发条件 + 行为规则」，不是形容词堆砌
-for _section in ("【语言风格】", "【禁止事项】", "【回复长度】"):
-    check(f"含规则段 {_section}", _section in _SRC)
-# 参考方案第 2 条：按消息类型选回复结构
-check("含按消息类型分派的回法", "先判断对方在干嘛" in _SRC)
-for _kind in ("提问", "求建议", "闲聊", "吐槽", "分享信息", "追问", "指令"):
-    check(f"消息类型覆盖「{_kind}」", _kind in _SRC)
-# 参考方案第 5 条：消息意图判断
-check("明确要求先判意图再回", "先判断对方在干嘛，再决定怎么回" in _SRC)
-# 参考方案第 6 条：正反例
-check("含正例对话", "【示例：这样回】" in _SRC and _SRC.count("对方：") >= 5)
-check("含反例对话", "【示例：不要这样回】" in _SRC and "✗" in _SRC)
+if not _WHALE19:
+    print("  [跳过] 示例人格的正文体例断言（当前激活的不是示例包 whale）")
+else:
+    # 参考方案第 1 条：要写成「触发条件 + 行为规则」，不是形容词堆砌
+    for _section in ("【语言风格】", "【禁止事项】", "【回复长度】"):
+        check(f"含规则段 {_section}", _section in _SRC)
+    # 参考方案第 2 条：按消息类型选回复结构
+    check("含按消息类型分派的回法", "先判断对方在干嘛" in _SRC)
+    for _kind in ("提问", "求建议", "闲聊", "吐槽", "分享信息", "追问", "指令"):
+        check(f"消息类型覆盖「{_kind}」", _kind in _SRC)
+    # 参考方案第 5 条：消息意图判断
+    check("明确要求先判意图再回", "先判断对方在干嘛，再决定怎么回" in _SRC)
+    # 参考方案第 6 条：正反例
+    check("含正例对话", "【示例：这样回】" in _SRC and _SRC.count("对方：") >= 5)
+    check("含反例对话", "【示例：不要这样回】" in _SRC and "✗" in _SRC)
 
-# 机制说明不能留在人设里（换角色会丢，且会与代码版本冲突）
-for _stale in ("【关于眼前的聊天记录】", "目标：「", "TIMEOUTSIGNAL"):
-    check(f"人设里没有过时的机制/占位文本「{_stale}」", _stale not in _SRC)
+    # 机制说明不能留在人设里（换角色会丢，且会与代码版本冲突）
+    for _stale in ("【关于眼前的聊天记录】", "目标：「", "TIMEOUTSIGNAL"):
+        check(f"人设里没有过时的机制/占位文本「{_stale}」", _stale not in _SRC)
 
-# 参考方案第 7 条：不在代码里大改自然语言；这里确认人设**完全不含** [SKIP]。
-# 2026-09-26 规范化：人设里那段【主动发言】已删 —— 它的判据由 proactive.py /
-# context.py / greetings.py 在**各自需要的时机**注入，比在人设里常驻更准。
-# 于是契约从"只出现在主动发言段"收紧成"人设里一处都不许有"。
-check("人设里不出现 [SKIP]（契约由各模块按时机自带）",
-      _SRC.count("[SKIP]") == 0, f"{_SRC.count('[SKIP]')} 处")
+    # 参考方案第 7 条：不在代码里大改自然语言；这里确认人设**完全不含** [SKIP]。
+    # 2026-09-26 规范化：人设里那段【主动发言】已删 —— 它的判据由 proactive.py /
+    # context.py / greetings.py 在**各自需要的时机**注入，比在人设里常驻更准。
+    # 于是契约从"只出现在主动发言段"收紧成"人设里一处都不许有"。
+    check("人设里不出现 [SKIP]（契约由各模块按时机自带）",
+          _SRC.count("[SKIP]") == 0, f"{_SRC.count('[SKIP]')} 处")
 
 
 # 曾经有「随机人设要素一轮最多一条」的闸门（flavor → rice → fat 顺序掷骰）。
@@ -1956,7 +2052,7 @@ _log2 = ConversationLog("u_time2", TMP / "chatlog_u_time2.json")
 for _m in (_m_3d, _m_yest, _m_just):
     _log2.messages.append(dict(_m))
 _log2.messages.append(
-    {**_at(20, "我自己说的", uid=10000, name="鲸鱼娘"), "is_bot": True, "bot_uid": 10000}
+    {**_at(20, "我自己说的", uid=10000, name=config.bot_name()), "is_bot": True, "bot_uid": 10000}
 )
 _log2.messages.append(
     {**_at(10, "主人说的", uid=int(settings.get("master_qq")), name="魔王")}
@@ -1975,7 +2071,7 @@ finally:
 check("背景里带日期锚点", "——" in _bg and re.search(r"—— \d{4}-\d{2}-\d{2} ——", _bg) is not None,
       _bg[:120])
 check("「3 天前」与「昨天」在渲染里都能看到", "3 天前" in _bg and "昨天" in _bg, _bg[:160])
-check("自己的发言仍带（你）", "鲸鱼娘（你）" in _bg)
+check("自己的发言仍带（你）", f"{config.bot_name()}（你）" in _bg, _bg[:200])
 check("主人仍带（主人）", "魔王（主人）" in _bg)
 
 # ---- 21.5 /时间 指令：精确回答，不过模型 ----
@@ -2948,22 +3044,26 @@ finally:
 print("\n=== 25. 不汇报收图 / 多条发送 / /风格 自由要求 ===")
 
 # ---- 25.1 人设里必须明确禁止"汇报收图" ----
-_SRC2 = pathlib.Path("persona/active/forbidden.txt").read_text(encoding="utf-8")
-check("人设【禁止事项】里钉了「不汇报对图片的处置」",
-      "不汇报你对图片的处置" in _SRC2, _SRC2[_SRC2.index("【禁止事项】"):][:400])
-for _phrase in ("我收了", "这图我存了", "收进图库了", "要不要我收"):
-    check(f"人设点名了要禁止的说法「{_phrase}」", _phrase in _SRC2)
-# 2026-09-26 规范化：表层那段【挑图进表情包库】已删 —— 它的判据由 stickers.py
-# 自带的提示词负责（含"能看到画面/只能看元信息"的 sight 说明），人设里不再重复写。
-# 于是"不重复"改成更强的形式：禁令只在禁止事项层说**一次**，别处一处都不许有。
-_SURF_SRC = pathlib.Path("persona/active/surface.txt").read_text(encoding="utf-8")
-_BASE_SRC25 = pathlib.Path("persona/active/base.txt").read_text(encoding="utf-8")
-check("收图禁令只在禁止事项层说一次（别处不重复）",
-      _SRC2.count("我收了") == 1
-      and "我收了" not in _SURF_SRC
-      and "我收了" not in _BASE_SRC25,
-      f"禁令层 {_SRC2.count('我收了')} 次，表层 {_SURF_SRC.count('我收了')} 次，"
-      f"底层 {_BASE_SRC25.count('我收了')} 次")
+# 这一组也是**示例人格（whale）**的正文断言，理由同 §19：人设正文属于某个包。
+_SRC2 = _pack_text("forbidden")
+if not _WHALE19:
+    print("  [跳过] 示例人格的收图禁令断言（当前激活的不是示例包 whale）")
+else:
+    check("人设【禁止事项】里钉了「不汇报对图片的处置」",
+          "不汇报你对图片的处置" in _SRC2, _SRC2[_SRC2.index("【禁止事项】"):][:400])
+    for _phrase in ("我收了", "这图我存了", "收进图库了", "要不要我收"):
+        check(f"人设点名了要禁止的说法「{_phrase}」", _phrase in _SRC2)
+    # 2026-09-26 规范化：表层那段【挑图进表情包库】已删 —— 它的判据由 stickers.py
+    # 自带的提示词负责（含"能看到画面/只能看元信息"的 sight 说明），人设里不再重复写。
+    # 于是"不重复"改成更强的形式：禁令只在禁止事项层说**一次**，别处一处都不许有。
+    _SURF_SRC = _pack_text("surface")
+    _BASE_SRC25 = _pack_text("base")
+    check("收图禁令只在禁止事项层说一次（别处不重复）",
+          _SRC2.count("我收了") == 1
+          and "我收了" not in _SURF_SRC
+          and "我收了" not in _BASE_SRC25,
+          f"禁令层 {_SRC2.count('我收了')} 次，表层 {_SURF_SRC.count('我收了')} 次，"
+          f"底层 {_BASE_SRC25.count('我收了')} 次")
 
 # ---- 25.2 多段/多短句分条发送 ----
 settings.set_value("sentence_split", True)
@@ -3927,7 +4027,11 @@ try:
           "机器人小号" not in _snd and "肥鱼" not in _snd and _snd.get("群友甲") == 3003, str(_snd))
 
     # ---- 30.7 修复脚本 `_修复画像重复.py` 的合并计划与落地 ----
-    _rep_path = ROOT / "_工具链" / "_修复画像重复.py"
+    # 路径别写回 `_工具链\_修复画像重复.py`：维护脚本 2026-10-02 分组之后在
+    # `_工具链\维护\` 下 —— 写死旧路径的后果是这一节（以及它之后的一切）**静默不跑**。
+    _rep_path = ROOT / "_工具链" / "维护" / "_修复画像重复.py"
+    if not _rep_path.is_file():
+        raise SystemExit(f"找不到 {_rep_path}：修复脚本的合并计划没法验证")
     _rep_spec = importlib.util.spec_from_file_location("_repair_profiles", _rep_path)
     assert _rep_spec and _rep_spec.loader
     _rep_mod = importlib.util.module_from_spec(_rep_spec)
@@ -4253,6 +4357,11 @@ from ai_chat import signals as _sig  # noqa: E402
 _old_logdir7 = config.LOG_DIR
 _sigdir = _mkdtemp("ai_chat_sig_")
 config.LOG_DIR = _sigdir  # type: ignore[misc]
+# 人格运行数据（账本在里面）跟着**表层的路径**走，而表层路径不再是 `config.LOG_DIR`
+# 派生的（包化之后是 `data/runtime/persona/<包>/`）。所以要把表层显式指到这个临时目录，
+# 否则本节会把账本写进真实运行数据 —— 旧测试是靠 `config.LOG_DIR` 拦住的，那条路已经不通了。
+_orig_surface_cfg32 = _driver.config.get("ai_chat_surface_file")
+persona_cfg("ai_chat_surface_file", str(_sigdir / "surface_sig.txt"))
 
 try:
     _sig._store.items.clear()  # noqa: SLF001
@@ -4302,8 +4411,8 @@ try:
           f"{_n2}/{_sig.stats()['items']}")  # noqa: SLF001
     _sig.record(_sig.detect("以后叫我哥哥"), conv="u1", uid=1)  # noqa: SLF001
     check("另一类会记成第二条", _sig.stats()["items"] == 2, str(_sig.stats()))  # noqa: SLF001
-    check("账本落盘了", (_sigdir / "persona" / "signals.json").exists(),
-          str(sorted(p.name for p in _sigdir.glob("*.json"))))
+    check("账本落盘了", (config.persona_data_dir() / "signals.json").exists(),
+          str(config.persona_data_dir()))
 
     # ---- 32.5 **最要紧的一条：识别与记账都不得改人设** ----
     # 旧的 `persona.stamp()` / `_store.entries` / `style_notes()` 都随槽位机制删了。
@@ -4376,6 +4485,7 @@ try:
     del _settings.store._runtime["persona_signal_enabled"]  # noqa: SLF001
 finally:
     _sig._store.items.clear()  # noqa: SLF001
+    persona_cfg("ai_chat_surface_file", _orig_surface_cfg32)
     config.LOG_DIR = _old_logdir7  # type: ignore[misc]
     shutil.rmtree(_sigdir, ignore_errors=True)
 
@@ -4387,13 +4497,14 @@ from ai_chat import persona_iter as _piter  # noqa: E402
 _old_logdir8 = config.LOG_DIR
 _iterdir = _mkdtemp("ai_chat_iter_")
 config.LOG_DIR = _iterdir  # type: ignore[misc]
-# 把表层人设临时指到测试目录：**绝不能让测试写进真实的 persona/active/surface.txt**
-_orig_surface_cfg = config._SURFACE_CONFIGURED  # noqa: SLF001
-_orig_base_cfg = config._PERSONA_CONFIGURED  # noqa: SLF001
-_orig_base_prompt = config.BASE_PROMPT
+# 把表层人设临时指到测试目录：**绝不能让测试写进真实的运行数据**。
+# 包化之后"指到别处"走**显式配置**这条路（`persona_cfg`），而不再改私有常量 ——
+# 路径现在是 `config.persona_source_path()` 现算的，常量已经不是真源了。
+_orig_surface_cfg = _driver.config.get("ai_chat_surface_file")
+_orig_base_cfg = _driver.config.get("ai_chat_persona_file")
 _test_surface = _iterdir / "persona_surface_test.txt"
 _test_surface.write_text(persona.surface_text(), encoding="utf-8")
-config._SURFACE_CONFIGURED = str(_test_surface)  # noqa: SLF001
+persona_cfg("ai_chat_surface_file", str(_test_surface))
 persona._log.items.clear()  # noqa: SLF001
 persona._log.loaded = True  # noqa: SLF001
 # §33 验的是**"过闸门即生效"这条老路径**（写入、撤回、冲突拦截）。
@@ -4451,13 +4562,13 @@ try:
     # ---- 33.4 底层人设为空时拒绝跑（没有约束就没有闸门依据）----
     _empty_base = _iterdir / "persona_base_empty.txt"
     _empty_base.write_text("", encoding="utf-8")
-    config._PERSONA_CONFIGURED = str(_empty_base)  # noqa: SLF001
-    config.BASE_PROMPT = ""  # type: ignore[misc]
+    persona_cfg("ai_chat_persona_file", str(_empty_base))
+    persona_layer_override("BASE_PROMPT", "")
     _res3 = asyncio.run(_piter.reflect_once(notify=False))
     check("底层人设为空时拒绝迭代（闸门需要依据）",
           _res3.get("ok") is False and "底层人设" in str(_res3.get("why")), str(_res3))
-    config._PERSONA_CONFIGURED = _orig_base_cfg  # noqa: SLF001
-    config.BASE_PROMPT = _orig_base_prompt  # type: ignore[misc]
+    persona_cfg("ai_chat_persona_file", _orig_base_cfg)
+    persona_layer_override("BASE_PROMPT", None)
 
     # ---- 33.5 统计可供控制台/日志展示 ----
     _ist = _piter.stats()
@@ -4465,9 +4576,9 @@ try:
 
     _piter._ask_model = _orig_ask  # type: ignore[assignment]  # noqa: SLF001
 finally:
-    config._SURFACE_CONFIGURED = _orig_surface_cfg  # noqa: SLF001
-    config._PERSONA_CONFIGURED = _orig_base_cfg  # noqa: SLF001
-    config.BASE_PROMPT = _orig_base_prompt  # type: ignore[misc]
+    persona_cfg("ai_chat_surface_file", _orig_surface_cfg)
+    persona_cfg("ai_chat_persona_file", _orig_base_cfg)
+    persona_layer_override("BASE_PROMPT", None)
     persona._log.items.clear()  # noqa: SLF001
     del _settings.store._runtime["persona_iter_auto_apply"]  # noqa: SLF001
     config.LOG_DIR = _old_logdir8  # type: ignore[misc]
@@ -4486,10 +4597,10 @@ try:
     persona._pending.loaded = True  # noqa: SLF001
     persona._log.items.clear()  # noqa: SLF001
     persona._log.loaded = True  # noqa: SLF001
-    # 表层用临时文件，别动真实 persona/active/surface.txt
-    _orig_surface_cfg9 = config._SURFACE_CONFIGURED  # noqa: SLF001
+    # 表层用临时文件，别动真实运行数据
+    _orig_surface_cfg9 = _driver.config.get("ai_chat_surface_file")
     _surface_keep = persona.surface_text()
-    config._SURFACE_CONFIGURED = str(_pool / "surface_pool.txt")  # noqa: SLF001
+    persona_cfg("ai_chat_surface_file", str(_pool / "surface_pool.txt"))
     (config.surface_file_path()).write_text(_surface_keep, encoding="utf-8")
     _orig_sig_items = list(_sig._store.items)  # noqa: SLF001
 
@@ -4676,7 +4787,7 @@ try:
     persona._pending.save()  # noqa: SLF001
     persona._log.items.clear()  # noqa: SLF001
     _sig._store.items[:] = _orig_sig_items  # noqa: SLF001
-    config._SURFACE_CONFIGURED = _orig_surface_cfg9  # noqa: SLF001
+    persona_cfg("ai_chat_surface_file", _orig_surface_cfg9)
     del _settings.store._runtime["persona_iter_auto_apply"]  # noqa: SLF001
 finally:
     config.LOG_DIR = _old_logdir9  # type: ignore[misc]
@@ -5073,8 +5184,213 @@ finally:
     config.LOG_DIR = _old_logdir_llm  # type: ignore[misc]
     shutil.rmtree(_llm_dir, ignore_errors=True)
 
+# --------------------------------------------------------------------- 35. 人格包（2026-10 包化）
+# 守四件事：
+#   ① 一个包 = 一套完整人格，"切过去"要**当场换人**（不重启）；
+#   ② 换包必须让所有按人格算出来的缓存一起失效 —— 否则新角色带着旧角色的
+#      闸门关键词运行（静默失守），或还读着旧包的三层正文（改了没生效）；
+#   ③ 每个包的运行数据**互相隔离**（表层的自我学习不会串到别的角色身上）；
+#   ④ 身份元数据（角色名）跟着包走 —— `chatlog._speaker()` 的归属判定靠它。
+#
+# 这一节自己造一个临时包，**不动仓库里那两个**（whale / assistant 是交付物）。
+print("\n=== 35. 人格包：热切换 / 缓存失效 / 运行数据隔离 ===")
+_old_logdir35 = config.LOG_DIR
+_pack35 = _mkdtemp("ai_chat_pack_")
+config.LOG_DIR = _pack35  # type: ignore[misc]
+# 造一个包：id 用测试名，避免和真实包重名（重名会污染"可用包"清单）。
+# ⚠ **id 不能以 `_` 开头** —— 那是"不参与扫描"的保留前缀（`_TEMPLATE/` 靠它躲开列表），
+# 而且在 `_` 与 `.` 之间摇摆会让 `validate()` 与 `list_packs()` 的口径不一致。
+_PROBE_ID = "zzprobe35"
+_PROBE_DIR = ROOT / "persona" / "packs" / _PROBE_ID
+_PROBE_DIR.mkdir(parents=True, exist_ok=True)
+(_PROBE_DIR / "base.txt").write_text(
+    "【它是谁】\n你是「探针」，一个只存在于测试里的人格。\n"
+    "【说话的样子】\n- 只回一个词。\n", encoding="utf-8")
+(_PROBE_DIR / "forbidden.txt").write_text(
+    "【禁止事项】\n- 不许说「啰嗦」这两个字作为禁令关键词。\n- 不许提「测试专用禁词」。\n",
+    encoding="utf-8")
+(_PROBE_DIR / "surface.txt").write_text(
+    "【表层人设：可学习偏好】\n\n【探针的小节】\n- 初始条目\n\n\n"
+    "【自动学到的（自动迭代只写这一节，条目追加在文件末尾）】\n", encoding="utf-8")
+(_PROBE_DIR / "_pack.json").write_text(json.dumps({
+    "schema": 1, "id": _PROBE_ID, "name": "探针", "bot_name": "探针",
+    "wake_words": ["探针", "小探针"], "enabled": True,
+}, ensure_ascii=False), encoding="utf-8")
+
+_orig_active35 = packs.active_id()
+_orig_botname35 = settings.get("bot_name")
+_orig_wake35 = settings.get("wake_words")
+try:
+    # ---- 35.1 列表与校验 ----
+    _ids = packs.pack_ids()
+    check("能用的人格包都列出来了", {"whale", "assistant"} <= set(_ids), str(_ids))
+    check("`_` 前缀的脚手架不算包（_TEMPLATE 不该被切过去）",
+          not any(x.startswith("_") for x in _ids), str(_ids))
+    check("新造的包能被校验通过", packs.validate(_PROBE_ID)["ok"],
+          str(packs.validate(_PROBE_ID)))
+    _bad = packs.validate("不存在的包")
+    check("不存在的包校验失败且说明了原因",
+          _bad["ok"] is False and any("目录不存在" in x for x in _bad["errors"]), str(_bad))
+    _badid = packs.validate("中文 id 不行")
+    check("id 白名单挡住非 ASCII（它要进 /人设 切换 与 URL）",
+          _badid["ok"] is False, str(_badid["errors"]))
+    _dotid = packs.validate("_template_style")
+    check("id 白名单挡住 `_` 开头（那是「不参与扫描」的保留前缀）",
+          _dotid["ok"] is False, str(_dotid["errors"]))
+    check("按显示名/别名也能解析到 id",
+          packs.resolve_id("探针") == _PROBE_ID and packs.resolve_id("whale") == "whale", "")
+
+    # ---- 35.2 三层与闸门关键词（换包前）----
+    _whale_base = config.BASE_PROMPT
+    _whale_traits = len(config.load_traits())
+    check("换包前读的是 whale", packs.active_id() == "whale" and "鲸鱼娘" in _whale_base,
+          packs.active_id())
+
+    # ---- 35.3 切换：当场换人 ----
+    # 先给新包播种表层：真实切换路径也是这么做的（`config.seed_surface_for`），
+    # 不播的话新包还没有运行数据目录里的表层，那一层就是空的（不是缺陷，是要知道）。
+    _seed_note = config.seed_surface_for(_PROBE_ID)
+    check("播种落在这个包自己的目录里，且与包内模板字节一致",
+          (packs.seeded_stage_file(_PROBE_ID, "surface")).read_bytes()
+          == (packs.pack_file(_PROBE_ID, "surface")).read_bytes(),
+          _seed_note)
+
+    _sw = packs.switch(_PROBE_ID)
+    check("切换返回成功", _sw.get("ok") is True, str(_sw))
+    check("active_id 当场变了（不是重启才生效）", packs.active_id() == _PROBE_ID,
+          packs.active_id())
+    check("三层正文当场变成新包的", "探针" in config.BASE_PROMPT
+          and "鲸鱼娘" not in config.BASE_PROMPT, config.BASE_PROMPT[:40])
+    check("SYSTEM_PROMPT 也跟着变（惰性属性，不是 import 期常量）",
+          "探针" in config.SYSTEM_PROMPT, config.SYSTEM_PROMPT[:40])
+    check("禁止事项跟着换（闸门依据也换了）",
+          any("测试专用禁词" in x for x in persona.forbidden_items()),
+          str(persona.forbidden_items()[:2]))
+    check("旧包的运行数据没有被读到（表层是新的那一层）",
+          "探针的小节" in persona.surface_text(), persona.surface_text()[:40])
+
+    # ---- 35.4 闸门关键词跟着换（这是最容易静默失守的一处）----
+    _kw = [x[0] for x in persona._CONFLICTS]  # noqa: SLF001
+    check("闸门关键词按新包的注册表重算（缺 traits 时回退内置表）",
+          len(config.load_traits()) == 0 and len(_kw) > 0,
+          f"traits={len(config.load_traits())} kwargs={len(_kw)}")
+    # 缓存失效：registry 的缓存必须跟着代际走，不然切回去还是免 traits 的结论
+    _traits_now = len(config.load_traits())
+    packs.switch("whale")
+    check("切回 whale 后注册表缓存失效并重读（否则闸门一直用旧包的表）",
+          len(config.load_traits()) == _whale_traits > 0,
+          f"{_traits_now} → {len(config.load_traits())}")
+
+    # ---- 35.5 运行数据隔离 ----
+    packs.switch(_PROBE_ID)
+    _stage_probe = packs.stage_dir()
+    check("运行数据落在按包分开的目录里",
+          _stage_probe.name == _PROBE_ID and _stage_probe.parent.name == "persona",
+          str(_stage_probe))
+    _mine = persona.apply_candidate("这句只该属于探针这个包", reason="测试：包隔离")
+    check("往当前包的表层写一条", _mine.get("written") is True, str(_mine))
+    check("这条写进了探针自己的目录",
+          "只该属于探针" in (packs.seeded_stage_file(_PROBE_ID, "surface")).read_text(encoding="utf-8"),
+          "")
+    packs.switch("whale")
+    check("**切回 whale 之后看不到探针学的那条**（包隔离的关键断言）",
+          "只该属于探针" not in persona.surface_text(), persona.surface_text()[-60:])
+    packs.switch(_PROBE_ID)
+    check("切回探针，它学的那条还在（自我学习不被换包冲掉）",
+          "只该属于探针" in persona.surface_text(), persona.surface_text()[-60:])
+    check("变更日志也按包分开（/人设 日志 不该显示别人格的记录）",
+          all("只该属于探针" in str(x.get("text") or "") or x.get("action") == "proposed"
+              for x in persona.changelog(20)) or bool(persona.changelog(20)),
+          str([x.get("action") for x in persona.changelog(3)]))
+
+    # ---- 35.6 身份元数据跟着包走 ----
+    # **从包里读用哪一份快照**：这里必须点名 whale，而不是 `packs.active_pack()` ——
+    # 走到这一步时激活的已经是探针包，拿它当"whale 声明了什么"就会比错对象。
+    _whale_name = str(json.loads((packs.pack_dir("whale") / "_pack.json").read_text(encoding="utf-8"))
+                      .get("bot_name") or "")
+    _got = config.switch_persona("whale")
+    check("切换会同步身份元数据（角色名 / 唤醒词）",
+          bool(_whale_name) and _got.get("identity", {}).get("bot_name") == _whale_name,
+          f"包声明 {_whale_name!r} / 同步 {_got.get('identity')}")
+    check("config.bot_name() 报的是新包的角色名",
+          config.bot_name() == _whale_name, f"{config.bot_name()!r} / {_whale_name!r}")
+    _got2 = config.switch_persona(_PROBE_ID)
+    check("切到探针后角色名变成探针（归属判定跟得上）",
+          config.bot_name() == "探针" and _got2.get("identity", {}).get("wake_words") == "探针,小探针",
+          f"{config.bot_name()} / {_got2.get('identity')}")
+
+    # ---- 35.7 不合法/不存在的包：一个字都不写，保持原状 ----
+    _before = packs.active_id()
+    _fail = config.switch_persona("查无此包")
+    check("切到不存在的包：返回失败",
+          _fail.get("ok") is False and _fail.get("errors"), str(_fail.get("errors")))
+    check("失败时激活状态一个字没变（先校验后写入）",
+          packs.active_id() == _before, packs.active_id())
+
+    # ---- 35.8 `_pack.json` 的 id 与目录名不一致时以目录为准 ----
+    check("包视图以**目录名**为身份（避免列表显示 A、实际加载 B）",
+          packs._manifest_view(_PROBE_DIR)["id"] == _PROBE_ID, "")  # noqa: SLF001
+
+    # ---- 35.9 迁移：改造前的平铺运行数据要归位到当前包目录 ----
+    _flat_root = config.persona_data_dir().parent
+    (_flat_root / "signals.json").write_text(
+        json.dumps({"items": [{"kind": "call", "text": "旧账本"}]}, ensure_ascii=False),
+        encoding="utf-8")
+    _mig = packs.migrate_layout()
+    check("平铺的旧运行数据被搬进当前包目录",
+          "signals.json" in _mig["migrated"] and (packs.stage_dir() / "signals.json").exists(),
+          str(_mig))
+    check("迁移前留了备份（可恢复）", bool(_mig["backup"]) and os.path.isdir(_mig["backup"]),
+          _mig["backup"])
+    _mig2 = packs.migrate_layout()
+    check("再迁一次是幂等的（没有要迁的就什么都不做）",
+          _mig2["migrated"] == [] and _mig2["conflicts"] == [], str(_mig2))
+
+    # ---- 35.10 `/人设 包` 与 `/人设 切换` 的指令面 ----
+    _act_packs = asyncio.run(instructions.parse("/人设 包", conv="u1", is_master=True))
+    check("/人设 包 列出当前包与可用包",
+          _act_packs.handled and "当前人格包" in _act_packs.reply and "whale" in _act_packs.reply,
+          _act_packs.reply[:70])
+    _act_sw = asyncio.run(instructions.parse("/人设 切换 whale", conv="u1", is_master=True))
+    check("/人设 切换 <id> 能切（回执说明立即生效）",
+          _act_sw.handled and packs.active_id() == "whale" and "立即生效" in _act_sw.reply,
+          _act_sw.reply[:90])
+    _act_deny = asyncio.run(instructions.parse("/人设 切换 assistant", conv="u1", is_master=False))
+    check("群友不能切人格（它是全局可见的身份）",
+          _act_deny.handled and not _act_deny.ok, _act_deny.reply[:40])
+    check("群友被拒之后人格没有被改动", packs.active_id() == "whale", packs.active_id())
+
+    # ---- 35.11 旧路径逃生舱仍然有效（显式配置优先于包）----
+    _escape = _pack35 / "escape_base.txt"
+    _escape.write_text("你是「逃生舱」，一个显式配置的人设。", encoding="utf-8")
+    persona_cfg("ai_chat_persona_file", str(_escape))
+    check("显式配了 AI_CHAT_PERSONA_FILE 就绕过人格包（回退路径还在）",
+          "逃生舱" in config.BASE_PROMPT and config.persona_file_path() == _escape,
+          f"{config.persona_file_path()} / {config.BASE_PROMPT[:30]}")
+    persona_cfg("ai_chat_persona_file", None)
+    check("清掉显式配置后又回到包里的那份", "鲸鱼娘" in config.BASE_PROMPT,
+          config.BASE_PROMPT[:30])
+
+    # ---- 35.12 两层解析必须同口径（`_人格包检查.py` 复算了一份 PACK_FILES）----
+    _script = (ROOT / "验证" / "_人格包检查.py").read_text(encoding="utf-8")
+    check("验证脚本的 PACK_FILES 与 packs.PACK_FILES 一致（防两份表漂移）",
+          all(f'"{role}": "{name}"' in _script for role, name in packs.PACK_FILES.items()),
+          str(packs.PACK_FILES))
+finally:
+    # 收尾：把状态与设置还回去，**并删掉测试包**（不能让仓库里多一个假人格）
+    persona_cfg("ai_chat_persona_file", None)
+    # **必须还回"哪个包是激活的"**：后面还有整组用例在读示例人格的正文
+    # （见快照处的说明）。用 `sync_registry=False`：测试不该改仓库里的注册表。
+    if _ACTIVE_PACK_SNAPSHOT:
+        packs.switch(_ACTIVE_PACK_SNAPSHOT, sync_registry=False)
+    settings.set_value("bot_name", _orig_botname35 if _orig_botname35 is not None else "")
+    settings.set_value("wake_words", _orig_wake35 if _orig_wake35 is not None else "")
+    config.LOG_DIR = _old_logdir35  # type: ignore[misc]
+    shutil.rmtree(_PROBE_DIR, ignore_errors=True)
+    shutil.rmtree(_pack35, ignore_errors=True)
+
 # --------------------------------------------------------------------- 收尾
-# **先把还开着的 sqlite 句柄关掉**：Windows 上句柄没释放时 `rmtree` 会失败，
+# **先把还开着的 sqlite 句柄关掉**
 # 而失败被 `ignore_errors=True` 吞掉的后果，是仓库根目录长期留一个
 # `.tmp_selftest\<run>\memory.db`（实测 98 KB）—— 没人知道它为什么在那，
 # 而 `git add .` 会把它收进去（`.gitignore` 是第二道防线，不是第一道）。
@@ -5111,7 +5427,7 @@ if _WORKSPACE_TMP.exists():
         print("         多半是还有 sqlite 句柄没释放。它已在 .gitignore 里、不会进仓库，"
               "手工删一次即可。")
 print(f"\n{'=' * 60}")
-# 跳过项**必须出现在汇总里**：公开副本缺 `persona/active/traits.json`，"跑绿了"不能
+# 跳过项**必须出现在汇总里**：公开副本缺 `persona/packs/<包>/traits.json`，"跑绿了"不能
 # 被误读成"注册表那几组也验过了"（与 README「巡检 0 错误也可能是假的」同一条纪律）。
 print(f"通过 {passed} 项"
       + (f"，失败 {len(failed)} 项：{failed}" if failed else "，全部通过")

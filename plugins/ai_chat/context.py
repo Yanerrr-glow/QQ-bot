@@ -427,7 +427,7 @@ def build(
         # **当前没有调用方**：定时问候走的是 `greetings.compose()`，
         # 它自己组 prompt（`context.build_simple`），不经过这个分支。
         # 留在这里是为了不静默删代码；真要用它，记得它只是一句"临时场合说明"，
-        # 优先级低于 persona/active/forbidden.txt。
+        # 优先级低于 persona/packs/<包>/forbidden.txt。
         ask = f"【现在需要你做的事】\n到点问候了。对{speaker}说一句合乎当下时段的话。"
     else:  # proactive
         ask = "【现在需要你做的事】\n看看上面在聊什么，想插一句就自然地说；不想说就只回 [SKIP]。"

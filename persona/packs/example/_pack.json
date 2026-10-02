@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "id": "example",
+  "name": "示例角色",
+  "aliases": ["示例"],
+  "description": "写人格包时的参照样本：四个文件逐条演示《人格包内容规范》里的写法",
+  "bot_name": "示例角色",
+  "wake_words": ["示例角色"],
+  "enabled": true,
+  "note": "这份注释是给你看的，不参与运行。要点：id 只能用 ASCII；bot_name 是**线上实际显示名**，决定 chatlog._speaker() 认哪句是机器人自己说的，所以必须与 base.txt 里那句自我介绍一致；aliases 放历史名与别名（改名后旧记录靠它才认得出自己）；master_title 留空 = 不干预。逐条说明见 docs/人格包内容规范.md。"
+}

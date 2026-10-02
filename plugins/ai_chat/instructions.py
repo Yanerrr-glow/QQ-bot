@@ -47,8 +47,8 @@ from typing import Any
 
 
 from . import (
-    attention, clock, config, dsh_bridge, identity, memory, mode, persona, search, settings,
-    signals, state, stickers,
+    attention, clock, config, dsh_bridge, identity, memory, mode, packs, persona, search,
+    settings, signals, state, stickers,
 )
 
 logger = logging.getLogger("ai_chat.instructions")
@@ -550,6 +550,49 @@ async def _cmd_persona(rest: str, *, conv: str, is_master: bool, ctx: Any = None
             return _say("persona", f"没否决成：{got.get('why')}")
         return _say("persona", f"否决了，已从候选池丢掉：\n· {got.get('text', '')[:70]}")
 
+    # ---- 人格包：看有哪些、切到哪一个 ----------------------------------------
+    # 为什么把"切换"放在群里而不是只放控制台：换人格是**一眼就能看出效果**的操作
+    # （下一句回复就换人），在群里试最直接。但它是**主人限定**的 ——
+    # 群友不能改机器人是谁。
+    if sub in ("包", "人格包", "pack", "packs"):
+        return _say("persona", packs.describe())
+
+    if sub in ("切换", "换", "切", "switch", "use", "用"):
+        if not arg:
+            ids = packs.pack_ids()
+            return _say("persona",
+                        "要给一个包 id（或显示名）。可用的是："
+                        + ("、".join(ids) if ids else "（当前一个可用包都没有）"))
+        target = packs.resolve_id(arg) or arg
+        before = packs.active_id()
+        if target == before:
+            return _say("persona", f"现在用的就是「{arg}」，没有切换。"
+                                   "（想重读文件用 /人设 状态；表层本来每轮现读）")
+        # 先给新包播种表层：切完立刻就有内容，不用等下一次启动。
+        seed_note = config.seed_surface_for(target)
+        got = config.switch_persona(target)
+        if not got.get("ok"):
+            why = "；".join(got.get("errors") or []) or "未知原因"
+            return _say("persona", f"没切成：{why}\n照 persona/_TEMPLATE/README.md 补齐包里的文件。")
+        rows = [
+            f"换好了：{before or '（无）'} → {packs.active_id()}（{packs.active_pack()['name']}）",
+            f"· 人设文件：{packs.rel_to_root(packs.active_file('base'))}",
+            f"· 运行数据：{packs.rel_to_root(packs.stage_dir())}",
+            f"· {seed_note}",
+            "· **立即生效**，不用重启（下一次回复就是新人格）。",
+        ]
+        if got.get("identity"):
+            pairs = "、".join(f"{k}={v}" for k, v in got["identity"].items())
+            rows.append(f"· 身份已跟着换：{pairs}")
+        if got.get("identity_note"):
+            rows.append(f"· {got['identity_note']}")
+        for warn in got.get("warnings") or []:
+            rows.append(f"· ⚠ {warn}")
+        if not got.get("registry_written"):
+            rows.append("· ⚠ 注册表写不进去（只读文件系统？）：重启后默认人格不会跟着变，"
+                        "但运行时标记已经写下了，本次部署不受影响。")
+        return _say("persona", "\n".join(rows))
+
     if sub in ("重跑", "反思", "迭代"):
         from . import persona_iter
 
@@ -614,7 +657,9 @@ async def _cmd_persona(rest: str, *, conv: str, is_master: bool, ctx: Any = None
             "按槽位改人设的指令已经删掉了。\n"
             f"{_persona_readonly_hint()}\n\n"
             "还能用的：\n"
-            "· /人设 —— 看三层状态与文件路径\n"
+            "· /人设 —— 看当前人格包与三层状态\n"
+            "· /人设 包 —— 看有哪些人格包可以用\n"
+            "· /人设 切换 <id> —— 换一个（**立即生效**，不用重启）\n"
             "· /人设 铁律 —— 逐条看禁止事项\n"
             "· /人设 候选 / 采纳 <序号> / 否决 <序号> —— 看待采纳提议并决定要不要\n"
             "· /人设 日志 / /人设 撤回 —— 看与撤销已生效的改动\n"
@@ -1259,7 +1304,7 @@ async def _cmd_help(rest: str, *, conv: str, is_master: bool, ctx: Any = None) -
         "· /图 忽略|只看|完全不看|正常|撤销|状态 —— 管图片怎么处理",
         "· /风格 —— 看我的人格三层现状（**改人格要直接编辑文件**）",
         "· /风格 铁律 —— 逐条看禁止事项（自动迭代撞不过去的那几条）",
-        "· /人设 [候选|采纳 <序号>|否决 <序号>|日志|撤回|重跑|信号|评估] —— 管我的人格（限主人）",
+        "· /人设 [包|切换 <id>|候选|采纳 <序号>|否决 <序号>|日志|撤回|重跑|信号|评估] —— 管我的人格（限主人）",
         "· /记忆 列表|存|找|翻|忘|保护 —— 管我记住的东西",
         "· /机制 [图|记忆|风格|触发|安全|全部] —— 我把自己的机制讲给你听",
         "· /时间 [差 <时刻>|校准|戳] —— 现在几点、距某个时间多久、跟 NTP 对时（我直接算，不猜）",

@@ -22,7 +22,7 @@ A/B 实测（用真实对话各生成 12 次）也证实：**加规则量不出�
 ## 判据现在从哪来
 
 原来窗口、阈值、正则、抑制文案**全部硬编码在本文件里**，只覆盖"提时间"与"追问"两个特质。
-现在它们登记在 `persona/active/traits.json` 的 `guards` 下，本文件按注册表构造判定器 ——
+现在它们登记在 `persona/packs/<包>/traits.json` 的 `guards` 下，本文件按注册表构造判定器 ——
 **于是"加一个可数守卫"变成加一条数据，而不是改这个文件。**
 
 **内置的 `TIME_RE` / `ASK_RE` 与默认窗口阈值继续保留**：注册表缺失或损坏时守卫照常工作。
@@ -95,6 +95,19 @@ _DEFAULT_RULES: tuple[tuple[str, str, "re.Pattern[str]", str, int, int], ...] = 
 
 _spec_cache: tuple | None = None
 
+# 换了人格包就必须重建判定器：`guards` 是从**当前包**的 `traits.json` 派生的，
+# 而它是"哪条毛病算反复"的判据。不清的话新角色会带着旧角色的规则运行 ——
+# 表现为抑制指令说得驴唇不对马嘴，**而且一条日志都不会有**。
+#
+# 导入失败是**正常路径**：`验证\_行为闸门验证.py` 会把本模块单独加载来测纯逻辑
+# （那时没有 `ai_chat.packs`），那种场景下没有人格可切，也就不需要登记。
+try:  # noqa: SIM105 - 显式写出失败分支比 contextlib.suppress 更清楚
+    from . import packs as _packs
+except ImportError:  # pragma: no cover - 只在单模块加载的验证场景下走到
+    _packs = None  # type: ignore[assignment]
+if _packs is not None:
+    _packs.on_change(lambda: globals().__setitem__("_spec_cache", None))
+
 
 def _positive_int(value: object, default: int) -> int:
     try:
@@ -105,7 +118,7 @@ def _positive_int(value: object, default: int) -> int:
 
 
 def _build_spec() -> tuple:
-    """按 `persona/active/traits.json` 的 guards 构造判定器；注册表用不上就退回内置默认。
+    """按**当前人格包**的 `traits.json` 的 guards 构造判定器；注册表用不上就退回内置默认。
 
     返回 `(默认窗口, 默认阈值, rules)`，`rules` 每条是
     `(id, label, 正则, 抑制文案, window, threshold)`。

@@ -14,7 +14,7 @@
 而 `config.py` 里那句注释「注意别在这里写括号动作」说明项目早就知道这类问题 ——
 只是用的是**注释提醒**，不是结构保证。
 
-`persona/active/traits.json` 把「所有表达该特质的通道」登记到特质名下，本脚本据此逐条核对。
+`persona/packs/<包>/traits.json` 把「所有表达该特质的通道」登记到特质名下，本脚本据此逐条核对。
 
 ## 三处冲突的结局（2026-09-26 已判定）
 
@@ -29,8 +29,8 @@
 
 所以本脚本维护**三张清单**，它们互不判违规：
 
-1. `persona/active/traits.json` 的 `traits[].channels` —— 表达某个特质的通道（人格语域）；
-2. `persona/active/traits.json` 的 `fixed_notice_channels` —— 代码写死的固定文案（**非**人格语域，
+1. `persona/packs/<包>/traits.json` 的 `traits[].channels` —— 表达某个特质的通道（人格语域）；
+2. `persona/packs/<包>/traits.json` 的 `fixed_notice_channels` —— 代码写死的固定文案（**非**人格语域，
    铁律管的是"模型自己怎么说"，管不到这里）；
 3. `resolved_conflicts` —— 已经判完的历史冲突，只作考证。
 
@@ -41,7 +41,7 @@
 
 **失败（退出码 1）**：
 * 通道的 `match` 在目标文件里找不到（引用的规则被删/改写了）；
-* **孤儿铁律** —— `persona/active/forbidden.txt` 里有条目没被任何特质认领
+* **孤儿铁律** —— `persona/packs/<包>/forbidden.txt` 里有条目没被任何特质认领
   （不可测量 = 不可验证，接不上「可诱发性准入」那条纪律）；
 * **生效特质没有闸门关键词** —— 那样的特质对自动迭代是完全敞开的。
 
@@ -68,33 +68,80 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(HERE)
 PKG = os.path.join(PROJ, "plugins", "ai_chat")
-
-TRAITS_FILE = os.path.join(PROJ, "persona/active/traits.json")
+PACKS_DIR = os.path.join(PROJ, "persona", "packs")
 
 # 自动迭代的**落点节**前缀：`apply_candidate` 是纯追加、不识别小节，
 # 所以"文件末尾那个【…】小节"决定了新条目落在哪个语义下面。
 LANDING_HEAD = "【自动学到的"
 
-# 通道 kind → 项目根下的文件名
+# 通道 kind → 包内文件名。**与 `plugins/ai_chat/packs.py` 的 `PACK_FILES` 一致**
+# （本脚本刻意不 import 插件，所以这张表是两份；`离线验证_桩.py` 有比对断言防漂移）。
 LAYER_FILES = {
-    "base": "persona/active/base.txt",
-    "forbidden": "persona/active/forbidden.txt",
-    "surface": "persona/active/surface.txt",
+    "base": "base.txt",
+    "forbidden": "forbidden.txt",
+    "surface": "surface.txt",
 }
+
+# 当前检查的包（`--pack` 指定，或按激活顺序推出来）。
+PACK = ""
+TRAITS_FILE = ""
 
 FAILED: list[str] = []
 WARNED: list[str] = []
 STATS: dict[str, int] = {}
 
 
+def active_pack_id() -> str:
+    """当前激活的包：运行时标记 > 注册表 > 唯一一个启用的包。
+
+    与 `plugins/ai_chat/packs.py` 的 `_resolve_active()` **同序**（这里复算一遍，
+    理由同其它复算：本脚本要能脱依赖直跑）。
+    """
+    marker = os.path.join(PROJ, "data", "runtime", "persona", "_active")
+    try:
+        with open(marker, "r", encoding="utf-8") as fh:
+            got = fh.read().strip()
+        if got and os.path.isdir(os.path.join(PACKS_DIR, got)):
+            return got
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(PROJ, "persona", "_registry.json"), "r", encoding="utf-8") as fh:
+            got = str((json.load(fh) or {}).get("active") or "").strip()
+        if got and os.path.isdir(os.path.join(PACKS_DIR, got)):
+            return got
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        pass
+    names = list_packs()
+    return names[0] if len(names) == 1 else ""
+
+
+def list_packs() -> list[str]:
+    """可用的包 id（按名字排序，跳过 `_`/`.` 开头的脚手架与临时目录）。"""
+    try:
+        return sorted(
+            name for name in os.listdir(PACKS_DIR)
+            if not name.startswith(("_", ".")) and os.path.isdir(os.path.join(PACKS_DIR, name))
+        )
+    except OSError:
+        return []
+
+
+def pack_layer_path(kind: str) -> str:
+    """当前包里某一层的路径。"""
+    return os.path.join(PACKS_DIR, PACK, LAYER_FILES[kind])
+
+
 def check(name: str, ok: bool, detail: str = "", *, warn_only: bool = False) -> bool:
     if ok:
         return True
+    # 名字带上包名：一个仓库里可能有多个包，汇总里两条同名失败会看不出是哪个包。
+    label = ("[%s] " % PACK) + name if PACK else name
     if warn_only:
-        WARNED.append(name)
+        WARNED.append(label)
         print("  [WARN] " + name + ((" —— " + str(detail)) if detail else ""))
     else:
-        FAILED.append(name)
+        FAILED.append(label)
         print("  [FAIL] " + name + ((" —— " + str(detail)) if detail else ""))
     return False
 
@@ -116,7 +163,7 @@ def _settings_int(key: str, fallback: int) -> int:
     按文本取默认值是糙一点，但 `_语法检查.py` 里已有同类先例（它也按文本核对 Dockerfile）。
     """
     try:
-        with open(os.path.join(PROJ, "data", "settings.json"), "r", encoding="utf-8") as fh:
+        with open(os.path.join(PROJ, "data", "runtime", "settings.json"), "r", encoding="utf-8") as fh:
             runtime = json.load(fh)
         if key in runtime:
             return int(runtime[key])
@@ -169,17 +216,26 @@ def forbidden_items(text: str) -> list[str]:
     return [x for x in out if len(x) >= 6]
 
 
-def main() -> int:
-    quiet = "--quiet" in sys.argv
-    strict = "--strict" in sys.argv
+def check_one_pack(pack_id: str, *, quiet: bool) -> None:
+    """检查一个包。**每个包独立判定**：一个包坏了不该让别的包看不出结论。"""
+    global PACK, TRAITS_FILE
+    PACK = pack_id
+    TRAITS_FILE = os.path.join(PACKS_DIR, pack_id, "traits.json")
+    print("\n" + "=" * 62)
+    print("== 人格包 %s ==" % pack_id)
+    print("=" * 62)
 
     if not os.path.exists(TRAITS_FILE):
-        print("找不到 persona/active/traits.json：%s" % TRAITS_FILE)
-        return 1
+        # 注册表是**可选**的（`persona.py` / `behavior.py` 都有内置回退，
+        # 公开副本按设计就不带它）。所以这里只报"查不了"，不当结构错误 ——
+        # 真正"缺它就不能用"的判断在 `_人格包检查.py --strict` 里。
+        print("  找不到 %s：%s" % (os.path.join("persona", "packs", pack_id, "traits.json"), TRAITS_FILE))
+        print("  → 跳过本包的通道一致性 / 闸门派生检查（闸门会回退内置默认表）")
+        return
     reg = json.loads(read(TRAITS_FILE))
     traits = reg.get("traits") or []
 
-    raw_layer = {k: read(os.path.join(PROJ, v)) for k, v in LAYER_FILES.items()}
+    raw_layer = {k: read(pack_layer_path(k)) for k in LAYER_FILES}
     active_layer = {k: strip_comments(v) for k, v in raw_layer.items()}
     code_raw: dict[str, str] = {}
     code_active: dict[str, str] = {}
@@ -389,11 +445,60 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 汇总
     print()
-    print("=== 结构错误 %d 项，警告 %d 项 ===" % (len(FAILED), len(WARNED)))
+    print("== 包 %s：结构错误 %d 项，警告 %d 项 ==" % (pack_id, len(FAILED), len(WARNED)))
     for f in FAILED:
         print("  失败: " + f)
-    if strict:
-        FAILED.extend(WARNED)
+
+
+def main() -> int:
+    """`--pack <id>` 只查一个；否则查**所有可用的包**。
+
+    **为什么要遍历所有包而不是只查当前那个**：包化之后"能切过去"的每个包
+    都是一份会被加载的人格，只查当前激活的等于让别的包裸奔 ——
+    而切换只需要一条指令，没有任何东西拦着你去用一个从没被检查过的包。
+    """
+    quiet = "--quiet" in sys.argv
+    strict = "--strict" in sys.argv
+    only = ""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--pack" and i + 1 < len(sys.argv):
+            only = sys.argv[i + 1].strip()
+
+    if not os.path.isdir(PACKS_DIR):
+        print("没有 persona/packs/ 目录 —— 照 persona/_TEMPLATE/README.md 建一个包")
+        return 1
+
+    packs = [only] if only else list_packs()
+    if not packs:
+        print("persona/packs/ 下一个可用的包都没有")
+        return 1
+    if only and not os.path.isdir(os.path.join(PACKS_DIR, only)):
+        print("找不到包目录：%s" % os.path.join(PACKS_DIR, only))
+        return 1
+
+    print("项目根：%s" % PROJ)
+    print("当前激活：%s" % (active_pack_id() or "（无）"))
+    print("要检查的包：%s" % "、".join(packs))
+
+    for pack_id in packs:
+        # 每个包一份独立的结论清单：`_pack_scope` 里把 check() 记到的名字都打上包名前缀，
+        # 免得"两个包都失败"时汇总里出现两条一模一样的行，看不出是哪个包。
+        global FAILED, WARNED, STATS
+        check_one_pack(pack_id, quiet=quiet)
+    return _summarize(strict=strict)
+
+
+def _summarize(*, strict: bool) -> int:
+    print()
+    print("=" * 62)
+    print("=== 全部包：结构错误 %d 项，警告 %d 项 ===" % (len(FAILED), len(WARNED)))
+    for f in FAILED:
+        print("  失败: " + f)
+    for w in WARNED:
+        print("  警告: " + w)
+    if strict and WARNED:
+        print("（--strict：警告按失败计）")
+        return 1
     return 1 if FAILED else 0
 
 

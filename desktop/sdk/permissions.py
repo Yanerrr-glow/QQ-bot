@@ -78,6 +78,8 @@ ROUTES: tuple[RouteRule, ...] = (
     RouteRule("POST", "/api/model/test", "api.write.models", "探活（会花 token）"),
     RouteRule("POST", "/api/model/save", "api.write.models", "保存档案 JSON"),
     RouteRule("POST", "/api/model/delete", "api.write.models", "删除档案"),
+    RouteRule("GET", "/api/persona/packs", "api.read.persona", "人格包列表"),
+    RouteRule("POST", "/api/persona/switch", "api.action.persona", "切换人格包"),
     RouteRule("POST", "/api/persona/undo", "api.action.persona", "撤回自动改动"),
     RouteRule("POST", "/api/persona/reflect", "api.action.persona", "手动反思"),
     RouteRule("POST", "/api/persona/eval", "api.action.persona", "评估素材/基线"),

@@ -696,13 +696,44 @@ def check_desktop_outside_plugins() -> str:
     return "desktop/ 与 plugins/ 完全分离，bot.py 不引用它"
 
 
+def check_persona_packs(server: StubServer, token: str) -> str:
+    """人格包：列表能拿到、切换能生效、**旧入口仍然是 410**。
+
+    这三条要一起守 —— 包化之后最容易出的事是"顺手把 410 桩也放开了"：
+    那样"人设内容只能直接编辑文件"这条硬边界就在 API 层面消失了。
+    """
+    client = _client(server, token=token)
+    listed = client.persona_packs()
+    ids = [str(x.get("id") or "") for x in (listed.get("items") or [])]
+    assert listed.get("active") == "whale", f"激活包不对：{listed.get('active')}"
+    assert {"whale", "assistant"} <= set(ids), f"包列表不完整：{ids}"
+
+    # state 里的人设切片要带上包信息（人格页靠它渲染）
+    persona = dict(client.state().get("persona") or {})
+    assert persona.get("pack", {}).get("id"), "state.persona 里没有当前包"
+    assert (persona.get("stats") or {}).get("pack_id"), "persona.stats 里没有 pack_id"
+
+    got = client.persona_switch("assistant")
+    assert got.get("ok") and got.get("active") == "assistant", f"切换没生效：{got}"
+    # 切不存在的包必须是 400（参数被拒），不是 500 也不是静默成功
+    bad = _expect_error(lambda: client.persona_switch("nope"), 400)
+    assert "包" in bad.message or "包" in (bad.hint or ""), f"400 的说明不对：{bad.message}"
+    # 旧入口仍然是 410：改内容这条路必须一直关着
+    gone = _expect_error(lambda: client._request("POST", "api/persona"), 410)
+    assert gone.gone, "改人设内容的入口被放开了（它必须恒 410）"
+    client.persona_switch("whale")
+    return "包列表 / 切换 / 参数校验 / 内容入口 410 四条都对"
+
+
 def check_webui_paths_match_scheme() -> str:
     """方案第 4.2 章的表必须与真实路由一致（防止文档再次漂移）。"""
     root = paths.project_root()
     webui = (root / "plugins" / "ai_chat" / "webui.py").read_text(encoding="utf-8")
     expected = [
         '/api/state', '/api/settings', '/api/settings/reset', '/api/model/active',
-        '/api/model/test', '/api/model/save', '/api/model/delete', '/api/persona/undo',
+        '/api/model/test', '/api/model/save', '/api/model/delete',
+        '/api/persona/packs', '/api/persona/switch',
+        '/api/persona/undo',
         '/api/persona/reflect', '/api/persona/eval', '/api/memory', '/api/image-policy',
         '/api/stickers', '/api/speak', '/api/greet',
     ]
@@ -770,6 +801,7 @@ def run() -> int:
     suite.check("连到非机器人服务 → 报『不是 JSON』", lambda: check_html_instead_of_json(server, token))
     suite.check("503 时写请求不重试", lambda: check_write_not_retried(server, token))
     suite.check("参数读写与掩码回写", lambda: check_settings_roundtrip(server, token))
+    suite.check("人格包列表 / 切换 / 内容入口仍 410", lambda: check_persona_packs(server, token))
     suite.check("图片走同一会话且 URL 不带 token", lambda: check_image_auth_and_no_token_in_url(server, token))
 
     print("")

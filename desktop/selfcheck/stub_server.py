@@ -61,12 +61,29 @@ def sample_state() -> dict[str, Any]:
         },
         "models_editor": '{\n "deepseek": {"api_key": "***"}\n}',
         "persona": {
-            "stats": {"base_chars": 1200, "surface_chars": 300, "forbidden": 7},
+            "stats": {"base_chars": 1200, "surface_chars": 300, "forbidden": 7,
+                      "base_file": "persona/packs/whale/base.txt",
+                      "forbidden_file": "persona/packs/whale/forbidden.txt",
+                      "surface_file": "data/runtime/persona/whale/surface.txt",
+                      "pack_id": "whale", "pack_name": "鲸鱼娘", "pack_count": 2,
+                      "pack_dir": "persona/packs/whale",
+                      "pack_stage": "data/runtime/persona/whale"},
             "forbidden": ["不冒充人", "不主动要钱"],
             "layers": {"base": "底层人设……", "surface": "表层人设……", "forbidden": "禁止事项……"},
             "changelog": [{"ts": "2026-10-02 10:00:00", "action": "reflect", "text": "把口癖收了一点"}],
             "iter": {"runs": 3, "written": 5},
             "eval": {"enabled": False, "artifacts": 0, "traits": [{"key": "warm", "score": None}]},
+            # 人格包（2026-10 包化）：形状与 `packs.list_packs()` / `packs.stats()` 一致
+            "pack": {"id": "whale", "name": "鲸鱼娘", "dir": "persona/packs/whale",
+                     "stage": "data/runtime/persona/whale", "description": "示例人格",
+                     "bot_name": "鲸鱼娘", "aliases": ["小鲸鱼"], "wake_words": "肥鱼,鲸鱼娘",
+                     "frozen": None, "manifest_error": ""},
+            "packs": [
+                {"id": "whale", "name": "鲸鱼娘", "description": "示例人格", "aliases": ["小鲸鱼"],
+                 "enabled": True, "manifest_error": ""},
+                {"id": "assistant", "name": "小助手", "description": "中性简洁", "aliases": [],
+                 "enabled": True, "manifest_error": ""},
+            ],
         },
         "memory": {
             "facts": [
@@ -214,6 +231,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"api_version": "1", "app": {"name": "QQ_bot", "version": "stub"},
                         "features": {"settings": True, "stickers": True}, "limits": {}})
             return
+        if path == prefix + "/api/persona/packs":
+            self._json({"active": self.cfg.state["persona"]["stats"].get("pack_id") or "whale",
+                        "items": self.cfg.state["persona"]["packs"]})
+            return
         if path == prefix + "/api/stickers":
             self._json({"items": self.cfg.state["stickers_list"],
                         "stats": self.cfg.state["status"]["stickers"]})
@@ -256,10 +277,32 @@ class _Handler(BaseHTTPRequestHandler):
         if path == prefix + "/api/model/delete":
             return self._json({"ok": True, "detail": "已删除", "state": None})
         if path == prefix + "/api/persona":
-            # 与 `webui.py:1051-1060` 一致：恒 410。
+            # 与 `webui.py` 一致：改**人设内容**恒 410。
+            # 注意 `/api/persona/switch` 仍然是可用的（那是换包，不是改内容），
+            # 所以这条桩不能写成 `path.startswith(...)`。
             return self._json(
-                {"ok": False, "error": "改人设的接口已删除：现在只能直接编辑三个文件"}, 410
+                {"ok": False, "error": "改人设内容的接口已删除：只能直接编辑当前人格包里的文件"}, 410
             )
+        if path == prefix + "/api/persona/packs":
+            return self._json({"active": "whale",
+                               "items": self.cfg.state["persona"]["packs"]})
+        if path == prefix + "/api/persona/switch":
+            want = str(body.get("id") or "")
+            known = {x["id"] for x in self.cfg.state["persona"]["packs"]}
+            if want not in known:
+                return self._json({"ok": False, "errors": [f"没有这个包：{want}"]}, 400)
+            self.cfg.state["persona"]["pack"] = dict(
+                next(x for x in self.cfg.state["persona"]["packs"] if x["id"] == want),
+                dir=f"persona/packs/{want}", stage=f"data/runtime/persona/{want}",
+                bot_name=want, wake_words=want, frozen=None, manifest_error="",
+            )
+            self.cfg.state["persona"]["stats"]["pack_id"] = want
+            self.cfg.state["persona"]["stats"]["pack_name"] = want
+            return self._json({"ok": True, "from": "whale", "active": want, "name": want,
+                               "identity": {"bot_name": want}, "identity_note": "",
+                               "warnings": [], "registry_written": True,
+                               "seed": f"已为 {want} 播种表层",
+                               "persona": self.cfg.state["persona"]})
         if path == prefix + "/api/persona/undo":
             return self._json({"ok": True, "note": "已撤回一条表层改动"})
         if path == prefix + "/api/persona/reflect":

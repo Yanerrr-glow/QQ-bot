@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import clock, config, settings
+from . import clock, config, packs, settings
 
 logger = logging.getLogger("ai_chat.chatlog")
 
@@ -447,10 +447,15 @@ class ConversationLog:
             return f"{name}{config.BOT_SELF_LABEL}"
         if ConversationLog._is_master_uid(m.get("uid")):
             return f"{name}（{settings.get('master_title')}）"
-        # 无法确定：没有 bot_uid、没有 is_bot,名字又和机器人显示名相同 ——
+        # 无法确定：没有 bot_uid、没有 is_bot,名字又是**机器人用过的某个名字** ——
         # 可能是改名前的自己，也可能是同名群友。**显式标注**，让模型别当成确定的事实。
+        #
+        # **为什么要比对"所有用过的名字"而不是只比当前显示名**：改过名之后，改名前的记录
+        # 名字对不上当前显示名，会直接落到函数末尾的 `return name` —— 那是最危险的分支
+        # （等于告诉模型"这是别人说的"）。人格包的 `_pack.json` 里 `aliases` 正是为此存在：
+        # `bot_name` 是现在的名字，`aliases` 是历史名与别名。
         if (not stored_uid and not m.get("is_bot")
-                and name and name == config.bot_name()):
+                and name and name in _bot_known_names()):
             return f"{name}（可能是你）"
         return name
 
@@ -600,6 +605,37 @@ async def get_log(conv: str) -> ConversationLog:
         await asyncio.to_thread(log.load)  # 文件 IO 不阻塞事件循环
         _logs[conv] = log
     return log
+
+
+def _bot_known_names() -> set[str]:
+    """机器人**用过的所有名字**：当前显示名 + 人格包声明的别名。
+
+    `_speaker()` 用它判"这条会不会是我自己说的"。为什么需要别名而不只是当前显示名：
+
+    改过名之后（本机 2026-10-02 换过一次显示名），改名**之前**留下的记录
+    名字对不上新的显示名 —— 而那些老记录常常恰好缺 `bot_uid`/`is_bot`（字段是后加的）。
+    只比当前显示名的话，它们会直接落到 `return name`，也就是被当成**别人说的**：
+    模型于是把自己的旧话当对话对象，正是「它把自己说过的话认知到别人身上」那个漏洞。
+    标成「可能是你」比当成别人安全得多（宁可提醒，也不要让它认错人）。
+
+    代价是"群里真有人的昵称等于某个别名"时，会多一条「可能是你」—— 这是有意接受的：
+    那个方向只让模型更谨慎，而漏标的方向会让它认错人。
+    """
+    names: set[str] = set()
+    try:
+        current = config.bot_name()
+        if current:
+            names.add(current)
+    except Exception:  # noqa: BLE001 - 名字取不到不该影响渲染
+        pass
+    try:
+        for alias in packs.active_pack().get("aliases") or []:
+            alias = str(alias).strip()
+            if alias:
+                names.add(alias)
+    except Exception:  # noqa: BLE001
+        pass
+    return names
 
 
 def get_log_sync(conv: str) -> ConversationLog | None:

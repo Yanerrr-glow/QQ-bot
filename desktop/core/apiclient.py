@@ -39,8 +39,10 @@ DEFAULT_TIMEOUT = 15.0
 RETRY_STATUS = (429, 502, 503, 504)
 DEFAULT_MAX_RETRIES = 2
 
-# 服务端返回体里常见的失败包络（`webui.py:1030/988/1053` 三种都有）。
-ERROR_KEYS = ("error", "detail", "message", "reason")
+# 服务端返回体里常见的失败包络（`webui.py` 里几种都有）。
+# **`errors` 是列表**（人格包切换那种"逐条说哪里不合格"的接口用它）——
+# 忘了它的话，用户只会看到一句光秃秃的 `HTTP 400`，而服务端其实已经把原因说清了。
+ERROR_KEYS = ("error", "detail", "message", "reason", "errors")
 
 
 class BotApiError(RuntimeError):
@@ -387,6 +389,10 @@ class ApiClient:
         if isinstance(data, dict):
             for key in ERROR_KEYS:
                 value = data.get(key)
+                if not value:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    value = "；".join(str(x) for x in value if x)
                 if value:
                     message = f"HTTP {raw.status}：{one_line(value, 300)}"
                     break
@@ -478,6 +484,14 @@ class ApiClient:
 
     def model_delete(self, profile_id: str) -> dict[str, Any]:
         return self._request("POST", "api/model/delete", body={"id": profile_id})
+
+    def persona_packs(self) -> dict[str, Any]:
+        """可用的人格包 + 当前激活的那个（`GET /api/persona/packs`）。"""
+        return self._request("GET", "api/persona/packs")
+
+    def persona_switch(self, pack_id: str) -> dict[str, Any]:
+        """切换人格包。**服务端是热切换**（下一次回复就是新人格），所以不需要重启。"""
+        return self._request("POST", "api/persona/switch", body={"id": str(pack_id)})
 
     def persona_undo(self) -> dict[str, Any]:
         return self._request("POST", "api/persona/undo")

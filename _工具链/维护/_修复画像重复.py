@@ -353,16 +353,55 @@ class Repair:
         return removed_n, merged_n
 
 
+def _active_pack_id(root: Path) -> str:
+    """当前激活的人格包：运行时标记 > 注册表 > 唯一一个启用的包。
+
+    **不 import 插件**（本脚本只用标准库）：任务只是"读一眼角色名"，
+    为它拖进 nonebot 整条依赖链不值当，所以这里复算同一套优先级。
+    """
+    packs_dir = root / "persona" / "packs"
+    marker = root / "data" / "runtime" / "persona" / "_active"
+    try:
+        got = marker.read_text(encoding="utf-8").strip()
+        if got and (packs_dir / got).is_dir():
+            return got
+    except OSError:
+        pass
+    try:
+        got = str((json.loads((root / "persona" / "_registry.json").read_text(encoding="utf-8"))
+                   or {}).get("active") or "").strip()
+        if got and (packs_dir / got).is_dir():
+            return got
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        names = sorted(n for n in os.listdir(packs_dir)
+                       if not n.startswith(("_", ".")) and (packs_dir / n).is_dir())
+    except OSError:
+        return ""
+    return names[0] if len(names) == 1 else ""
+
+
+def _active_pack_base(root: Path) -> Path | None:
+    """当前人格包里的 `base.txt`（读不出包就返回 None）。"""
+    pack = _active_pack_id(root)
+    return (root / "persona" / "packs" / pack / "base.txt") if pack else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="修复记忆库里的画像重复键")
     parser.add_argument("--db", default="", help="memory.db 路径（默认 <项目>/data/runtime/memory.db）")
     parser.add_argument("--dry-run", action="store_true", help="只打印会改什么，不写库")
     parser.add_argument("--keep-bot", action="store_true", help="只合并重复，不删机器人画像")
     parser.add_argument("--bot-uid", default="", help="机器人自己的 QQ 号（逗号分隔）；默认读 .env 的 ACCOUNT")
-    parser.add_argument("--bot-name", default="", help="机器人显示名（逗号分隔）；默认读 persona/active/base.txt 的角色名 + .env 的 AI_CHAT_BOT_NAME")
+    parser.add_argument("--bot-name", default="", help="机器人显示名（逗号分隔）；默认读 persona/packs/<包>/base.txt 的角色名 + .env 的 AI_CHAT_BOT_NAME")
     args = parser.parse_args()
 
-    root = Path(__file__).resolve().parent.parent
+    # **项目根从脚本自身位置向上探测**：维护脚本按用途分组（`_工具链\维护\`）之后，
+    # 写死 `.parent.parent` 会得到 `_工具链\`，于是默认的 memory.db 路径整个指错。
+    root = Path(__file__).resolve().parent
+    while root.parent != root and not (root / "bot.py").is_file():
+        root = root.parent
     db_path = Path(args.db) if args.db else (root / "data" / "runtime" / "memory.db")
     if not db_path.is_absolute():
         db_path = (root / db_path).resolve()
@@ -396,8 +435,8 @@ def main() -> int:
                     value = line.split("=", 1)[1].strip()
                     if value:
                         bot_names.add(value)
-        base = root / "persona/active/base.txt"
-        if base.exists():
+        base = _active_pack_base(root)
+        if base is not None and base.exists():
             first = base.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
             if first:
                 import re

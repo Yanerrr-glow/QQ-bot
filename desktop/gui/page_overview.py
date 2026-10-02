@@ -145,6 +145,8 @@ class OverviewPage(Page):
         rows.append(("当前目标", f"{self.manager.state.target_name} · {self.manager.state.address_summary()}"))
         rows.append(("模型档案", f"{models.get('active') or '-'}（{len(models.get('items') or [])} 个）"))
         rows.append(("记忆", f"事实 {stats.get('facts', 0)} · 群事件 {stats.get('events', 0)} · 人物 {stats.get('profile', 0)}"))
+        rows.append(("人格包", f"{pstats.get('pack_name') or '-'}（{pstats.get('pack_id') or '-'}）"
+                              f" · 共 {pstats.get('pack_count', 0)} 个可用"))
         rows.append(("人格", f"底层 {pstats.get('base_chars', 0)} 字 · 表层 {pstats.get('surface_chars', 0)} 字 · 禁止事项 {pstats.get('forbidden', 0)} 条"))
         rows.append(("人设自动迭代", f"已跑 {piter.get('runs', 0)} 次 · 写入 {piter.get('written', 0)} 条"))
         modes = image.get("valid_modes") or []

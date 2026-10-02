@@ -438,37 +438,107 @@ def check_env(root: Path, venv_py: Path) -> bool:
     return usable
 
 
+def active_persona_pack(root: Path, env: dict[str, str]) -> str:
+    """当前激活的人格包 id：运行时标记 > 注册表 > `.env` 的 AI_CHAT_PERSONA_PACK > 唯一一个包。
+
+    与 `plugins/ai_chat/packs.py` 的 `_resolve_active()` **同序**。这里复算一遍是因为
+    自检脚本**故意不 import 插件**（它要在没装依赖的机器上跑，见文件头）。
+    """
+    packs_dir = root / "persona" / "packs"
+
+    def usable(name: str) -> bool:
+        return bool(name) and (packs_dir / name).is_dir()
+
+    try:
+        got = (root / "data" / "runtime" / "persona" / "_active").read_text(encoding="utf-8").strip()
+        if usable(got):
+            return got
+    except OSError:
+        pass
+    try:
+        got = str((json.loads((root / "persona" / "_registry.json").read_text(encoding="utf-8"))
+                   or {}).get("active") or "").strip()
+        if usable(got):
+            return got
+    except (OSError, ValueError, AttributeError):
+        pass
+    got = str(env.get("AI_CHAT_PERSONA_PACK", "") or "").strip()
+    if usable(got):
+        return got
+    try:
+        names = sorted(n for n in os.listdir(packs_dir)
+                       if not n.startswith(("_", ".")) and (packs_dir / n).is_dir())
+    except OSError:
+        names = []
+    return names[0] if len(names) == 1 else ""
+
+
 def check_persona(root: Path, env: dict[str, str], overrides: dict[str, object],
                   env_path: Path, interactive: bool = False) -> None:
     head("3.2 人格三文件")
 
-    def resolve(key: str, default: str) -> Path:
-        name = env.get(key, "").strip() or default
-        return (root / name) if not Path(name).is_absolute() else Path(name)
+    pack = active_persona_pack(root, env)
+    packs_dir = root / "persona" / "packs"
+    try:
+        available = sorted(n for n in os.listdir(packs_dir)
+                           if not n.startswith(("_", ".")) and (packs_dir / n).is_dir())
+    except OSError:
+        available = []
+    if pack:
+        say(OK, f"当前人格包：{pack}", f"共 {len(available)} 个可用：{'、'.join(available) or '（无）'}")
+    else:
+        say(BLOCK, "没有可用的人格包",
+            "照 persona\\_TEMPLATE\\README.md 建一个（persona\\packs\\<id>\\），"
+            "或在 .env 里显式配 AI_CHAT_PERSONA_FILE / _FORBIDDEN_FILE / _SURFACE_FILE")
+
+    def resolve(key: str, default_name: str) -> Path:
+        """显式配置优先，否则取当前包里的同名文件。"""
+        name = env.get(key, "").strip()
+        if name:
+            return Path(name) if Path(name).is_absolute() else (root / name)
+        return packs_dir / pack / default_name if pack else root / "persona" / "packs" / default_name
+
+    def shown(key: str, default_name: str) -> str:
+        name = env.get(key, "").strip()
+        if name:
+            return f"{name}（.env 显式指定，绕过人格包）"
+        return f"persona/packs/{pack or '<包>'}/{default_name}"
 
     layers = [
-        ("底层人设（它是谁）", resolve("AI_CHAT_PERSONA_FILE", "persona/active/base.txt"), "persona/active/base.txt"),
-        ("禁止事项（铁律）", resolve("AI_CHAT_FORBIDDEN_FILE", "persona/active/forbidden.txt"), "persona/active/forbidden.txt"),
-        ("表层人设（会被自动改写）", resolve("AI_CHAT_SURFACE_FILE", "persona/active/surface.txt"), "persona/active/surface.txt"),
+        ("底层人设（它是谁）", resolve("AI_CHAT_PERSONA_FILE", "base.txt"),
+         shown("AI_CHAT_PERSONA_FILE", "base.txt")),
+        ("禁止事项（铁律）", resolve("AI_CHAT_FORBIDDEN_FILE", "forbidden.txt"),
+         shown("AI_CHAT_FORBIDDEN_FILE", "forbidden.txt")),
+        ("表层人设（会被自动改写）", resolve("AI_CHAT_SURFACE_FILE", "surface.txt"),
+         shown("AI_CHAT_SURFACE_FILE", "surface.txt")),
     ]
     base_text = ""
-    for label, path, shown in layers:
+    for label, path, label_text in layers:
         if path.is_file():
             text = path.read_text(encoding="utf-8", errors="replace")
             if label.startswith("底层"):
                 base_text = text
             if text.strip():
-                say(OK, f"{label}：{len(text.strip())} 字", shown)
+                say(OK, f"{label}：{len(text.strip())} 字", label_text)
             else:
-                say(WARN, f"{label}是空的", f"{shown}（它会没有性格可言）")
+                say(WARN, f"{label}是空的", f"{label_text}（它会没有性格可言）")
         else:
-            say(BLOCK, f"找不到 {label}", f"{shown} —— 检查 .env 里的文件名或恢复该文件")
+            say(BLOCK, f"找不到 {label}", f"{label_text} —— 检查 .env 里的文件名或恢复该文件")
 
-    traits = root / "persona/active/traits.json"
+    # 运行数据的表层才是**实际生效**的那份（包里的只是首次播种模板）
+    stage_surface = root / "data" / "runtime" / "persona" / pack / "surface.txt" if pack else None
+    if stage_surface is not None:
+        if stage_surface.is_file():
+            say(OK, "运行数据的表层在", f"data/runtime/persona/{pack}/surface.txt（这一份才是生效的）")
+        else:
+            say(INFO, "还没有运行数据的表层",
+                f"data/runtime/persona/{pack}/surface.txt —— 首次启动时会从包里的模板播种")
+
+    traits = (packs_dir / pack / "traits.json") if pack else (packs_dir / "traits.json")
     if traits.is_file():
-        say(OK, "特质注册表在", "persona/active/traits.json")
+        say(OK, "特质注册表在", f"persona/packs/{pack}/traits.json")
     else:
-        say(INFO, "没有 persona/active/traits.json",
+        say(INFO, f"没有 persona/packs/{pack or '<包>'}/traits.json",
             "运行时不需要（有内置回退）；但 _人设结构检查.py / _自示监控.py 会报错，这是有意的")
 
     # `AI_CHAT_BOT_NAME` 与人设里的角色名**必须一致** —— 它决定"聊天记录里哪句话是

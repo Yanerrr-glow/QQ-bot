@@ -65,6 +65,7 @@ from . import (
     memory,
     mode,
     msgindex,
+    packs,
     persona,
     persona_iter,
     proactive,
@@ -1307,7 +1308,7 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         #   ① `logger.error` 记 conv / trigger / 原话片段，供排查；
         #   ② 群里发一条**措辞中性的错误通报**（`config.MSG_EMPTY`），让人知道这轮出了故障，
         #      而不是被静默无视。该通报属"固定系统文案"语域，不受人格铁律约束
-        #      （见 persona/active/traits.json 的 fixed_notice_channels）。
+        #      （见 persona/packs/<包>/traits.json 的 fixed_notice_channels）。
         logger.error(
             "模型返回空回复 conv=%s trigger=%s question=%r",
             conv, trigger, (question or "")[:60],
@@ -1389,7 +1390,7 @@ async def _start_proactive() -> None:
     #
     # **人格不需要预热**：分层之后 `persona.render()` 每轮现读 —— 但现读的是**表层**，
     # 底层人设与禁止事项是 `config` 在 import 期读入的常量（改完要重启），
-    # 注册表 `persona/active/traits.json` 同样只读一次。没有内存副本可预热。
+    # 注册表 `persona/packs/<包>/traits.json` 同样只读一次。没有内存副本可预热。
     memory._db.ensure()  # noqa: SLF001
     state._state.ensure()  # noqa: SLF001
     # 时间校准：先把上次的偏移读回来（重启后到首次同步成功之间有段空窗，
@@ -1472,10 +1473,31 @@ async def _start_proactive() -> None:
             "检查 _工具链\\启动\\诊断状态.py 或 /时间 校准。",
             abs(_time_st["offset_seconds"]),
         )
-    # 表层人设的**播种**：先把镜像里的模板落到 data/（卷内），之后自我迭代写在那里。
-    # **必须在下面的三层日志之前**，否则日志反映的是"还没播种"的状态。
-    # 幂等：data/ 里已有就不动它 —— 这正是"自我学习不被重建覆盖"的保证。
+    # 人格的**激活与迁移**，顺序有意如此：
+    #   1. 把改造前平铺在 data/runtime/persona/ 的运行数据按当前包归位（幂等，见 packs）；
+    #   2. 表层播种：把包内的模板落到 data/runtime/persona/<包>/（卷内）。
+    # **必须在下面的三层日志之前**，否则日志反映的是"还没迁移/还没播种"的状态。
+    _mig = packs.migrate_layout()
+    if _mig["migrated"] or _mig["conflicts"]:
+        logger.info("人格运行数据按包归位：迁入 %d 项，冲突 %d 项（备份 %s）",
+                    len(_mig["migrated"]), len(_mig["conflicts"]), Path(_mig["backup"]).name)
+        for _c in _mig["conflicts"]:
+            logger.error("人格运行数据迁移冲突：%s", _c)
     logger.info(config.seed_surface())
+    # 人格包：**当前读的是哪一个**是排查人格问题的第一问，所以单独打一条，
+    # 并把可用包数列出来 —— "切过去没生效"通常是切错了包或包不合法。
+    _pk = packs.stats()
+    if _pk["id"]:
+        logger.info(
+            "人格包：%s（id=%s，指纹 %s，共 %d 个可用）｜源 %s｜运行数据 %s",
+            _pk["name"], _pk["id"], packs.stage_source_fingerprint(), _pk["count"],
+            packs.rel_to_root(_pk["dir"]), packs.rel_to_root(_pk["stage"]),
+        )
+    else:
+        logger.warning(
+            "没有可用的人格包（persona/packs/ 下没有目录）：当前只有 AI_CHAT_SYSTEM_PROMPT 兜底。"
+            "照 persona/_TEMPLATE/README.md 建一个包即可。"
+        )
     # 人格三层：**每一层的字数与文件路径都要可见**。
     # 分层之后"它现在到底是什么性格"取决于三个文件，日志里只说一个来源是不够的；
     # 而且自动迭代会改表层，所以那一层的字数变化是最直观的"它有没有在学"的证据。
@@ -1486,6 +1508,17 @@ async def _start_proactive() -> None:
         _pst["forbidden_chars"], len(persona.forbidden_items()), Path(_pst["forbidden_file"]).name,
         _pst["surface_chars"], Path(_pst["surface_file"]).name,
     )
+    # 身份一致性：**角色名必须与人设里的名字一致**，否则聊天记录里认不出自己说过的话
+    # （`chatlog._speaker` 的判据是「角色名 + QQ 号」）。这是包化之后最容易漏的一处，
+    # 所以启动时就当面报出来，而不是等人发现"它对着自己接话"。
+    _bot = config.bot_name()
+    view = packs.active_pack()
+    if _pk["id"] and view.get("bot_name") and view["bot_name"] != _bot:
+        logger.warning(
+            "机器人显示名（%s）与人格包声明的角色名（%s）不一致 —— "
+            "聊天记录里的归属判定会退化。用 /昵称 %s 或清掉设置里的 bot_name 覆盖。",
+            _bot, view["bot_name"], view["bot_name"],
+        )
     _pit = persona_iter.stats()
     logger.info(
         "人格自我迭代：%s（每 %d 秒一次，最多 %d 条/次）｜至今写入 %d 条、被闸门拦下 %d 条",
@@ -1496,7 +1529,7 @@ async def _start_proactive() -> None:
         logger.warning(
             "底层人设文件是空的，当前用的是 AI_CHAT_SYSTEM_PROMPT（%s）。"
             "**注意：底层为空时自我迭代会拒绝运行** —— 没有约束就没有闸门的依据。",
-            config.PERSONA_SOURCE,
+            config.persona_source(),
         )
 
 

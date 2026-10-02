@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "id": "example",
+  "name": "示例角色",
+  "aliases": [],
+  "description": "一句话说清这个角色是什么样、在群里干什么",
+  "bot_name": "示例角色",
+  "wake_words": ["示例角色"],
+  "enabled": true,
+  "note": "bot_name 必须与 base.txt 里的角色名逐字一致（chatlog 用它判定哪句是机器人自己说的）。master_title 留空 = 不干预，由 .env / 控制台决定。"
+}

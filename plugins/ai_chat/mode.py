@@ -40,8 +40,8 @@
 | 专注 | 先给结论，不闲聊 | 认真、直接，但仍然是她 | 压低 | 压低 |
 | 安慰 | 短，一两句 | 先接情绪，不给方案 | 压低 | 压低 |
 
-所以它跟人格三层（`persona/active/base.txt` 底色 / `persona/active/forbidden.txt` 铁律 /
-`persona/active/surface.txt` 表层）**不冲突**：
+所以它跟人格三层（`persona/packs/<包>/base.txt` 底色 / `persona/packs/<包>/forbidden.txt` 铁律 /
+`persona/packs/<包>/surface.txt` 表层）**不冲突**：
 人设决定"她是谁"，模式决定"这会儿该多用力"。叠加顺序见 `context.system_prompt()`。
 
 > 注：旧的运行时槽位文件 `persona_directives.json`（`/风格` 当场改的那些要求）

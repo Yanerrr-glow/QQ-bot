@@ -9,15 +9,19 @@
 
 现在按**寿命与权限**切成三个文件，代码里各走各的路径：
 
-| 层 | 文件 | 谁能写 | 进 prompt 的顺序 |
+| 层 | 文件（当前人格包内） | 谁能写 | 进 prompt 的顺序 |
 |---|---|---|---|
-| 底层人设 | `persona/active/base.txt` | **只有用户**（直接编辑） | 第 1 位（最硬） |
-| 禁止事项 | `persona/active/forbidden.txt` | **只有用户**（直接编辑） | 第 2 位 |
-| 表层人设 | `persona/active/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
+| 底层人设 | `base.txt` | **只有用户**（直接编辑） | 第 1 位（最硬） |
+| 禁止事项 | `forbidden.txt` | **只有用户**（直接编辑） | 第 2 位 |
+| 表层人设 | 包内 `surface.txt` 模板 → 运行数据 `data/runtime/persona/<包>/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
 
 **「只有用户能写」不是靠提示词约束，是靠代码**：本模块里只有 `surface_*` 系列函数，
-底层与禁止事项**连写函数都不存在**（`BASE_PROMPT` / `FORBIDDEN_PROMPT` 是只读常量）。
+底层与禁止事项**连写函数都不存在**（`BASE_PROMPT` / `FORBIDDEN_PROMPT` 是只读的惰性属性）。
 自动迭代哪怕被 prompt 注入攻击劫持，也没有可调用的写入口。
+
+**包化之后多了一条保证**：这三层现在属于**某个包**（`persona/packs/<id>/`），
+换角色 = 换目录，而不是覆盖同一批文件；各自的自我学习成果也按包分开
+（`data/runtime/persona/<id>/`），切回来接着用。
 
 ## 冲突闸门
 
@@ -39,7 +43,7 @@
 逆向表述（「不叫主人」「别用客服腔」）作为**允许**特例放在最前面 ——
 它们字面命中关键词，但语义上是在**站在铁律这一边**。
 
-`forbidden_kw` 的关键词表**由 `persona/active/traits.json` 的 `gate_terms` 派生**（当前 56 条），
+`forbidden_kw` 的关键词表**由 `persona/packs/<包>/traits.json` 的 `gate_terms` 派生**（当前 56 条），
 不再手工维护；注册表读不到时回退内置表，闸门绝不裸奔。
 ⚠ 派生发生在 **import 期**：改了注册表、或给某条铁律加注释，闸门要**重启**才跟着变。
 
@@ -47,7 +51,7 @@
 
 闸门只拦"碰铁律"，**拦不住风格跑偏**（学成话痨、学成另一个语气）——
 那种改动照过闸门，人在群里只觉得"它今天怪怪的"。所以合规候选
-**默认先进 `data/runtime/persona/candidates.json` 等人采纳**：
+**默认先进 `data/runtime/persona/<包>/candidates.json` 等人采纳**：
 `/人设 候选` 看池子、`/人设 采纳 <序号>` 才写表层、`/人设 否决 <序号>` 丢弃
 （对应 `propose_candidate` / `approve_candidate` / `reject_candidate`）。
 采纳时会**再过一次闸门** —— 池子里的条目在等待期间可能已经因为底层人设被改而变得不合规。
@@ -55,7 +59,7 @@
 
 ## 变更日志
 
-每次写入/丢弃都进 `data/runtime/persona/changelog.json`（上限 200 条），`/人设 撤回` 撤销最近一次**写入**。
+每次写入/丢弃都进 `data/runtime/persona/<包>/changelog.json`（上限 200 条），`/人设 撤回` 撤销最近一次**写入**。
 这是路线 C 能被信任的前提：**每次自动改动都可查、可撤**。
 """
 
@@ -68,7 +72,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, settings
+from . import config, packs, settings
 
 logger = logging.getLogger("ai_chat.persona")
 
@@ -108,7 +112,8 @@ def layers() -> dict[str, str]:
 
 
 def stats() -> dict[str, Any]:
-    """三层的字数与文件路径 —— 启动日志与 `/人设` 都用它。"""
+    """三层的字数、文件路径与**当前人格包** —— 启动日志、`/人设` 与控制台都用它。"""
+    pack = packs.stats()
     return {
         "base_chars": len(base_text()),
         "forbidden_chars": len(forbidden_text()),
@@ -116,10 +121,21 @@ def stats() -> dict[str, Any]:
         "base_file": str(config.persona_file_path()),
         "forbidden_file": str(config.forbidden_file_path()),
         "surface_file": str(config.surface_file_path()),
+        "traits_file": str(config.traits_file_path()),
         "changes": len(_log_items()),
         # 待采纳的候选数。**放在这里而不是只做 `/人设 候选`**：
         # 候选池满了会挤掉最旧的提议，人在别处看不到那个事实。
         "pending": candidate_count(),
+        # ---- 人格包（2026-10 包化）----
+        # "它现在读的哪一份"是排查人格问题的第一问，所以包 id、来源与运行数据目录
+        # 都摆在同一个 dict 里，控制台与 `/人设 状态` 不用各拼一次。
+        "pack_id": pack["id"],
+        "pack_name": pack["name"],
+        "pack_dir": pack["dir"],
+        "pack_stage": pack["stage"],
+        "pack_count": pack["count"],
+        "pack_available": pack["available"],
+        "pack_fingerprint": packs.stage_source_fingerprint(),
     }
 
 
@@ -213,7 +229,7 @@ def _blocks(text: str) -> list[str]:
 # 没有这一层，「不叫主人」「别用客服腔」这类正确表述会被闸门误杀 ——
 # 而它们恰恰是自动迭代最该学的东西。
 # ------------------------------------------------------------------ 闸门关键词
-# **从 `persona/active/traits.json` 派生，不再手工维护。**
+# **从 `persona/packs/<包>/traits.json` 派生，不再手工维护。**
 #
 # 为什么改：原来这里是手写的 10 项关键词表，而铁律有 13 条 —— 实测只有 5 条被覆盖，
 # 另外 8 条对自动迭代是**敞开的**（它可以合法地把「以后多提提米饭」写进表层）。
@@ -430,6 +446,15 @@ class _Log:
         except OSError:
             logger.warning("人格变更日志写盘失败：%s", path.name)
 
+    def reset(self) -> None:
+        """丢掉内存副本，下次 `ensure()` 从**当前人格包**的目录重读。
+
+        换人格时必须调它：账本是按包分开的，留着上一个包的副本会让
+        `/人设 撤回` 去撤**别人格**的条目（而且看起来一切正常）。
+        """
+        self.items = []
+        self.loaded = False
+
 
 _log = _Log()
 
@@ -633,9 +658,15 @@ def base_enabled() -> bool:
 
 
 def describe(limit: int = 40) -> str:
-    """`/人设` 的查看输出：三层各自的状态与摘要。"""
+    """`/人设` 的查看输出：当前人格包 + 三层各自的状态与摘要。"""
     st = stats()
     rows = [
+        f"【当前人格包】{st['pack_name']}（id={st['pack_id'] or '（无）'}）"
+        f"，共 {st['pack_count']} 个可用包"
+        + (f"；指纹 {st['pack_fingerprint']}" if st["pack_fingerprint"] else ""),
+        f"  包目录：{st['pack_dir']}",
+        f"  运行数据：{st['pack_stage']}",
+        "",
         f"【底层人设】{st['base_chars']} 字（**只有你能改**：{st['base_file']}）",
         f"【禁止事项】{st['forbidden_chars']} 字（**只有你能改**：{st['forbidden_file']}）",
         f"【表层人设】{st['surface_chars']} 字（**自动迭代只写这一层**：{st['surface_file']}）",
@@ -647,6 +678,8 @@ def describe(limit: int = 40) -> str:
             if st.get("pending")
             else "候选池是空的（自动迭代产出的合规条目会先落在这里等你定）。"
         ),
+        "",
+        "切换人格：/人设 包 看可用包，/人设 切换 <id> 换一个（立即生效）。",
     ]
     return "\n".join(rows)
 
@@ -739,8 +772,28 @@ class _Pending:
         except OSError:
             logger.warning("人格候选池写盘失败：%s", path.name)
 
+    def reset(self) -> None:
+        """丢掉内存副本，下次 `ensure()` 从**当前人格包**的目录重读。见 `_Log.reset`。"""
+        self.items = []
+        self.loaded = False
+
 
 _pending = _Pending()
+
+
+def reset_state_cache() -> None:
+    """把按人格分开的两本账（变更日志、候选池）从磁盘重读。换包时由 `packs` 调。
+
+    **为什么必须清**：这两个类各自缓存了内存副本，而它们在盘上的位置是
+    `config.persona_data_dir() / <文件名>` —— 那是**按包分**的。不清的话切过去之后
+    `/人设 日志` 显示上一个包的记录、`/人设 撤回` 去撤别人格的条目，
+    而表层本身已经换了 —— 两边不一致且没有任何报错。
+    """
+    _log.reset()
+    _pending.reset()
+
+
+packs.on_change(reset_state_cache)
 
 
 def candidates(*, limit: int = 20) -> list[dict[str, Any]]:

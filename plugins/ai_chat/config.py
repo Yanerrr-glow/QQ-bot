@@ -14,7 +14,7 @@ from typing import Any
 
 from nonebot import get_driver
 
-from . import settings
+from . import packs, settings
 
 _cfg = get_driver().config
 
@@ -140,12 +140,62 @@ def _persona_path(configured: str) -> Path:
     return path if path.is_absolute() else _ROOT / path
 
 
+# ------------------------------------------------------------ 人格源在哪里（一个解析口）
+# 人格源文件有**两种**来源，且优先级明确：
+#
+#   1. 显式配置的路径（`.env` 的 AI_CHAT_PERSONA_FILE / _FORBIDDEN_FILE / _SURFACE_FILE
+#      / AI_CHAT_TRAITS_FILE）—— 配了就按它，绕过人格包。这是**逃生舱**，
+#      也是出故障时的一键回退路径：三个变量指回旧目录即可回到改造前的行为。
+#   2. 当前激活的**人格包**：`persona/packs/<id>/<文件>`。
+#      一个包 = 一个角色需要的全部静态文件；`_registry.json` 记默认值，
+#      `data/runtime/persona/_active` 记运行时切换的结果。见 `packs.py`。
+#
+# **为什么把这张表放在这里而不是各模块各拼一次**：
+# 原来 `_PERSONA_CONFIGURED` / `_FORBIDDEN_CONFIGURED` / `_TRAITS_NAME` 三处各存一份
+# 字面量，加一个角色就要改三处、还容易漏。现在只有这一张表 + 包内文件名表
+# （`packs.PACK_FILES`），别处一律走 `persona_file_path()` 这类函数。
+def _spec_override(role: str) -> str:
+    """某层的显式路径配置。**必须区分 None 与空串**。
+
+    NoneBot2 的 Config 是 extra="allow"，字段没配时取到的是 **None 而不是"没有这个属性"**，
+    所以 `getattr(cfg, name, "默认值")` 的默认值**永远不会生效**。
+    历史事故：写成 `getattr(..., "persona.txt") or ""` 之后 persona.txt 被静默跳过，
+    机器人退化成一句内置通用提示词，而日志里一个字都没有。
+    """
+    field = {
+        "base": "ai_chat_persona_file",
+        "forbidden": "ai_chat_forbidden_file",
+        "surface": "ai_chat_surface_file",
+        "traits": "ai_chat_traits_file",  # 新增：给"注册表放别处"留的口子
+    }[role]
+    raw = getattr(_cfg, field, None)
+    return "" if raw is None else str(raw).strip()
+
+
+def persona_source_path(role: str) -> Path:
+    """某层人格文件的**权威路径**（不保证存在）。
+
+    这是全项目唯一的人格路径解析口：`persona_file_path()` / `forbidden_file_path()` /
+    `surface_seed_path()` / `traits_file_path()` 都是它的薄封装，
+    各模块不要再自己 `Path(...)` 拼一遍。
+    """
+    configured = _spec_override(role)
+    if configured:
+        return _persona_path(configured)
+    return packs.active_file(role)
+
+
 def _data_dir() -> Path:
     """运行时数据目录（`data/runtime/`，容器里位于持久化 data 卷中）。
 
-    **为什么单独抽一个函数**：`LOG_DIR` 在文件后半段才定义，而表层人设的路径
-    必须在 `SYSTEM_PROMPT = compose_prompt()`（模块导入期就会执行）之前可用 ——
-    否则导入时就 `NameError`（实测踩过）。`LOG_DIR` 也复用它，避免两处各算一遍。
+    **为什么单独抽一个函数**：`LOG_DIR` 在文件后半段才定义，而人格路径
+    在模块导入期就可能被读到（`packs` 的激活标记、表层播种）——
+    否则导入时就 `NameError`（实测踩过）。`LOG_DIR` 与 `packs` 都复用它，
+    避免三处各算一遍。
+
+    ⚠ **它每次现读 `_cfg`，不缓存结果**：`验证\离线验证_桩.py` 会在导入之后
+    改 `AI_CHAT_LOG_DIR` 来把落盘接到临时目录，缓存住就会把测试数据写进真实 `data/`
+    （那个坑踩过一次：3300 多行用例因此从没被执行过）。
     """
     configured = getattr(_cfg, "ai_chat_log_dir", "") or ""
     legacy = _ROOT / "data"
@@ -158,63 +208,121 @@ def _data_dir() -> Path:
     return path
 
 
+# **把两样东西注入 packs**（本模块是唯一知道它们的地方）：
+#   * `default`：`.env` 的 AI_CHAT_PERSONA_PACK（部署期想钉死某个包时用）；
+#   * `data_dir`：运行数据根的回调 —— 切换标记、运行数据都要落在卷里的 data/ 下。
+# 两样都是惰性使用，所以在这里（`_data_dir` 定义之后、任何读取发生之前）注入正好。
+packs.configure(
+    default=str(getattr(_cfg, "ai_chat_persona_pack", None) or "").strip(),
+    data_dir=_data_dir,
+)
+
+
 def bot_name() -> str:
-    """机器人自己的显示名。**每次现读** —— 它可以被 `/昵称` 或控制台改。
+    """机器人自己的显示名。**每次现读** —— 它可以被 `/昵称`、控制台或**换人格**改。
 
-    优先取可调项 `settings.bot_name`（控制台 / `/昵称` 写入 settings.json），
-    留空则回落到 `.env` 的 `AI_CHAT_BOT_NAME`（即模块级 `BOT_NAME`）。
+    四级回落（高 → 低）：
 
-    **为什么不是一个常量**：改了 QQ 昵称之后，聊天记录里必须跟着换名字 ——
-    而"分清自己说的话"正是靠 `名字 + bot_uid` 判定的（`_speaker()` 的兜底分支
-    就是拿它比的）。名字与落盘不一致会让归属判定退化。
+    1. 可调项 `settings.bot_name`（控制台 / `/昵称` / `/人设 切换` 写入 settings.json）；
+    2. **当前人格包的 `_pack.json` → `bot_name`**；
+    3. `.env` 的 `AI_CHAT_BOT_NAME`（即模块级 `BOT_NAME`）；
+    4. 内置默认。
+
+    **为什么人格包要插在 .env 前面**：角色名是人格的一部分。切到「小助手」之后
+    还叫「鲸鱼娘」，`chatlog._speaker()` 就认不出它刚说过的话（判定依据是
+    「角色名 + QQ 号」），于是它会对着自己上一轮接话 —— 这是静默故障，
+    所以身份元数据必须跟着包走。
+
+    **为什么 settings 仍然在最前**：用户手改的值永远最大 ——
+    `/昵称 小鱼` 之后不能被包的默认值顶回去。
     """
     try:
         from . import settings as _s  # 局部导入：settings 顶部要 import config
     except Exception:  # noqa: BLE001
-        return BOT_NAME
+        return _pack_bot_name() or BOT_NAME
     override = str(_s.get("bot_name") or "").strip()
-    return override or BOT_NAME
+    return override or _pack_bot_name() or BOT_NAME
+
+
+def _pack_bot_name() -> str:
+    """当前人格包里声明的角色名（读不到返回空串）。"""
+    try:
+        return str(packs.active_pack().get("bot_name") or "").strip()
+    except Exception:  # noqa: BLE001 - 名字读不出来不能让聊天挂掉
+        return ""
 
 
 def surface_file_path() -> Path:
-    """表层人设的**读写路径**：`data/runtime/persona/surface.txt`（卷内持久化）。
+    """表层人设的**读写路径**。
 
-    改这个函数就等于改了"自我学习存在哪"，所以 `persona.py` 的写入与
-    `/人设` 的显示都走它，不各自拼路径。
+    * **没有显式配 `AI_CHAT_SURFACE_FILE`**（正常情况）：落在当前人格包的运行数据目录
+      —— `data/runtime/persona/<包>/surface.txt`，卷内持久化。
+    * **显式配了**：就用那个路径（逃生舱；测试也靠它把表层指到临时目录，
+      免得写进真实运行数据）。
+
+    **按包分目录**是包化的关键一步：改造前它平铺在 `data/runtime/persona/surface.txt`，
+    于是换人格后前一个角色学到的说话方式会被后一个继承。
+    旧目录由 `packs.migrate_layout()` 在启动时归位（幂等）。
     """
-    name = Path(_SURFACE_CONFIGURED or "surface.txt").name
-    return _data_dir() / "persona" / name
+    configured = _spec_override("surface")
+    if configured:
+        return _persona_path(configured)
+    name = Path(packs.PACK_FILES["surface"]).name
+    return packs.stage_dir() / name
 
 
 def persona_data_dir() -> Path:
-    """人格运行状态目录；和只读的人格源文件分开。"""
-    return LOG_DIR / "persona"
+    """**当前人格**的运行状态目录；和只读的人格源文件分开，也和别的人格分开。
+
+    正常情况就是 `data/runtime/persona/<包>/`。
+
+    **配了 `AI_CHAT_SURFACE_FILE` 时跟着它走**（只要它落在运行数据根内）：
+    这时候表层被显式指到了别处，而变更日志与候选池都是**表层的附属账本** ——
+    账本留在原地会出现"表层在 A、日志在 B"，撤回与采纳就会对着错的账本操作。
+    刻意**不**照抄它落在运行数据根之外的情况（比如仓库内某个测试文件）：
+    那样子目录会散到源码树里，日志与候选池没有理由跟着跑。
+    """
+    configured = _spec_override("surface")
+    if configured:
+        parent = surface_file_path().parent
+        try:
+            parent.resolve().relative_to(packs.runtime_persona_root().resolve())
+        except ValueError:
+            pass
+        else:
+            return parent
+    return packs.stage_dir()
 
 
 def surface_seed_path() -> Path:
-    """镜像内那份模板的路径（只用于首次播种；之后不再读写它）。"""
-    return _persona_path(_SURFACE_CONFIGURED or "persona/active/surface.txt")
+    """模板的路径（只用于首次播种；之后不再读写它）。**在包内**。"""
+    return persona_source_path("surface")
+
+
+# 兼容旧名字：`packs` 出现之前它们是拆开算的。
+def surface_template_path() -> Path:
+    return surface_seed_path()
 
 
 def seed_surface() -> str:
-    """首次启动时把镜像里的模板播种到 `data/`。返回一句可打进启动日志的说明。
+    """首次启动时把包里的模板播种到 `data/runtime/persona/<包>/`。返回一句可打进启动日志的说明。
 
     **幂等**：只在目标不存在时播种 —— 之后的自我迭代成果不会被模板覆盖。
     这正是"自我学习不会被重建冲掉"的保证。
     播种失败不抛：表层读不到时 `render()` 少一层，不该让插件起不来。
     """
-    if not _SURFACE_CONFIGURED:
-        return "表层人设：已关闭（配置为空串）"
+    if not _spec_override("surface") and not packs.active_id():
+        return "表层人设：已关闭（没有可用的人格包，且未配置 AI_CHAT_SURFACE_FILE）"
     target = surface_file_path()
     if target.exists():
         try:
-            return "表层人设：读写 data/runtime/persona/%s（%d 字，已存在，未覆盖）" % (
-                target.name, len(target.read_text(encoding="utf-8")))
+            return "表层人设：读写 %s（%d 字，已存在，未覆盖）" % (
+                _rel_to_root(target), len(target.read_text(encoding="utf-8")))
         except OSError:
-            return "表层人设：读写 data/runtime/persona/%s（已存在）" % target.name
+            return "表层人设：读写 %s（已存在）" % _rel_to_root(target)
     seed = surface_seed_path()
     if not seed.exists():
-        return "表层人设：data/runtime/persona/%s 与模板都缺失，本层为空" % target.name
+        return "表层人设：%s 与模板都缺失，本层为空" % _rel_to_root(target)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp")
@@ -223,52 +331,108 @@ def seed_surface() -> str:
         # 但没必要引入这种差异 —— 二进制搬运保证**字节级一致**。
         tmp.write_bytes(seed.read_bytes())
         tmp.replace(target)
-        return "表层人设：已从模板播种到 data/runtime/persona/%s（重建不再丢）" % target.name
+        return "表层人设：已从模板播种到 %s（重建不再丢）" % _rel_to_root(target)
     except OSError as exc:
         return "表层人设：播种失败（%s），本次将退回读模板" % type(exc).__name__
+
+
+def _rel_to_root(path: Path) -> str:
+    """日志里尽量用相对项目根的路径（绝对路径会把本机目录结构写进日志）。"""
+    try:
+        return str(path.relative_to(_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path)
 
 
 # ------------------------------------------------------------------ 人格三层
 # 人格从「一个文件 + 一堆运行时槽位」改成**三个文件、三层寿命**。
 #
-# | 层 | 文件 | 谁能写 | 进 prompt 的顺序 |
+# | 层 | 文件（当前人格包内） | 谁能写 | 进 prompt 的顺序 |
 # |---|---|---|---|
-# | 底层人设 | `persona.txt` | **只有用户**（直接编辑文件） | 第 1 位（最硬） |
-# | 禁止事项 | `persona/active/forbidden.txt` | **只有用户**（直接编辑文件） | 第 2 位 |
-# | 表层人设 | `persona/active/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
+# | 底层人设 | `base.txt` | **只有用户**（直接编辑文件） | 第 1 位（最硬） |
+# | 禁止事项 | `forbidden.txt` | **只有用户**（直接编辑文件） | 第 2 位 |
+# | 表层人设 | 模板 `surface.txt` → 运行数据 `data/runtime/persona/<包>/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
 #
 # 为什么这么分：原来「底色」和「可以学的东西」挤在同一个文件里（`persona.txt` 自己
 # 第 3 行就写着"下面写的是底色，改起来很慢"），而运行时槽位又是第三处 ——
 # 结果"哪些能自动变"这件事没有结构性保证，只靠约定。
 # 现在**由文件划分把权限钉死**：自动迭代的代码里根本拿不到另外两个文件的写路径。
 #
+# 包化（2026-10 起）在里面又加了一层：**一组三层 = 一个包**，
+# 所以"换角色"变成"换目录"，而不是"覆盖同一批文件"。见 `packs.py`。
+#
 # 禁止事项单独成层而不是并进底层，是因为它要被**逐条解析出来做冲突判定**
 # （见 `persona.forbidden_items()`）—— 一条禁止事项能挡掉一条表层改动。
 _PERSONA_RAW = getattr(_cfg, "ai_chat_persona_file", None)
-# 分层之后**底层人设的默认文件换成了 `persona/active/base.txt`**。
-# 旧名 `persona.txt` 仍然被识别（`_read_text_file` 会找到它），
-# 但默认值必须是新的那份 —— 否则会读到一个"包含三层内容"的旧文件，
-# 于是禁止事项被算进底层、闸门的相似度判定也跟着偏。
-_PERSONA_CONFIGURED = "persona/active/base.txt" if _PERSONA_RAW is None else str(_PERSONA_RAW).strip()
+# 兼容旧名字：分层之前的旧文件叫 `persona.txt`，那时直接改这两个常量来指路径。
+# 现在路径由 `_spec_override()` 现算，这两个别名保留只为**读**（旧脚本/旧测试引用）。
+_PERSONA_CONFIGURED = "" if _PERSONA_RAW is None else str(_PERSONA_RAW).strip()
 _FORBIDDEN_RAW = getattr(_cfg, "ai_chat_forbidden_file", None)
-_FORBIDDEN_CONFIGURED = (
-    "persona/active/forbidden.txt" if _FORBIDDEN_RAW is None else str(_FORBIDDEN_RAW).strip()
-)
+_FORBIDDEN_CONFIGURED = "" if _FORBIDDEN_RAW is None else str(_FORBIDDEN_RAW).strip()
 _SURFACE_RAW = getattr(_cfg, "ai_chat_surface_file", None)
-_SURFACE_CONFIGURED = (
-    "persona/active/surface.txt" if _SURFACE_RAW is None else str(_SURFACE_RAW).strip()
-)
+_SURFACE_CONFIGURED = "" if _SURFACE_RAW is None else str(_SURFACE_RAW).strip()
 
-BASE_PROMPT: str = (
-    _read_text_file(_persona_path(_PERSONA_CONFIGURED), label="底层人设")
-    if _PERSONA_CONFIGURED
-    else ""
-)
-FORBIDDEN_PROMPT: str = (
-    _read_text_file(_persona_path(_FORBIDDEN_CONFIGURED), label="禁止事项")
-    if _FORBIDDEN_CONFIGURED
-    else ""
-)
+# 三层正文的**按包缓存**。换包时清空（见 `_persona_generation()`）。
+#
+# **为什么不再是 import 期常量**：人格包要求"切了就换人"，而 import 期常量只能
+# 重启才变。改法见模块末尾的 `__getattr__` —— `config.BASE_PROMPT` 照旧能读，
+# 但值是**现算 + 按包缓存**的。
+_persona_memo: dict[str, str] = {}
+_persona_generation_seen: str | None = None
+
+
+def persona_generation() -> str:
+    """人格代际：激活包换了就跟着变。所有"按人格算出来的缓存"都挂在这个键上。
+
+    单独抽成一个函数（而不是让各模块自己比 `packs.active_id()`）是为了**只有一个地方**
+    定义"什么算换人格"。以后如果引入"同一包内换 profile"这类概念，改这里就够。
+    """
+    global _persona_generation_seen
+    now = packs.active_id()
+    if now != _persona_generation_seen:
+        _persona_generation_seen = now
+        _persona_memo.clear()
+    return now
+
+
+def _persona_layer(role: str) -> str:
+    """读某层的正文（带缓存，换包自动失效）。
+
+    三层都用它，所以**不要**在别处再 `path.read_text()` 一次 —— 那条路不会
+    跟着换包失效，于是"切了人格但某一层还是旧的"，而且只在切过之后才出现。
+    """
+    persona_generation()  # 先对齐代际：换包时这一步会清掉 memo
+    if role in _persona_memo:
+        return _persona_memo[role]
+    configured = _spec_override(role)
+    if not configured and not packs.active_id():
+        # 既没配路径、也没有可用的人格包 → 这一层就是空的。
+        # 故意**不去**看旧目录：看起来像"兜底"，实际只会让人以为改了文件没生效。
+        _persona_memo[role] = ""
+        return ""
+    path = persona_source_path(role)
+    label = {"base": "底层人设", "forbidden": "禁止事项", "surface": "表层人设"}.get(role, role)
+    text = _read_text_file(path, label=label)
+    _persona_memo[role] = text
+    return text
+
+
+def _base_layer() -> str:
+    return _persona_layer("base")
+
+
+def _forbidden_layer() -> str:
+    return _persona_layer("forbidden")
+
+
+def active_persona_id() -> str:
+    """当前人格包 id（空串 = 没有可用的人格包）。"""
+    return packs.active_id()
+
+
+def _system_prompt_lazy() -> str:
+    """现在该用的 system 前缀：三层合成，空了才回落到 `.env` 的静态提示词。"""
+    return compose_prompt() or _static_prompt()
 
 
 def load_surface() -> str:
@@ -276,15 +440,16 @@ def load_surface() -> str:
 
     文件很小（几百字），一次读盘是毫秒级，而且只在组装 prompt 时读。
 
-    ## 从 `data/` 读（这是「自我学习不该被重建覆盖」的修法）
-    表层是**唯一会被自动迭代写入**的一层，而 `Dockerfile` 里有
-    `COPY persona/active ./persona/active` —— 于是"线上学到的"会被"本机那份"顶掉，
-    而且**不报错**，只表现为"它前几天学会的说话方式又变回去了"。
+    ## 从 `data/runtime/persona/<包>/` 读（这是「自我学习不该被重建覆盖」的修法）
+    表层是**唯一会被自动迭代写入**的一层，而 `Dockerfile` 会 `COPY persona ./persona`
+    —— 于是"线上学到的"会被"本机那份"顶掉，**而且不报错**，只表现为
+    "它前几天学会的说话方式又变回去了"。
 
-    现在读写都落在 `data/`（卷内），镜像里那份只作**首次播种**的模板
-    （`seed_surface()` 在启动时播一次，幂等）。
+    现在读写都落在卷里的 `data/`（`packs.stage_dir()`），镜像里那份只作
+    **首次播种**的模板（`seed_surface()` 在启动时播一次，幂等）。
+    包化之后还多了一层隔离：**每个包一份**，换人格不会互相继承。
     """
-    if not _SURFACE_CONFIGURED:
+    if not _spec_override("surface") and not packs.active_id():
         return ""
     return _read_text_file(surface_file_path(), label="表层人设")
 
@@ -312,8 +477,15 @@ def compose_prompt() -> str:
     所以底色 → 铁律 → 表层，表层即使写得天花乱坠也压不过上面两层。
 
     **`#` 开头的整行在这里被剥掉** —— 见 `strip_comments()`。
+
+    **每轮现读**：三层都走 `_persona_layer()`（按包缓存），所以换人格之后
+    下一轮组装就是新人格，不需要重启进程。
     """
-    parts = [strip_comments(p) for p in (BASE_PROMPT, FORBIDDEN_PROMPT, load_surface()) if p]
+    parts = [
+        strip_comments(p)
+        for p in (_base_layer(), _forbidden_layer(), load_surface())
+        if p
+    ]
     parts = [p for p in parts if p.strip()]
     return "\n\n".join(parts)
 
@@ -324,39 +496,45 @@ def _static_prompt() -> str:
 
 
 # 三层的**文件路径出口** —— `persona.py` 与迁移脚本按名字取，不各自拼路径。
-# 返回值是"打算用哪个路径"，不保证文件存在：底层/禁止事项允许缺失（那就没有这一层），
+# 返回值是"打算用哪个路径"，**不保证文件存在**：底层/禁止事项允许缺失（那就没有这一层），
 # 表层缺失时由写入方创建。
 def persona_file_path() -> Path:
-    # 兜底名跟着默认值走（`persona/active/base.txt`）：留 `persona.txt` 会让
-    # 「显式写成空串」这种配置把路径指回一个已经改名为备份的旧文件。
-    return _persona_path(_PERSONA_CONFIGURED or "persona/active/base.txt")
+    """底层人设（它是谁）的路径：显式配置优先，否则取当前人格包内的 base.txt。"""
+    return persona_source_path("base")
 
 
 def forbidden_file_path() -> Path:
-    return _persona_path(_FORBIDDEN_CONFIGURED or "persona/active/forbidden.txt")
+    """禁止事项（铁律）的路径。"""
+    return persona_source_path("forbidden")
 
 
 # ---------------------------------------------------------------- 特质注册表
 # 人格约束的**元数据**：每个特质是什么、怎么测、有哪些表达通道、闸门关键词。
-# 它是**配置**（随镜像走，不像表层那样会被运行时改写），所以解释器内缓存一次即可。
+# 它是**配置**（随镜像走，不像表层那样会被运行时改写）。
 # 规则正文仍然只在三层文件里 —— 注册表只做索引，不复制文本（见 README §5.6.14）。
-_TRAITS_NAME = "persona/active/traits.json"
+#
+# ⚠ **注册表是人格相关的**：`gate_terms` 决定冲突闸门认哪些词。换人格之后
+# 缓存必须失效，否则新角色会带着旧角色的关键词运行（表现为"铁律挡不住新角色的
+# 偏离"或反过来），而且没有任何报错。所以它挂 `persona_generation()`。
 _traits_cache: list[dict[str, Any]] | None = None
+_traits_generation: str | None = None
 
 
 def traits_file_path() -> Path:
-    """特质注册表的路径。与三层人设文件同级（项目根 / 容器 WORKDIR）。"""
-    return _persona_path(_TRAITS_NAME)
+    """特质注册表的路径：显式配置优先，否则取当前人格包内的 traits.json。"""
+    return persona_source_path("traits")
 
 
 def load_traits() -> list[dict[str, Any]]:
     """读特质注册表。**读不到或结构不对一律返回空列表。**
 
     这是"闸门不裸奔"的一半：`persona.py` 用它派生冲突关键词与否定白名单，
-    拿不到就回退到内置的 `_LEGACY_CONFLICTS` —— 注册表损坏不该让安全判定消失。
+    拿不到就回退到内置的 `_LEGACY_CONFLICTS` —— 注册表损坏不该让安全判定消失
+    （公开副本按设计就不带这份文件，所以"缺它也能跑"是硬要求）。
     """
-    global _traits_cache
-    if _traits_cache is not None:
+    global _traits_cache, _traits_generation
+    gen = persona_generation()
+    if _traits_cache is not None and _traits_generation == gen:
         return _traits_cache
     items: list[dict[str, Any]] = []
     path = traits_file_path()
@@ -370,25 +548,145 @@ def load_traits() -> list[dict[str, Any]]:
         logger.warning("特质注册表读不到，闸门回退到内置表：%s（%s）",
                        path.name, type(exc).__name__)
     _traits_cache = items
+    _traits_generation = gen
     return items
+
+
+def reset_persona_cache() -> None:
+    """把"按人格算出来的"缓存全部作废。**换包之后必须调它**（`packs.switch()` 会）。
+
+    只清本模块的两处（三层正文、特质注册表）；判据器与内存副本由各自的模块
+    通过 `packs.on_change()` 登记清理 —— 见 `packs.py` 顶部那张表。
+    """
+    _persona_memo.clear()
+    global _traits_cache, _traits_generation, _persona_generation_seen
+    _traits_cache = None
+    _traits_generation = None
+    # 让下一次 `persona_generation()` 重新对齐（即使 active_id 没变）。
+    _persona_generation_seen = None
+
+
+packs.on_change(reset_persona_cache)
 
 
 # `surface_file_path()` 定义在上面（`load_surface` 旁边）—— 它落在 `data/` 而不是项目根，
 # 理由见那里的 docstring。**不要在这里再加一个同名函数**：后定义的会覆盖前者。
 
 
-_PERSONA_TEXT: str = BASE_PROMPT
-SYSTEM_PROMPT: str = compose_prompt() or _static_prompt()
+# ------------------------------------------------------- 人格相关的三个常量（惰性）
+# 改造前它们是 import 期常量（`BASE_PROMPT: str = _read_text_file(...)`），
+# 于是"改底层人设要重启"是一条写在注释里的约定 —— 人格包要热切换，这条就不成立了。
+#
+# 现在它们是**模块级 `__getattr__`（PEP 562）**：`config.BASE_PROMPT` 照旧能读，
+# 但值是现算 + 按包缓存的；换包之后下一次读就是新人格。
+#
+# **为什么用 `__getattr__` 而不是 `@property` 或 `lru_cache` 包一层函数**：
+# `验证\离线验证_桩.py` 会**给这些名字赋值**来做隔离测试
+# （`config.BASE_PROMPT = ""`、`config.SYSTEM_PROMPT = ""`），
+# 而 `__getattr__` 只在**正常属性查找失败**时才被调用 —— 赋过值之后读到的是
+# 赋进去的那个值，打桩语义原样保住。换成 property 就没法赋值了。
+_LAZY_ATTRS = ("BASE_PROMPT", "FORBIDDEN_PROMPT", "SYSTEM_PROMPT")
 
-# 底层人设到底是从哪来的 —— 启动日志与 /机制 都要用，否则"人设没生效"这类问题
-# 排查起来会先卡在"它现在读的哪一份"上。
-# 分层之后"来源"是**三层各自的文件**，所以这里只标明底层那层用没用文件。
-PERSONA_SOURCE: str = (
-    persona_file_path().name
-    if _PERSONA_TEXT
-    else "AI_CHAT_SYSTEM_PROMPT"
-)
-PERSONA_PREVIEW: str = " ".join((BASE_PROMPT or SYSTEM_PROMPT).split())[:60]
+
+def __getattr__(name: str) -> Any:
+    if name == "BASE_PROMPT":
+        return _base_layer()
+    if name == "FORBIDDEN_PROMPT":
+        return _forbidden_layer()
+    if name == "SYSTEM_PROMPT":
+        return _system_prompt_lazy()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def persona_layers() -> dict[str, str]:
+    """三层正文 + 各自来自哪个文件（启动日志、诊断、`/人设 状态` 用）。"""
+    return {
+        "base": _base_layer(),
+        "forbidden": _forbidden_layer(),
+        "surface": load_surface(),
+        "base_file": _rel_to_root(persona_file_path()),
+        "forbidden_file": _rel_to_root(forbidden_file_path()),
+        "surface_file": _rel_to_root(surface_file_path()),
+        "traits_file": _rel_to_root(traits_file_path()),
+    }
+
+
+# 兼容旧读法：`PERSONA_SOURCE` 历史上是"底层人设来自哪个文件名"。
+# 现在来源是**当前人格包**，所以它报包的 id（空 = 靠 .env 的静态提示词兜底）。
+# `PERSONA_PREVIEW` 同理改成函数 —— import 期算一次会在换人格后变成陈旧值，
+# 而它的用途（启动日志里显示"现在的人设长什么样"）恰恰要求它是最新的。
+def persona_source() -> str:
+    return packs.active_id() or "AI_CHAT_SYSTEM_PROMPT"
+
+
+def persona_preview() -> str:
+    return " ".join((_base_layer() or _system_prompt_lazy()).split())[:60]
+
+
+# ------------------------------------------------------------ 切换人格（统一入口）
+def switch_persona(pack_id: str, *, sync_identity: bool = True) -> dict[str, Any]:
+    """切到另一个人格包，并把身份元数据一起同步。**群指令、Web、桌面三处都走它。**
+
+    为什么不让调用方各自 `packs.switch()` 再自己写设置：
+
+    1. **身份要跟着包走**。切到「小助手」之后 `bot_name` 还是「鲸鱼娘」的话，
+       `chatlog._speaker()` 就认不出它刚说过的话（判据是「角色名 + QQ 号」），
+       于是它会对着自己上一轮接话 —— 这是静默故障，必须由切换动作本身负责；
+    2. **"切完要不要重启"这类说明只能有一处**。散在三个入口就会有一处忘改。
+
+    返回 `packs.switch()` 的结果，另加两个字段：
+
+    * `identity`：实际同步到 `settings.json` 的身份参数（空 = 没动）；
+    * `identity_note`：同步失败/跳过时的说明（给人看）。
+
+    注意：**表层播种不在这一步**。切换后第一次组装 prompt 会读到旧包运行数据目录
+    之外的东西 —— 如果新包还没有表层文件，`load_surface()` 读不到内容，
+    由 `_startup` 与切换入口各自调一次 `seed_surface()` 补上（幂等）。
+    """
+    got = packs.switch(pack_id)
+    got["identity"] = {}
+    got["identity_note"] = ""
+    if not got.get("ok") or not sync_identity:
+        return got
+    patch = packs.identity_patch(str(got["id"]))
+    if not patch:
+        got["identity_note"] = "包里没有声明身份元数据，机器人显示名与唤醒词保持不变"
+        return got
+    applied: dict[str, str] = {}
+    for key, value in patch.items():
+        try:
+            settings.set_value(key, value)
+            applied[key] = value
+        except (KeyError, OSError, ValueError) as exc:
+            got["identity_note"] = f"{key} 同步失败（{type(exc).__name__}）"
+            logger.warning("切换人格时同步 %s 失败：%s", key, type(exc).__name__)
+    got["identity"] = applied
+    return got
+
+
+def seed_surface_for(pack_id: str) -> str:
+    """给**指定**的包播种表层（用它自己的模板 → 它自己的运行数据目录）。
+
+    切换前先播一次：切完立刻就有表层内容，不用等下一次启动。
+    幂等（目标存在就不动），失败不抛。
+    """
+    pid = packs.resolve_id(pack_id) or str(pack_id or "").strip()
+    if not pid:
+        return "表层人设：包 id 为空，未播种"
+    target = packs.seeded_stage_file(pid, "surface")
+    if target.exists():
+        return "表层人设：%s 已存在，未覆盖" % _rel_to_root(target)
+    seed = packs.pack_file(pid, "surface")
+    if not seed.is_file():
+        return "表层人设：%s 里没有 surface.txt 模板，本层为空" % _rel_to_root(seed.parent)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_bytes(seed.read_bytes())
+        tmp.replace(target)
+        return "表层人设：已为 %s 播种 %s" % (pid, _rel_to_root(target))
+    except OSError as exc:
+        return "表层人设：给 %s 播种失败（%s）" % (pid, type(exc).__name__)
 
 
 # ---------------------------------------------------------------- 当前时间
@@ -569,8 +867,8 @@ def time_hint(when: float | None = None) -> str:
 #
 # 【语域说明（重要）】下面这些是**固定系统文案**：由代码写死、在特定时机
 # 原样发出，模型没有即兴发挥的余地。因此它们**不属于人格语域** ——
-# `persona/active/forbidden.txt` 的铁律管的是"模型自己怎么说"，不适用于这里。
-# 这个区分登记在 `persona/active/traits.json` 的 `fixed_notice_channels` 里，巡逻脚本会核对；
+# `persona/packs/<包>/forbidden.txt` 的铁律管的是"模型自己怎么说"，不适用于这里。
+# 这个区分登记在 `persona/packs/<包>/traits.json` 的 `fixed_notice_channels` 里，巡逻脚本会核对；
 # **以后新增固定文案时，记得去那里登记一条**（否则"谁在发什么"就没有清单了）。
 MSG_TIMEOUT: str = getattr(
     _cfg, "ai_chat_msg_timeout", "想太久了，脑子有点乱……等下再问我一次吧。"
@@ -582,7 +880,7 @@ MSG_ERROR: str = getattr(
 # 【判定】它**不是**人设化的兜底话术，措辞刻意中性 —— 因为空回复是**故障**，
 # 不该由人格接管。原来那句「我没想出要说什么，换个说法问？」自带问句，与人设铁律
 # 「不作话头抛回者」冲突；判定结果是"**改报错、不改人设**"，而不是把故障伪装成一句俏皮话。
-# 属"固定系统文案"语域，登记在 persona/active/traits.json 的 fixed_notice_channels。
+# 属"固定系统文案"语域，登记在 persona/packs/<包>/traits.json 的 fixed_notice_channels。
 MSG_EMPTY: str = getattr(
     _cfg, "ai_chat_msg_empty", "【出错了】这一轮没能生成回复，已记进日志。"
 )

@@ -32,6 +32,7 @@ from . import (
     greetings,
     llm,
     memory,
+    packs,
     persona,
     persona_eval,
     persona_iter,
@@ -215,15 +216,25 @@ _HTML = """<!doctype html>
   <!-- ---------------------------------------------------------- 人格三层 -->
   <div class="panel" id="panel-persona">
     <div class="card">
+      <h2>人格包 <span class="count" id="packCount"></span></h2>
+      <div class="muted" style="margin-bottom:12px">
+        人格现在是<b>一个目录一套</b>（<code>persona/packs/&lt;id&gt;/</code>）：
+        换角色 = 换目录，而不是覆盖同一批文件。
+        每个包的<b>自我学习成果按包分开存</b>（<code>data/runtime/persona/&lt;id&gt;/</code>），
+        切回来接着用，不会串到别的角色身上。
+        <b>切换立即生效</b> —— 下一次回复就是新人格，不用重启。
+      </div>
+      <div id="packList"></div>
+    </div>
+    <div class="card">
       <h2>人格三层 <span class="count" id="personaCount"></span></h2>
       <div class="muted" style="margin-bottom:12px">
-        人格现在分三层，由<b>文件</b>划分权限：
+        三层由<b>文件</b>划分权限：
         <b>底层人设</b>（它是谁）与<b>禁止事项</b>（铁律）
         <b>只能由你直接编辑文件修改</b> —— 聊天指令、控制台、自动迭代都改不了它们。
         <b>表层人设</b>（怎么说话）是唯一会自动迭代的部分，
         而且与上面两层冲突的条目会被<b>直接丢弃、不写入</b>。
-        生效时机：<b>表层每轮现读、改完即生效</b>；
-        <b>底层人设与禁止事项是启动时读入的，改完要重启</b>。
+        三层都是<b>每轮现读</b>，改完即生效（不用重启）。
       </div>
       <div id="personaList"></div>
     </div>
@@ -400,9 +411,67 @@ async function greet() {
   } catch (e) { toast('触发失败：' + e.message, true); }
 }
 
+// ---------------------------------------------------------------- 人格包
+// **这一页唯一会改变"它是谁"的动作。** 切换是热切换：改的是运行时标记
+// （data/runtime/persona/_active），下一次组装 prompt 就是新人格。
+// 为什么要二次确认：切过去之后群里下一句话就换人了 —— 这是全局可见的效果，
+// 误点一下的代价比"多点一次"高得多。
+function renderPacks(p) {
+  const cur = p.pack || {};
+  const items = p.packs || [];
+  const box = document.getElementById('packList');
+  document.getElementById('packCount').textContent =
+    `（当前 ${cur.name || '（无）'} / 共 ${items.length} 个可用）`;
+  if (!cur.id) {
+    box.innerHTML = `<div class="muted">还没有任何可用的人格包：把人格文件放进
+      <code>persona/packs/&lt;id&gt;/</code>（可照抄 <code>persona/_TEMPLATE/</code>）。</div>`;
+    return;
+  }
+  const rows = items.map(x => {
+    const active = x.id === cur.id;
+    const id = esc(x.id);
+    return `<tr>
+      <td>${active ? '✅ ' : ''}<b>${esc(x.name || x.id)}</b><br><code class="muted">${id}</code></td>
+      <td>${esc(x.description || '')}
+        ${(x.aliases || []).length ? `<br><span class="muted">别名：${esc((x.aliases || []).join('、'))}</span>` : ''}
+        ${x.manifest_error ? `<br><span class="muted">⚠ ${esc(x.manifest_error)}</span>` : ''}</td>
+      <td>${active ? '<span class="muted">当前</span>'
+                   : `<button onclick="packSwitch('${id}')">切到这个</button>`}</td>
+    </tr>`;
+  }).join('');
+  box.innerHTML = `<table><thead><tr><th>包</th><th>说明</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <div class="muted" style="margin-top:8px">
+      包目录：<code>${esc(cur.dir || '')}</code><br>
+      运行数据：<code>${esc(cur.stage || '')}</code>
+      ${cur.frozen ? `<br>⚠ 已被 freeze(${esc(cur.frozen)}) 钉死：切换不会改变实际加载的包` : ''}
+    </div>`;
+}
+
+async function packSwitch(id) {
+  if (!confirm(`切到人格包「${id}」？\n\n下一句回复就是新人格（立即生效，不用重启）。\n` +
+               `当前包的自我学习成果会原样留在它自己的目录里，切回来还在。`)) return;
+  const r = await api('/api/persona/switch', {method:'POST', body: JSON.stringify({id})});
+  if (!r.ok) {
+    alert('没切成：' + ((r.errors || []).join('；') || r.error || '未知原因'));
+    return;
+  }
+  const bits = [`已切到 ${r.name}（${r.active}）`, r.seed || ''];
+  if (r.identity && Object.keys(r.identity).length) {
+    bits.push('身份跟着换：' + Object.entries(r.identity).map(([k, v]) => `${k}=${v}`).join('、'));
+  }
+  if (r.identity_note) bits.push(r.identity_note);
+  (r.warnings || []).forEach(w => bits.push('⚠ ' + w));
+  if (!r.registry_written) bits.push('⚠ 注册表写不进去：重启后默认人格不会跟着变（本次部署不受影响）');
+  toast(bits.filter(Boolean).join('\n'));
+  if (r.persona) { renderPacks(r.persona); renderPersona(r.persona); }
+  load();
+}
+
 // ---------------------------------------------------------------- 人格三层
 // 这一页从「改人设槽位」改成**只读的三层视图 + 自动改动日志**。
-// 页面上不再有任何"改人设"的输入框 —— 改人格只能直接编辑文件（见 README 5.6.7.2）。
+// 页面上不再有任何"改人设内容"的输入框 —— 改人格只能直接编辑文件（见 README 5.6.7.2）；
+// **换一个角色**则是上面的「人格包」卡片在做。
 function renderPersona(p) {
   const st = p.stats || {}, iter = p.iter || {};
   const box = document.getElementById('personaList');
@@ -419,8 +488,8 @@ function renderPersona(p) {
       <br><code class="muted">${esc(r[2] || '')}</code></div>`).join('')}
   </div>
   <div class="muted" style="margin:8px 0">
-    改人格直接编辑上面三个文件。<b>表层</b>每轮回复前重新读，改完即生效；
-    <b>底层人设与禁止事项</b>是启动时读入的常量，<b>改完要重启</b>。
+    改人设内容直接编辑上面三个文件（它们在<b>当前人格包</b>里）。
+    <b>三层都是每轮现读</b>，改完即生效、不用重启。
     自动迭代每 ${iter.interval || 0} 秒跑一次，最多写入 ${iter.max || 0} 条；
     与上面两层冲突的条目会被<b>直接丢弃</b>。
   </div>
@@ -793,6 +862,7 @@ async function load() {
   renderSettings(data.settings);
   renderModels(data.models);
   renderModelJson(data.models_editor);
+  renderPacks(data.persona);
   renderPersona(data.persona);
   renderMemory(data.memory);
   renderImage(data.image);
@@ -936,6 +1006,8 @@ def _register() -> bool:
                 "models_editor": llm.editor_text(),
                 # 人设：三层结构。`catalog()`（旧槽位目录）已随分层一起删除 ——
                 # 控制台上的人设页现在只展示三层 + 自动改动日志 + 手动触发反思。
+                # 包化（2026-10）之后多了一维：**当前用的是哪个包**，
+                # 以及可以切到哪些包。切换是这个页面上唯一会改变"它是谁"的动作。
                 "persona": {
                     "stats": persona.stats(),
                     "forbidden": persona.forbidden_items(),
@@ -944,6 +1016,8 @@ def _register() -> bool:
                     "iter": persona_iter.stats(),
                     # 评估台现状：开关、素材/基线覆盖、各特质分数（只读）
                     "eval": persona_eval.status(),
+                    "pack": packs.stats(),
+                    "packs": packs.list_packs(),
                 },
                 "memory": {
                     "facts": memory.all_facts(),
@@ -1053,8 +1127,9 @@ def _register() -> bool:
         return JSONResponse(
             {
                 "ok": False,
-                "error": "改人设的接口已删除：现在只能直接编辑三个文件"
-                         "（底层人设 / 禁止事项 / 表层人设），改完不用重启",
+                "error": "改人设内容的接口已删除：现在只能直接编辑**当前人格包**里的"
+                         "base.txt / forbidden.txt（表层由自动迭代写）。"
+                         "**换一个角色**走 /api/persona/switch，不用重启",
             },
             status_code=410,
         )
@@ -1065,6 +1140,51 @@ def _register() -> bool:
             {"ok": False, "error": "撤销人设要求的接口已删除；自动改动用 /人设 撤回"},
             status_code=410,
         )
+
+    # ---- 人格包：看有哪些、切到哪一个 ------------------------------------
+    # 这是控制台上**唯一会改变"它是谁"的动作**，所以单独两个端点、单独一条权限规则
+    # （见 desktop/sdk/permissions.py）。切完立即生效：三层是每轮现读的。
+    @app.get(prefix + "/api/persona/packs")
+    async def _persona_packs() -> JSONResponse:  # noqa: ANN202
+        return JSONResponse({"active": packs.active_id(), "items": packs.list_packs()})
+
+    @app.post(prefix + "/api/persona/switch")
+    async def _persona_switch(request: Request) -> JSONResponse:  # noqa: ANN202
+        body = await _body(request)
+        want = str(body.get("id") or "").strip()
+        if not want:
+            return JSONResponse({"ok": False, "error": "要给一个包 id"}, status_code=400)
+        target = packs.resolve_id(want) or want
+        # 先给新包播种表层：切完立刻就有内容（幂等）。失败不拦切换 ——
+        # 少了表层只是少一层，而"切不过去"是更严重的事。
+        seed_note = config.seed_surface_for(target)
+        got = config.switch_persona(target)
+        if not got.get("ok"):
+            return JSONResponse(
+                {"ok": False, "errors": got.get("errors") or [], "active": packs.active_id()},
+                status_code=400,
+            )
+        return JSONResponse({
+            "ok": True,
+            "from": got.get("from"),
+            "active": packs.active_id(),
+            "name": packs.active_pack().get("name", ""),
+            "identity": got.get("identity") or {},
+            "identity_note": got.get("identity_note") or "",
+            "warnings": got.get("warnings") or [],
+            "registry_written": bool(got.get("registry_written")),
+            "seed": seed_note,
+            "persona": {
+                "stats": persona.stats(),
+                "forbidden": persona.forbidden_items(),
+                "layers": persona.layers(),
+                "changelog": persona.changelog(30),
+                "iter": persona_iter.stats(),
+                "eval": persona_eval.status(),
+                "pack": packs.stats(),
+                "packs": packs.list_packs(),
+            },
+        })
 
     @app.post(prefix + "/api/persona/undo")
     async def _persona_undo() -> JSONResponse:  # noqa: ANN202

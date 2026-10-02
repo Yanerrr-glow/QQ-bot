@@ -20,11 +20,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 PROJ = HERE.parent
 PKG = PROJ / "plugins" / "ai_chat"
 # 自定位回退：脚本被拷到别处（例如容器里的 /tmp）时，按自身位置推出来的 PROJ 是错的
-# （会推成 `/`，于是找不到 `persona/active/`）。允许用参数指定，或退到容器标准路径 `/app`。
+# （会推成 `/`，于是找不到 persona/packs/）。允许用参数指定，或退到容器标准路径 `/app`。
 if len(sys.argv) > 1:
     PROJ = pathlib.Path(sys.argv[1]).resolve()
     PKG = PROJ / "plugins" / "ai_chat"
-elif not (PROJ / "persona/active/surface.txt").is_file() and (pathlib.Path("/app") / "persona/active/surface.txt").is_file():
+elif not (PROJ / "persona" / "_registry.json").is_file() and (pathlib.Path("/app") / "persona" / "_registry.json").is_file():
     PROJ = pathlib.Path("/app")
     PKG = PROJ / "plugins" / "ai_chat"
 
@@ -43,47 +43,75 @@ def check(name, cond, detail=""):
 
 
 # ---- 造一个干净的项目根：模板放根目录，LOG_DIR 指向临时 data/ ----
+# 包化（2026-10）之后人格源在 `persona/packs/<id>/` 里，所以这里造的是**一个包**，
+# 并让 `persona/_registry.json` 指向它 —— 与真实布局同构，脚本才有意义。
 root = pathlib.Path(tempfile.mkdtemp(prefix="dsh_surface_"))
 (root / "data" / "runtime" / "persona").mkdir(parents=True)
-(root / "persona" / "active").mkdir(parents=True)
-for f in ("persona/active/surface.txt", "persona/active/base.txt", "persona/active/forbidden.txt"):
-    shutil.copy(PROJ / f, root / f)
+PACK_ID = "probe"
+(root / "persona" / "packs" / PACK_ID).mkdir(parents=True)
+for f in ("base.txt", "forbidden.txt", "surface.txt"):
+    shutil.copy(PROJ / "persona" / "packs" / "whale" / f,
+                root / "persona" / "packs" / PACK_ID / f)
+(root / "persona" / "_registry.json").write_text(
+    '{"schema": 1, "active": "%s"}\n' % PACK_ID, encoding="utf-8")
 
+# **桩要连 `packs` 一起桩**：config 现在 `from . import packs`，而 packs 自己要算
+# 项目根与 data/ 根 —— 不把它接进同一个临时 root，config 就会去读真实的 persona/packs。
 sys.modules["ai_chat"] = types.ModuleType("ai_chat")
 st = types.ModuleType("ai_chat.settings")
 st.get = lambda k, d=None: d
 sys.modules["ai_chat.settings"] = st
 
-src = (PKG / "config.py").read_text(encoding="utf-8")
-src = src.replace("_ROOT = Path(__file__).resolve().parent.parent.parent",
-                  '_ROOT = pathlib.Path(r"%s")' % root)
-src = src.replace("from nonebot import get_driver",
-                  "def get_driver():\n    raise RuntimeError('stub')")
-src = src.replace("_cfg = get_driver().config", "_cfg = types.SimpleNamespace()")
-if "import types" not in src:
-    src = src.replace("import logging", "import logging\nimport types", 1)
 
-mod = types.ModuleType("ai_chat.config")
-mod.__dict__.update({"__file__": str(PKG / "config.py"), "pathlib": pathlib, "types": types})
-sys.modules["ai_chat.config"] = mod
+def _exec_into(name: str, path: pathlib.Path, prep=None) -> types.ModuleType:
+    """把 `path` 按 `ai_chat.<x>` 的包上下文执行进一个新模块。
+
+    **必须带 `__package__ = "ai_chat"`**：这两个模块内部用的是相对导入
+    （`from . import packs`），没有包上下文时会 ImportError。
+    """
+    src = path.read_text(encoding="utf-8")
+    src = src.replace("_ROOT = Path(__file__).resolve().parent.parent.parent",
+                      '_ROOT = pathlib.Path(r"%s")' % root)
+    if "import types" not in src:
+        src = src.replace("import logging", "import logging\nimport types", 1)
+    if prep is not None:
+        src = prep(src)
+    mod = types.ModuleType(name)
+    mod.__dict__.update({"__file__": str(path), "__package__": "ai_chat",
+                         "pathlib": pathlib, "types": types})
+    sys.modules[name] = mod
+    exec(compile(src, path.name, "exec"), mod.__dict__)
+    return mod
+
+
+def _stub_driver(src: str) -> str:
+    """把 config 的 `get_driver()` 换成不需要 nonebot 的桩。"""
+    src = src.replace("from nonebot import get_driver",
+                      "def get_driver():\n    raise RuntimeError('stub')")
+    return src.replace("_cfg = get_driver().config", "_cfg = types.SimpleNamespace()")
+
+
+_exec_into("ai_chat.packs", PKG / "packs.py")
+
 try:
-    exec(compile(src, "config.py", "exec"), mod.__dict__)
+    c = _exec_into("ai_chat.config", PKG / "config.py", prep=_stub_driver)
 except Exception as exc:  # noqa: BLE001
     print("加载 config 失败:", type(exc).__name__, exc)
     sys.exit(1)
-c = sys.modules["ai_chat.config"]
 
 print("-- 1. 路径归属 --")
-check("读写路径在 data/runtime/persona/ 内（卷内持久化）",
-      c.surface_file_path().parent == root / "data" / "runtime" / "persona", c.surface_file_path())
-check("模板路径在项目根（只作播种用）",
-      c.surface_seed_path().parent == root, c.surface_seed_path())
-check("模块导入期不炸（`SYSTEM_PROMPT = compose_prompt()` 会提前调它）",
-      isinstance(c.SYSTEM_PROMPT, str))
+check("读写路径在 data/runtime/persona/<包>/ 内（卷内持久化、按包隔离）",
+      c.surface_file_path().parent == root / "data" / "runtime" / "persona" / PACK_ID,
+      c.surface_file_path())
+check("模板路径在包内（只作播种用）",
+      c.surface_seed_path().parent == root / "persona" / "packs" / PACK_ID,
+      c.surface_seed_path())
+check("惰性常量可读（不再在导入期算 `SYSTEM_PROMPT = compose_prompt()`）",
+      isinstance(c.SYSTEM_PROMPT, str) and isinstance(c.BASE_PROMPT, str))
 
 print("-- 2. 首次启动：播种 --")
 msg = c.seed_surface()
-check("播种到 data/runtime/persona/", c.surface_file_path().exists(), msg)
+check("播种到 data/runtime/persona/<包>/", c.surface_file_path().exists(), msg)
 check("播种是**字节级**搬运（不引入 CRLF↔LF 差异）",
       c.surface_file_path().read_bytes() == c.surface_seed_path().read_bytes())
 check("读得到内容", len(c.load_surface()) > 0)
@@ -101,9 +129,14 @@ print("-- 4. 边界：卷被清空 / 关掉这一层 --")
 c.surface_file_path().unlink()
 c.seed_surface()
 check("卷被清空后能重新播种（退回模板）", c.surface_file_path().exists())
-c._SURFACE_CONFIGURED = ""
-check("配置为空串时不读（返回空）", c.load_surface() == "")
-check("配置为空串时播种不抛且给出说明", "关闭" in c.seed_surface())
+# 「关掉这一层」现在的做法是把显式路径写成空串**并且**没有可用的人格包；
+# 只写空串时仍会回落到当前包（那是包化的语义：路径优先、包兜底）。
+c._cfg.ai_chat_surface_file = None  # type: ignore[attr-defined]
+sys.modules["ai_chat.packs"].freeze("")
+check("没有可用包时这一层为空（返回空而不是抛）", c.load_surface() == "")
+check("没有可用包时播种不抛且给出说明", "关闭" in c.seed_surface())
+sys.modules["ai_chat.packs"].freeze(None)
+c._cfg.ai_chat_surface_file = None  # type: ignore[attr-defined]
 
 shutil.rmtree(root, ignore_errors=True)
 print()
