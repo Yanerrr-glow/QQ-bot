@@ -16,8 +16,19 @@ from typing import Any
 from PySide6 import QtCore, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 from .base import Page, StateSlice
-from .widgets import badge, esc, label, table
+from .widgets import (
+    badge,
+    busy_button,
+    danger_button,
+    esc,
+    fit_table,
+    label,
+    primary_button,
+    table,
+    toolbar,
+)
 
 CATEGORIES = ("人物画像", "事实", "群事件")
 
@@ -36,22 +47,24 @@ class MemoryPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_refresh.clicked.connect(lambda: self.load(force=True))
-        self.btn_add = QtWidgets.QPushButton("手工记一条事实")
-        self.btn_add.clicked.connect(self._add_fact)
-        self.btn_protect = QtWidgets.QPushButton("保护 / 解除")
-        self.btn_protect.setToolTip("受保护的条目不会被自动整理删除")
-        self.btn_protect.clicked.connect(self._toggle_protect)
-        self.btn_delete = QtWidgets.QPushButton("删除")
-        self.btn_delete.clicked.connect(self._delete)
-        for widget in (self.btn_refresh, self.btn_add, self.btn_protect, self.btn_delete):
-            bar.addWidget(widget)
-        bar.addStretch(1)
+        bar = toolbar("条目按类别与搜索词在本地过滤；写入与删除都会先确认")
+        self.btn_refresh = busy_button("刷新", lambda: self.load(force=True))
+        self.btn_add = primary_button("手工记一条事实", self._add_fact)
+        self.btn_protect = busy_button(
+            "保护 / 解除", self._toggle_protect,
+            tip="受保护的条目不会被自动整理删除",
+        )
+        self.btn_delete = danger_button("删除", self._delete, tip="删除选中的条目（会确认）")
+        bar.addWidget(self.btn_refresh)
+        bar.addWidget(self.btn_add)
+        bar.addWidget(self.btn_protect)
+        bar.addSpacing(theme.SPACE["lg"])
+        bar.addWidget(self.btn_delete)
         outer.addLayout(bar)
 
         filter_row = QtWidgets.QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(theme.SPACE["sm"])
         filter_row.addWidget(QtWidgets.QLabel("类别："))
         self.category = QtWidgets.QComboBox()
         self.category.addItems(list(CATEGORIES))
@@ -126,7 +139,7 @@ class MemoryPage(Page):
         for index, row in enumerate(filtered):
             for column, text in enumerate(row["cells"]):
                 self.table.setItem(index, column, QtWidgets.QTableWidgetItem(str(text)))
-        self.table.resizeColumnsToContents()
+        fit_table(self.table)
 
         self.hint.setText(
             f"事实 {esc(stats.get('facts', 0))} · 群事件 {esc(stats.get('events', 0))} · "

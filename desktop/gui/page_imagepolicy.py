@@ -15,8 +15,21 @@ from typing import Any
 
 from PySide6 import QtWidgets
 
+from . import theme
 from .base import Page, StateSlice
-from .widgets import badge, elide, esc, label, table
+from .widgets import (
+    badge,
+    busy_button,
+    danger_button,
+    elide,
+    esc,
+    fit_table,
+    ghost_button,
+    label,
+    primary_button,
+    table,
+    toolbar,
+)
 
 MODE_LABELS = {
     "normal": "正常（按全局）",
@@ -26,7 +39,10 @@ MODE_LABELS = {
 
 
 class ImagePolicyPage(Page):
-    title = "图片策略"
+    #: ⚠ 标题**不能**叫「图片策略」：那个标题归「功能」目录下的图片策略子菜单
+    #: （策略开关在那边）。本页是**会话级数据**（哪个群什么策略、怎么改），
+    #: 两个同名页会让按标题跳转二义（`goto_page` 按标题查）。
+    title = "图片策略（会话）"
     subtitle = "全局策略与会话级有效策略"
 
     def __init__(self, manager, parent=None) -> None:  # noqa: ANN001
@@ -38,31 +54,34 @@ class ImagePolicyPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_refresh.clicked.connect(lambda: self.load(force=True))
+        bar = toolbar("全局策略影响所有没有自定义策略的会话")
+        self.btn_refresh = busy_button("刷新", lambda: self.load(force=True))
         bar.addWidget(self.btn_refresh)
-        bar.addStretch(1)
         outer.addLayout(bar)
 
         # ---- 全局
         global_box = QtWidgets.QGroupBox("全局策略")
         global_layout = QtWidgets.QHBoxLayout(global_box)
+        global_layout.setContentsMargins(0, 4, 0, 0)
+        global_layout.setSpacing(theme.SPACE["sm"])
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.setMinimumWidth(180)
         global_layout.addWidget(QtWidgets.QLabel("模式："))
         global_layout.addWidget(self.mode_combo)
-        self.btn_apply_global = QtWidgets.QPushButton("应用")
-        self.btn_apply_global.clicked.connect(self._apply_global)
+        self.btn_apply_global = primary_button("应用", self._apply_global)
         global_layout.addWidget(self.btn_apply_global)
-        self.btn_forbid_all = QtWidgets.QPushButton("全部禁存")
-        self.btn_forbid_all.setToolTip("把全局策略设为「禁存」——机器人不再记住任何新图")
-        self.btn_forbid_all.clicked.connect(lambda: self._set_global("ignore"))
-        global_layout.addWidget(self.btn_forbid_all)
-        self.btn_restore_all = QtWidgets.QPushButton("撤销禁存（恢复正常）")
-        self.btn_restore_all.clicked.connect(lambda: self._set_global("normal"))
-        global_layout.addWidget(self.btn_restore_all)
         global_layout.addStretch(1)
+        global_layout.addSpacing(theme.SPACE["lg"])
+        self.btn_restore_all = ghost_button(
+            "撤销禁存（恢复正常）", lambda: self._set_global("normal")
+        )
+        global_layout.addWidget(self.btn_restore_all)
+        global_layout.addSpacing(theme.SPACE["lg"])
+        self.btn_forbid_all = danger_button(
+            "全部禁存", lambda: self._set_global("ignore"),
+            tip="把全局策略设为「禁存」——机器人不再记住任何新图",
+        )
+        global_layout.addWidget(self.btn_forbid_all)
         outer.addWidget(global_box)
 
         self.hint = label("正在读取图片策略…")
@@ -108,31 +127,48 @@ class ImagePolicyPage(Page):
         for row, conv in enumerate(all_convs):
             custom = convs.get(conv)
             effective = custom or current
-            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(conv)))
-            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(MODE_LABELS.get(str(effective), str(effective))))
+            conv_item = QtWidgets.QTableWidgetItem(str(conv))
+            conv_item.setToolTip(str(conv))
+            effective_item = QtWidgets.QTableWidgetItem(
+                MODE_LABELS.get(str(effective), str(effective))
+            )
+            effective_item.setToolTip(str(effective))
+            self.table.setItem(row, 0, conv_item)
+            self.table.setItem(row, 1, effective_item)
             self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(MODE_LABELS.get(str(custom), str(custom)) if custom else ""))
 
             holder = QtWidgets.QWidget()
             layout = QtWidgets.QHBoxLayout(holder)
-            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setContentsMargins(0, 0, theme.SPACE["sm"], 0)
+            layout.setSpacing(theme.SPACE["sm"])
             combo = QtWidgets.QComboBox()
+            combo.setMinimumWidth(150)
             for mode in modes:
                 combo.addItem(MODE_LABELS.get(mode, mode), mode)
             index = combo.findData(str(effective))
             if index >= 0:
                 combo.setCurrentIndex(index)
-            apply_button = QtWidgets.QPushButton("设置")
-            apply_button.clicked.connect(
-                lambda _=False, c=str(conv), w=combo: self._set_conv(c, str(w.currentData()))
+            apply_button = busy_button(
+                "设置",
+                lambda c=str(conv), w=combo: self._set_conv(c, str(w.currentData())),
             )
-            clear_button = QtWidgets.QPushButton("清除自定义")
-            clear_button.clicked.connect(lambda _=False, c=str(conv): self._clear_conv(c))
+            clear_button = danger_button(
+                "清除自定义", lambda c=str(conv): self._clear_conv(c)
+            )
             layout.addWidget(combo)
             layout.addWidget(apply_button)
+            layout.addSpacing(theme.SPACE["lg"])
             layout.addWidget(clear_button)
             layout.addStretch(1)
             self.table.setCellWidget(row, 3, holder)
-        self.table.resizeColumnsToContents()
+        fit_table(self.table)
+        # 三列内容都短，给固定上限；把剩余宽度让给「操作」列 ——
+        # 否则 940px 窗口下 combo + 两个按钮放不下，「清除自定义」会切字。
+        header = self.table.horizontalHeader()
+        for column, width in ((0, 70), (1, 150), (2, 90)):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(column, width)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
 
         self.hint.setText(
             f"全局：<b>{esc(MODE_LABELS.get(current, current))}</b> · 有自定义策略的会话 "

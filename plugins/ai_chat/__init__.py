@@ -184,6 +184,24 @@ _RECENT_IMAGE_TTL = 180.0  # 秒
 
 
 def _remember_image(conv: str, data: bytes) -> None:
+    """记下「这个会话最近一张能看的图」。
+
+    **必须先过尺寸闸门**：`_recent_image` 是把字节直接塞进 `image_url` 的，
+    它**不经过** `_load_first_image` 那道 `sticker_vision_max_kb` 检查。
+    2026-10-02 线上故障就是这么发生的 —— 一张 17.9MB 的 jpeg 被下载后存进这里，
+    之后该会话**每一轮**对话都带着这张超限的图去请求，视觉接口一律 400，
+    表现成「群里 @ 它反复无响应」。宁可退回纯文本（模型只知道"有人发了张图"），
+    也不能把一张注定被拒的图钉在上下文里。
+    """
+    limit_kb = float(settings.get("sticker_vision_max_kb"))
+    size_kb = len(data) / 1024
+    if size_kb > limit_kb:
+        _recent_images.pop(conv, None)
+        logger.info(
+            "最近图片不缓存：%.0fKB 超过上限 %.0fKB conv=%s（后续对话按纯文本处理）",
+            size_kb, limit_kb, conv,
+        )
+        return
     _recent_images[conv] = (time.time(), data)
 
 
@@ -356,11 +374,50 @@ async def _run_tool_calls(
     return results, used, notes
 
 
+def _strip_images(messages: list[dict]) -> list[dict]:
+    """把多模态 content 里的 `image_url` 段摘掉，只留文本。
+
+    摘干净比留一半强 —— 留一张被拒的图会继续 400，整轮回复就没了。
+    """
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        texts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        out.append({**msg, "content": "\n".join(t for t in texts if t)})
+    return out
+
+
+def _is_vision_reject(exc: BaseException) -> bool:
+    """判断这次 400 是不是「图不被接受」。
+
+    只在报错正文里同时出现图片相关字样与字段路径时才认，避免把 prompt 超长、
+    工具表不合法之类的 400 误判成图片问题（那会白扔一次重试）。
+    """
+    text = str(exc).lower()
+    return "image" in text and (
+        "unsupported" in text
+        or "invalid" in text
+        or "messages[" in text
+        or "format" in text
+    )
+
+
 async def _ask_with_tools(messages: list[dict], *, conv: str, question: str = "") -> tuple[str, list[str]]:
     """带工具循环地问一次。返回 (最终回答, 搜过的查询词)。
 
     工具有两个：`web_search`（搜）与 `web_fetch`（读链接正文）。
     **任何一步失败都退回"不带工具的普通问答"** —— 搜索挂了不该让回复整个失败。
+
+    ⚠ 「退回普通问答」时**必须先摘掉图片**：`messages` 里的图是会话级复用对象，
+    带图重试只会再撞一次同样的 400，两跳都失败的结果就是群里彻底没响应
+    （2026-10-02 线上故障的最终表现）。摘图重试 + 清掉那份毒缓存，才是真正兜住。
     """
     if not _search_tool_enabled(conv):
         return await _ask_deepseek(messages), []
@@ -384,8 +441,14 @@ async def _ask_with_tools(messages: list[dict], *, conv: str, question: str = ""
                 ),
                 timeout=config.TIMEOUT,
             )
-        except Exception:  # noqa: BLE001 - 工具调用不被支持时退回普通问答
+        except Exception as exc:  # noqa: BLE001 - 工具调用不被支持时退回普通问答
             logger.exception("带工具的请求失败，退回普通问答 conv=%s", conv)
+            if _is_vision_reject(exc):
+                # 图被接口判为非法：清掉会话级「最近图片」，再摘掉本轮的图重试一次，
+                # 否则下一轮还会拿到同一张坏图，形成"每次都 400、群里永远不回"的循环。
+                _recent_images.pop(conv, None)
+                logger.warning("图片被接口拒绝，改为纯文本重试并清掉最近图片 conv=%s", conv)
+                return await _ask_deepseek(_strip_images(messages)), queries
             return await _ask_deepseek(messages), queries
 
         if not response.choices:
@@ -1291,11 +1354,26 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
             logger.warning("DeepSeek 请求超时 conv=%s", conv)
             await _send(bot, event, config.MSG_TIMEOUT)
             return
-        except Exception:  # noqa: BLE001 - 兜底，避免单次失败拖垮整条流程
-            # 群里只说人设化的提示，技术细节留在日志里，不往群里抛
-            logger.exception("DeepSeek 调用失败 conv=%s", conv)
-            await _send(bot, event, config.MSG_ERROR)
-            return
+        except Exception as exc:  # noqa: BLE001 - 兜底，避免单次失败拖垮整条流程
+            # 【兜底】图被接口拒了也**不能就此不发话** —— 群里看到的是"被 @ 了却
+            # 一点反应都没有"，比回一句略保守的话糟得多。这里摘掉图再问最后一次，
+            # 只有这一步也失败才走「DeepSeek 调用失败」的通报。
+            if _is_vision_reject(exc):
+                _recent_images.pop(conv, None)
+                logger.warning("图片被接口拒绝，摘图后最后重试一次 conv=%s", conv)
+                try:
+                    # ⚠ 不要再 `async with _semaphore`：外层已经持有它，
+                    # 重入会自己把自己锁死（信号量只有 1 时永久挂起）。
+                    answer, searched = await _ask_deepseek(_strip_images(messages)), []
+                except Exception:  # noqa: BLE001 - 重试仍失败，落回下面的错误通报
+                    logger.exception("摘图重试仍失败 conv=%s", conv)
+                    await _send(bot, event, config.MSG_ERROR)
+                    return
+            else:
+                # 群里只说人设化的提示，技术细节留在日志里，不往群里抛
+                logger.exception("DeepSeek 调用失败 conv=%s", conv)
+                await _send(bot, event, config.MSG_ERROR)
+                return
 
     answer = _polish(answer, question=question)
     if not answer:

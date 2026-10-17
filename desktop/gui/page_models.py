@@ -15,8 +15,21 @@ from typing import Any
 from PySide6 import QtCore, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 from .base import Page
-from .widgets import badge, esc, label, plain_text_edit, table
+from .widgets import (
+    badge,
+    busy_button,
+    danger_button,
+    esc,
+    fit_table,
+    ghost_button,
+    label,
+    plain_text_edit,
+    primary_button,
+    table,
+    toolbar,
+)
 
 NEW_PROFILE_TEMPLATE = """{
   "new-profile": {
@@ -41,19 +54,26 @@ class ModelsPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        for text, slot, tip in (
-            ("刷新", lambda: self.load(force=True), "重新读取档案列表"),
-            ("切换为当前", self._activate, "把选中的档案设为当前使用的模型"),
-            ("探活（花 token）", self._probe, "向该档案发一次最小请求，确认密钥与网络可用"),
-            ("新增模板", self._new_template, "在 JSON 编辑器里插入一份新档案模板"),
-            ("删除", self._delete, "删除选中的档案（会确认）"),
-        ):
-            button = QtWidgets.QPushButton(text)
-            button.clicked.connect(slot)
-            button.setToolTip(tip)
-            bar.addWidget(button)
-        bar.addStretch(1)
+        bar = toolbar("探活会真的调一次模型（花 token），删除会先确认")
+        self.btn_refresh = busy_button("刷新", lambda: self.load(force=True), tip="重新读取档案列表")
+        self.btn_activate = busy_button(
+            "切换为当前", self._activate, tip="把选中的档案设为当前使用的模型"
+        )
+        self.btn_new = busy_button(
+            "新增模板", self._new_template, tip="在 JSON 编辑器里插入一份新档案模板"
+        )
+        self.btn_probe = danger_button(
+            "探活（花 token）", self._probe,
+            tip="向该档案发一次最小请求，确认密钥与网络可用",
+        )
+        self.btn_delete = danger_button(
+            "删除", self._delete, tip="删除选中的档案（会确认）"
+        )
+        for widget in (self.btn_refresh, self.btn_activate, self.btn_new):
+            bar.addWidget(widget)
+        bar.addSpacing(theme.SPACE["lg"])
+        bar.addWidget(self.btn_probe)
+        bar.addWidget(self.btn_delete)
         outer.addLayout(bar)
 
         self.hint = label("正在读取模型档案…")
@@ -68,13 +88,16 @@ class ModelsPage(Page):
         outer.addWidget(self.editor, 1)
 
         bottom = QtWidgets.QHBoxLayout()
-        self.btn_save = QtWidgets.QPushButton("保存整份 JSON")
-        self.btn_save.clicked.connect(self._save)
-        self.btn_reload_editor = QtWidgets.QPushButton("放弃修改，重新读取")
-        self.btn_reload_editor.clicked.connect(lambda: self.load(force=True))
-        bottom.addWidget(self.btn_save)
-        bottom.addWidget(self.btn_reload_editor)
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(theme.SPACE["sm"])
+        self.btn_save = primary_button("保存整份 JSON", self._save)
+        self.btn_reload_editor = ghost_button(
+            "放弃修改，重新读取", lambda: self.load(force=True)
+        )
         bottom.addStretch(1)
+        bottom.addWidget(self.btn_reload_editor)
+        bottom.addSpacing(theme.SPACE["lg"])
+        bottom.addWidget(self.btn_save)
         outer.addLayout(bottom)
 
     # ------------------------------------------------------------ 数据
@@ -108,7 +131,7 @@ class ModelsPage(Page):
                 widget = QtWidgets.QTableWidgetItem(text)
                 widget.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
                 self.table.setItem(row, column, widget)
-        self.table.resizeColumnsToContents()
+        fit_table(self.table)
 
         self.editor.setPlainText(editor)
         self.hint.setText(

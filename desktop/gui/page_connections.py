@@ -35,8 +35,18 @@ from ..core.targets import (
     duplicate,
 )
 from ..core.tunnel import STATE_FAILED, STATE_RUNNING, STATE_STARTING
+from . import theme
 from .base import Page, secret_notice
-from .widgets import badge, esc, label
+from .widgets import (
+    badge,
+    busy_button,
+    danger_button,
+    esc,
+    label,
+    primary_button,
+    style_form,
+    toolbar_note,
+)
 
 
 class ConnectionsPage(Page):
@@ -52,39 +62,74 @@ class ConnectionsPage(Page):
     # ------------------------------------------------------------ 界面
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(0, 0, 0, 0)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(8)
+        splitter.setHandleWidth(theme.SPACE["md"])
 
-        # ---- 左：目标列表
-        left = QtWidgets.QWidget()
-        left.setMinimumWidth(190)
+        # ---- 左：目标列表（白卡片）
+        left = QtWidgets.QFrame()
+        left.setObjectName("card")
+        # 左栏只放列表与竖排按钮：并排两个中文按钮至少需要 270px，会把右栏表单
+        # 挤到 940px 窗口下出现横向裁切。竖排后 192px 就够（复制/删除那行 160px），
+        # 右栏表单在最小窗口下也能完整显示。
+        left.setMinimumWidth(192)
         left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.addWidget(QtWidgets.QLabel("目标"))
+        left_layout.setContentsMargins(
+            theme.SPACE["md"], theme.SPACE["md"], theme.SPACE["md"], theme.SPACE["md"]
+        )
+        left_layout.setSpacing(theme.SPACE["sm"])
+        target_title = QtWidgets.QLabel("目标")
+        target_title.setObjectName("cardTitle")
+        left_layout.addWidget(target_title)
         self.target_list = QtWidgets.QListWidget()
+        self.target_list.setObjectName("flatList")
         self.target_list.currentRowChanged.connect(self._on_select)
         left_layout.addWidget(self.target_list, 1)
-        buttons = QtWidgets.QGridLayout()
-        for index, (text, slot, tip) in enumerate((
-            ("添加本机目标", lambda: self._add(MODE_LOCAL), "直连 127.0.0.1:8080（默认）"),
-            ("添加服务器目标", lambda: self._add(MODE_SSH), "经 OpenSSH 本地端口转发访问"),
-            ("复制选中", self._copy, "复制一份（新 id、新令牌引用）"),
-            ("删除选中", self._remove, "删除目标（会确认）"),
-        )):
-            button = QtWidgets.QPushButton(text)
-            button.clicked.connect(slot)
-            button.setToolTip(tip)
-            buttons.addWidget(button, index // 2, index % 2)
-        left_layout.addLayout(buttons)
+        self.btn_add_local = busy_button(
+            "添加本机目标", lambda: self._add(MODE_LOCAL), tip="直连 127.0.0.1:8080（默认）"
+        )
+        self.btn_add_server = busy_button(
+            "添加服务器目标", lambda: self._add(MODE_SSH), tip="经 OpenSSH 本地端口转发访问"
+        )
+        self.btn_copy = busy_button("复制选中", self._copy, tip="复制一份（新 id、新令牌引用）")
+        self.btn_remove = danger_button("删除选中", self._remove, tip="删除目标（会确认）")
+        for button in (self.btn_add_local, self.btn_add_server):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(theme.SPACE["sm"])
+            row.addWidget(button)
+            row.addStretch(1)       # 按钮保持 sizeHint 宽度，不拉满左栏
+            left_layout.addLayout(row)
+        edit_row = QtWidgets.QHBoxLayout()
+        edit_row.setSpacing(theme.SPACE["sm"])
+        edit_row.addWidget(self.btn_copy)
+        edit_row.addSpacing(theme.SPACE["lg"])
+        edit_row.addWidget(self.btn_remove)
+        edit_row.addStretch(1)
+        left_layout.addLayout(edit_row)
         splitter.addWidget(left)
 
-        # ---- 右：表单
+        # ---- 右：表单（白卡片，表单 label 右对齐、固定宽 110）
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(theme.SPACE["md"])
+
+        form_card = QtWidgets.QFrame()
+        form_card.setObjectName("card")
+        form_card_layout = QtWidgets.QVBoxLayout(form_card)
+        form_card_layout.setContentsMargins(
+            theme.SPACE["lg"], theme.SPACE["md"], theme.SPACE["lg"], theme.SPACE["md"]
+        )
+        form_card_layout.setSpacing(theme.SPACE["sm"])
+        form_title = QtWidgets.QLabel("连接参数")
+        form_title.setObjectName("cardTitle")
+        form_card_layout.addWidget(form_title)
+
         self.form_host = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(self.form_host)
-        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        form.setContentsMargins(0, 0, 0, 0)
+        style_form(form)
 
         self.name = QtWidgets.QLineEdit()
         self.name.editingFinished.connect(self._collect)
@@ -103,26 +148,34 @@ class ConnectionsPage(Page):
         self.prefix.editingFinished.connect(self._collect)
         form.addRow("API 前缀", self.prefix)
 
-        token_row = QtWidgets.QWidget()
-        token_layout = QtWidgets.QHBoxLayout(token_row)
-        token_layout.setContentsMargins(0, 0, 0, 0)
+        # 令牌：输入框独占一整行；三个动作放在**横跨两列**的下一行右对齐。
+        # 挤在字段列里时（940px 窗口）「清除」会被裁掉，而 `addRow(widget)` 的
+        # 单控件行会占满 label+field 两列，按钮就有完整宽度。
         self.token = QtWidgets.QLineEdit()
         self.token.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.token.setPlaceholderText("留空 = 服务端不校验令牌")
-        token_layout.addWidget(self.token, 1)
-        self.btn_save_token = QtWidgets.QPushButton("保存令牌")
-        self.btn_save_token.clicked.connect(lambda: self._save_token(session_only=False))
-        self.btn_session_token = QtWidgets.QPushButton("仅本次会话")
-        self.btn_session_token.setToolTip("只放内存，退出即失效（比降级文件更安全）")
-        self.btn_session_token.clicked.connect(lambda: self._save_token(session_only=True))
-        self.btn_clear_token = QtWidgets.QPushButton("清除")
-        self.btn_clear_token.clicked.connect(self._clear_token)
-        for widget in (self.btn_save_token, self.btn_session_token, self.btn_clear_token):
-            token_layout.addWidget(widget)
-        form.addRow("令牌", token_row)
+        form.addRow("令牌", self.token)
 
         self.token_state = QtWidgets.QLabel("-")
         form.addRow("令牌状态", self.token_state)
+
+        self.btn_save_token = busy_button(
+            "保存令牌", lambda: self._save_token(session_only=False)
+        )
+        self.btn_session_token = busy_button(
+            "仅本次会话", lambda: self._save_token(session_only=True),
+            tip="只放内存，退出即失效（比降级文件更安全）",
+        )
+        self.btn_clear_token = danger_button("清除", self._clear_token, tip="清掉已保存的令牌")
+        token_actions = QtWidgets.QHBoxLayout()
+        token_actions.setContentsMargins(0, 0, 0, 0)
+        token_actions.setSpacing(theme.SPACE["sm"])
+        token_actions.addStretch(1)
+        token_actions.addWidget(self.btn_save_token)
+        token_actions.addWidget(self.btn_session_token)
+        token_actions.addSpacing(theme.SPACE["lg"])
+        token_actions.addWidget(self.btn_clear_token)
+        form.addRow(self._wrap(token_actions))
 
         self.timeout = QtWidgets.QDoubleSpinBox()
         self.timeout.setRange(1.0, 600.0)
@@ -136,11 +189,13 @@ class ConnectionsPage(Page):
         self.verify_tls.toggled.connect(lambda _v: self._collect())
         form.addRow("", self.verify_tls)
 
-        right_layout.addWidget(self.form_host)
+        form_card_layout.addWidget(self.form_host)
+        right_layout.addWidget(form_card)
 
         # ---- SSH 段（只有隧道目标才显示）
         self.ssh_box = QtWidgets.QGroupBox("SSH 隧道")
         ssh_form = QtWidgets.QFormLayout(self.ssh_box)
+        style_form(ssh_form)
 
         # 别名模式排在最前：项目里早就有 `启动隧道.ps1` 写好的 `Host qqbot`，
         # 复用它就不用在 GUI 里再抄一遍服务器 IP 与私钥路径。
@@ -157,9 +212,10 @@ class ConnectionsPage(Page):
         alias_layout = QtWidgets.QHBoxLayout(alias_row)
         alias_layout.setContentsMargins(0, 0, 0, 0)
         alias_layout.addWidget(self.ssh_alias, 1)
-        self.btn_scan_aliases = QtWidgets.QPushButton("读 ~/.ssh/config")
-        self.btn_scan_aliases.setToolTip("列出本机 ssh 配置里的 Host 别名，点一个就填上")
-        self.btn_scan_aliases.clicked.connect(self._pick_alias)
+        self.btn_scan_aliases = busy_button(
+            "读 ~/.ssh/config", self._pick_alias,
+            tip="列出本机 ssh 配置里的 Host 别名，点一个就填上",
+        )
         alias_layout.addWidget(self.btn_scan_aliases)
 
         self.ssh_host = QtWidgets.QLineEdit()
@@ -202,35 +258,37 @@ class ConnectionsPage(Page):
         ssh_form.addRow("保活间隔", self.ssh_alive)
 
         tunnel_buttons = QtWidgets.QHBoxLayout()
-        self.btn_tunnel_start = QtWidgets.QPushButton("启动隧道")
-        self.btn_tunnel_start.clicked.connect(self._start_tunnel)
-        self.btn_tunnel_stop = QtWidgets.QPushButton("停止隧道")
-        self.btn_tunnel_stop.clicked.connect(self._stop_tunnel)
-        self.btn_tunnel_check = QtWidgets.QPushButton("检查状态")
-        self.btn_tunnel_check.clicked.connect(self._check_tunnel)
-        self.btn_ssh_cmd = QtWidgets.QPushButton("显示 ssh 命令")
-        self.btn_ssh_cmd.setToolTip("复制隧道命令，并显示在下方内嵌终端")
-        self.btn_ssh_cmd.clicked.connect(self._show_command)
+        tunnel_buttons.setContentsMargins(0, 0, 0, 0)
+        tunnel_buttons.setSpacing(theme.SPACE["sm"])
+        self.btn_tunnel_start = busy_button("启动隧道", self._start_tunnel)
+        self.btn_tunnel_stop = busy_button("停止隧道", self._stop_tunnel)
+        self.btn_tunnel_check = busy_button("检查状态", self._check_tunnel)
+        self.btn_ssh_cmd = busy_button(
+            "显示 ssh 命令", self._show_command, tip="复制隧道命令，并显示在下方内嵌终端"
+        )
+        tunnel_buttons.addWidget(toolbar_note("隧道进程只在本次运行内有效"))
+        tunnel_buttons.addStretch(1)
         for widget in (self.btn_tunnel_start, self.btn_tunnel_stop, self.btn_tunnel_check, self.btn_ssh_cmd):
             tunnel_buttons.addWidget(widget)
-        tunnel_buttons.addStretch(1)
         ssh_form.addRow("", self._wrap(tunnel_buttons))
         right_layout.addWidget(self.ssh_box)
 
         # 内嵌终端已独立成「终端」页（与「总览」同级，见 `page_terminal.py`）：
         # 隧道诊断输出与服务器命令是跨目标通用的工具，不该埋在某一个目标的表单下面。
 
-        # ---- 底部：连接动作与状态
+        # ---- 底部：连接动作与状态（左说明、右操作；保存是本页唯一主操作）
         actions = QtWidgets.QHBoxLayout()
-        self.btn_test = QtWidgets.QPushButton("测试连接")
-        self.btn_test.clicked.connect(self._probe)
-        self.btn_activate = QtWidgets.QPushButton("切换到此目标")
-        self.btn_activate.clicked.connect(self._activate)
-        self.btn_save = QtWidgets.QPushButton("保存配置")
-        self.btn_save.clicked.connect(self._save)
-        for widget in (self.btn_test, self.btn_activate, self.btn_save):
-            actions.addWidget(widget)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(theme.SPACE["sm"])
+        self.btn_test = busy_button("测试连接", self._probe)
+        self.btn_activate = busy_button("切换到此目标", self._activate)
+        self.btn_save = primary_button("保存配置", self._save)
+        actions.addWidget(toolbar_note("当前目标的连接动作"))
         actions.addStretch(1)
+        actions.addWidget(self.btn_test)
+        actions.addWidget(self.btn_activate)
+        actions.addSpacing(theme.SPACE["lg"])
+        actions.addWidget(self.btn_save)
         right_layout.addLayout(actions)
 
         self.status = label("未选择目标")
@@ -252,6 +310,7 @@ class ConnectionsPage(Page):
         right_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         right_scroll.setWidget(right)
         splitter.addWidget(right_scroll)
+        # 左栏按钮已竖排，210px 够用；右栏拿大头，940px 窗口下表单与令牌按钮才不裁切。
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 5)
         outer.addWidget(splitter, 1)

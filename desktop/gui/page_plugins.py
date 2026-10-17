@@ -18,7 +18,18 @@ from ..core.util import one_line
 from ..sdk.loader import PluginState
 from ..sdk.permissions import PERMISSIONS
 from .base import Page
-from .widgets import badge, esc, label, plain_text_edit, table
+from .widgets import (
+    badge,
+    busy_button,
+    esc,
+    fit_table,
+    ghost_button,
+    label,
+    plain_text_edit,
+    primary_button,
+    table,
+    toolbar,
+)
 
 
 class PluginsPage(Page):
@@ -33,18 +44,16 @@ class PluginsPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("重新扫描")
-        self.btn_refresh.setToolTip("重新读 desktop/plugins/ 下的 manifest（不热重载已加载的插件）")
-        self.btn_refresh.clicked.connect(self._rescan)
-        self.btn_toggle = QtWidgets.QPushButton("启用 / 禁用")
-        self.btn_toggle.clicked.connect(self._toggle)
-        self.btn_details = QtWidgets.QPushButton("查看详情")
-        self.btn_details.clicked.connect(self._details)
+        bar = toolbar("插件来源、权限与启停（完全卸载需要重启桌面程序）")
+        self.btn_refresh = primary_button(
+            "重新扫描", self._rescan,
+            tip="重新读 desktop/plugins/ 下的 manifest（不热重载已加载的插件）",
+        )
+        self.btn_toggle = busy_button("启用 / 禁用", self._toggle)
+        self.btn_details = ghost_button("查看详情", self._details)
         bar.addWidget(self.btn_refresh)
         bar.addWidget(self.btn_toggle)
         bar.addWidget(self.btn_details)
-        bar.addStretch(1)
         outer.addLayout(bar)
 
         self.hint = label("正在读取插件列表…")
@@ -85,10 +94,20 @@ class PluginsPage(Page):
             for column, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(str(text))
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+                if column in (4, 5, 6):
+                    # 权限/来源目录/说明可能很长：列宽有上限，完整内容放 tooltip。
+                    item.setToolTip(str(text))
                 if record.state == PluginState.FAILED and column == 3:
                     item.setForeground(QtCore.Qt.GlobalColor.red)
                 self.table.setItem(row, column, item)
-        self.table.resizeColumnsToContents()
+        fit_table(self.table)
+        header = self.table.horizontalHeader()
+        # 来源目录是绝对路径，按内容定宽会把「说明」挤出屏幕（实测出现横向滚动条）。
+        # 权限与来源目录给固定上限，说明列吃剩余宽度；完整文本在 tooltip 里。
+        for column, width in ((4, 200), (5, 150)):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(column, width)
+        header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.hint.setText(
             f"根目录 <code>{esc(summary['root'])}</code> · 共 {esc(summary['total'])} 个 · "
             f"已激活 {esc(summary['states'].get('active', 0))} 个 · "

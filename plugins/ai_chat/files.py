@@ -184,7 +184,7 @@ def download_bytes(url: str, timeout: float = 25.0) -> bytes:
     errors: list[str] = []
 
     # ⓪ **先过公网校验**（2026-09-28 补）：群文件的 url 是外部可控输入，
-    #    不过这道门就能让容器去访问 searxng / 169.254.169.254 这类内网目标。
+    #    不过这道门就能让容器去访问内网服务 / 169.254.169.254 这类目标。
     #    放在最前面是为了让**四条传输路径**（含 curl 那条无法单独插检查的）都被覆盖。
     ok, why = netguard.check_url(url)
     if not ok:

@@ -77,7 +77,10 @@ $url = "http://127.0.0.1:$port/ai/"
 $helper = 'for($i=0;$i -lt 60;$i++){try{$c=New-Object Net.Sockets.TcpClient;' +
           '$c.Connect("127.0.0.1",' + $port + ');$c.Close();Start-Process "' + $url + '";break}' +
           'catch{Start-Sleep -Milliseconds 500}}'
-Start-Process -WindowStyle Hidden -FilePath 'powershell' `
+# 辅助进程解释器：优先 pwsh 7（按 PATH 解析），回落 inbox 的 powershell
+$psHost = (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $psHost) { $psHost = 'powershell' }
+Start-Process -WindowStyle Hidden -FilePath $psHost `
     -ArgumentList @('-NoProfile', '-Command', $helper) | Out-Null
 
 # ---------------------------------------------------------------- 5. 前台起机器人

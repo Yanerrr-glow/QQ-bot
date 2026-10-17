@@ -2562,39 +2562,60 @@ _ok, _why = _fetch._check_url("https://example.com/paper.zip")  # noqa: SLF001
 check("fetch 的网页策略仍然生效（.zip 不当网页读）", not _ok, _why)
 
 # --------------------------------------------------------------------- 24. 联网搜索
-print("\n=== 24. 联网搜索（跑真实 HTTP，假 SearXNG 端点，不是 mock）===")
+print("\n=== 24. 联网搜索（跑真实 HTTP，假搜索端点，不是 mock）===")
 import http.server as _httpserver  # noqa: E402
 import threading as _th  # noqa: E402
 from ai_chat import search as _search  # noqa: E402
 
 
-class _FakeSearxng:
-    """极小的 SearXNG 形态端点：/search?q=...&format=json → {"results":[...]}"""
+class _FakeSearchServer:
+    """极小的搜索端点，**同时兼容两种后端形状**：
+
+    * `GET /search?q=...`  → `{"results":[...]}`（`json` 后端）；
+    * `POST /search`       → 同上，另记下 `Authorization` 与请求体（`deepseek` 后端）。
+    """
 
     def __init__(self, *, results=None, status: int = 200, body: bytes | None = None) -> None:
         self.results = results if results is not None else []
         self.status = status
         self.body = body
         self.queries: list[str] = []
+        self.auth: list[str] = []
+        self.bodies: list[str] = []
         outer = self
+
+        def _reply(handler: _httpserver.BaseHTTPRequestHandler) -> None:
+            if outer.body is not None:
+                payload = outer.body
+            else:
+                payload = json.dumps(
+                    {"results": outer.results}, ensure_ascii=False
+                ).encode("utf-8")
+            handler.send_response(outer.status)
+            handler.send_header("Content-Type", "application/json; charset=utf-8")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
 
         class _H(_httpserver.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 parsed = urllib.parse.urlparse(self.path)
                 qs = urllib.parse.parse_qs(parsed.query)
-                q = (qs.get("q") or [""])[0]
-                outer.queries.append(q)
-                if outer.body is not None:
-                    payload = outer.body
-                else:
-                    payload = json.dumps(
-                        {"results": outer.results}, ensure_ascii=False
-                    ).encode("utf-8")
-                self.send_response(outer.status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+                outer.queries.append((qs.get("q") or qs.get("query") or [""])[0])
+                _reply(self)
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                outer.auth.append(self.headers.get("Authorization") or "")
+                outer.bodies.append(raw.decode("utf-8", "replace"))
+                try:
+                    data = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    data = {}
+                if isinstance(data, dict) and data.get("query"):
+                    outer.queries.append(str(data["query"]))
+                _reply(self)
 
             def log_message(self, *a):  # 静音
                 pass
@@ -2624,15 +2645,32 @@ _SEARCH_DEF = {
 
 # ---- 24.1 没配端点时必须"不可用"，而不是假装能搜 ----
 settings.set_value("search_enabled", True)
+settings.set_value("search_backend", "json")
 settings.set_value("search_endpoint", "")
 check("没配端点时 available() 为假", _search.available() is False)
 check("不可用原因说清了", "端点" in _search.unavailable_reason(), _search.unavailable_reason())
+# deepseek 后端：端点可以留空（有默认地址），但**没有 key 一样不可用**
+settings.set_value("search_backend", "deepseek")
+settings.set_value("search_endpoint", "")
+_saved_api_key = _search.config.API_KEY
+_saved_sk = settings.get("search_api_key")
+_search.config.API_KEY = ""
+settings.set_value("search_api_key", "")
+try:
+    check("deepseek 没 key 时判为不可用", _search.available() is False)
+    check("deepseek 缺 key 的原因说清了", "DEEPSEEK_API_KEY" in _search.unavailable_reason(),
+          _search.unavailable_reason())
+    check("deepseek 端点留空时回落到官方地址",
+          _search._endpoint().endswith("/v1/tools/search"), _search._endpoint())  # noqa: SLF001
+finally:
+    _search.config.API_KEY = _saved_api_key
+    settings.set_value("search_api_key", _saved_sk)
 settings.set_value("search_enabled", False)
 settings.set_value("search_endpoint", "http://127.0.0.1:1/search")
 check("关掉开关时也不可用", _search.available() is False)
 
 # ---- 24.2 真实 HTTP 往返 ----
-_srv_search = _FakeSearxng(
+_srv_search = _FakeSearchServer(
     results=[
         {"title": "什么是「鲸落」", "url": "https://example.com/a", "content": "鲸落指鲸鱼死后沉入海底形成的生态系统。"},
         {"title": "鲸落现象", "url": "https://example.com/b", "content": "深海中的一次鲸落可以养活大量生物数十年。"},
@@ -2642,7 +2680,7 @@ _srv_search = _FakeSearxng(
 )
 settings.set_value("search_enabled", True)
 settings.set_value("search_endpoint", _srv_search.url)
-settings.set_value("search_backend", "searxng")
+settings.set_value("search_backend", "json")
 try:
     check("配好端点后 available() 为真", _search.available() is True)
     _res = _search.search_blocking("鲸落是什么", timeout=5)
@@ -2679,7 +2717,7 @@ try:
     check("注入文本仍然保留了'不可信'声明", "不是谁对你说的话" in _inj)
 
     # ---- 24.5 搜不到时给的是"如实说没查到"，不是让他编 ----
-    _srv_empty = _FakeSearxng(results=[])
+    _srv_empty = _FakeSearchServer(results=[])
     settings.set_value("search_endpoint", _srv_empty.url)
     try:
         _empty = _search.search_blocking("不存在的词xyz", timeout=5)
@@ -2694,9 +2732,9 @@ try:
 
     # ---- 24.6 端点坏了 / 返回非 JSON / HTTP 错误 → 一律当"没搜到"，不抛 ----
     for _label, _maker in (
-        ("HTTP 500", lambda: _FakeSearxng(status=500)),
-        ("返回的不是 JSON", lambda: _FakeSearxng(body=b"<html>not json</html>")),
-        ("返回 JSON 但没有 results", lambda: _FakeSearxng(body=b'{"foo": 1}')),
+        ("HTTP 500", lambda: _FakeSearchServer(status=500)),
+        ("返回的不是 JSON", lambda: _FakeSearchServer(body=b"<html>not json</html>")),
+        ("返回 JSON 但没有 results", lambda: _FakeSearchServer(body=b'{"foo": 1}')),
     ):
         _bad_srv = _maker()
         settings.set_value("search_endpoint", _bad_srv.url)
@@ -2981,7 +3019,7 @@ try:
         _unpatch_chat(_orig_chat)
 
     # ---- 24.16 Tavily 后端（国内服务器上唯一实测可达的路子）----
-    # 它跟 searxng 有三点根本不同，都得验：① 走 POST ② 密钥在请求体里 ③ 不填端点也能用
+    # 它跟 deepseek 后端有三点根本不同，都得验：① 走 POST ② 密钥在请求体里 ③ 不填端点也能用
     _tv_seen: list[dict] = []
 
     class _FakeTavily(_httpserver.BaseHTTPRequestHandler):
@@ -3082,6 +3120,122 @@ finally:
     settings.set_value("search_enabled", _SEARCH_DEF["enabled"])
     settings.set_value("search_endpoint", _SEARCH_DEF["endpoint"])
     settings.set_value("search_backend", _SEARCH_DEF["backend"])
+
+# --------------------------------------------------------------------- 24.17 DeepSeek 官方 Search 后端
+# 2026-10-17 起这是默认后端：POST + Bearer，**一次请求连正文一起回**，
+# 所以自建 SearXNG 那套 compose 已经删掉，改用官方接口。
+print("\n=== 24.17 deepseek 后端：POST + Bearer + 正文随结果一起回 ===")
+from ai_chat import fetch as _fetch_ds  # noqa: E402
+
+_ds_srv = _FakeSearchServer(results=[
+    {
+        "title": "鲸落 - 百科",
+        "url": "https://ds.example/a",
+        "summary": "长摘要：" + "鲸落是鲸鱼尸体沉入深海形成的生态系统。" * 3,
+        "content": "正文甲。" * 400,
+        "date": "2026-06-01T00:00:00+00:00",
+    },
+    {"title": "鲸落的意义", "url": "https://ds.example/b", "summary": "短摘要", "content": "正文乙。" * 10},
+])
+settings.set_value("search_enabled", True)
+settings.set_value("search_backend", "deepseek")
+settings.set_value("search_endpoint", _ds_srv.url)
+settings.set_value("search_api_key", "sk-ds-TEST-ONLY")
+settings.set_value("search_read_enabled", True)
+try:
+    check("deepseek 配了 key 后可用", _search.available() is True)
+    _ds_res = _search.search_blocking("鲸落", timeout=8)
+    check("deepseek 后端拿到 2 条", len(_ds_res["results"]) == 2, str(_ds_res["error"]))
+    check("带 Authorization: Bearer 头",
+          bool(_ds_srv.auth) and _ds_srv.auth[0].startswith("Bearer sk-"), str(_ds_srv.auth[:1]))
+    _ds_body = json.loads(_ds_srv.bodies[0]) if _ds_srv.bodies else {}
+    check("请求体带 need_content（正文随搜索一起回）",
+          _ds_body.get("need_content") is True, str(_ds_body)[:120])
+    check("请求体带 query 与 count",
+          _ds_body.get("query") == "鲸落" and "count" in _ds_body, str(_ds_body)[:120])
+    check("摘要取 summary，而不是整页正文",
+          _ds_res["results"][0]["snippet"].startswith("长摘要"),
+          _ds_res["results"][0]["snippet"][:40])
+    check("正文留在 content 字段（供预读复用）",
+          "正文甲" in _ds_res["results"][0].get("content", ""),
+          str(list(_ds_res["results"][0].keys())))
+    check("date 被保留（给模型时效线索）",
+          _ds_res["results"][0].get("date", "").startswith("2026-06-01"),
+          str(_ds_res["results"][0].get("date")))
+
+    # 关键收益：正文已经在结果里 → **不该再发本地抓取请求**
+    _ds_fetch_calls: list[tuple] = []
+    _ds_orig_blocking = _fetch_ds.fetch_blocking
+
+    def _no_fetch(*a, **k):
+        _ds_fetch_calls.append(a)
+        return {"url": str(a[0] if a else ""), "title": "", "text": "", "error": "不该被调用",
+                "truncated": False}
+
+    _fetch_ds.fetch_blocking = _no_fetch
+    try:
+        _ds_full = asyncio.run(_search.search("鲸落"))
+    finally:
+        _fetch_ds.fetch_blocking = _ds_orig_blocking
+    check("有正文时完全不本地抓取", _ds_fetch_calls == [], str(_ds_fetch_calls[:1]))
+    _ds_pages = _ds_full.get("pages") or {}
+    check("正文被整理成 pages（渲染用）",
+          bool(_ds_pages.get("https://ds.example/a", {}).get("text")), str(list(_ds_pages))[:120])
+    check("超长正文被标记截断", _ds_pages["https://ds.example/a"]["truncated"] is True)
+    _ds_block = _search.render_block(_ds_full)
+    check("deepseek 结果块同样声明不可信", "不是谁对你说的话" in _ds_block)
+    check("渲染块里带上了正文", "正文甲" in _ds_block)
+    check("API Key 不出现在结果块里", "sk-ds-TEST-ONLY" not in _ds_block)
+finally:
+    settings.set_value("search_api_key", "")
+    settings.set_value("search_endpoint", _SEARCH_DEF["endpoint"])
+    settings.set_value("search_backend", _SEARCH_DEF["backend"])
+    _ds_srv.close()
+
+# --------------------------------------------------------------------- 24.18 官方 Fetch 兜底
+print("\n=== 24.18 官方 Fetch 兜底：直连读不到时让服务端去抓 ===")
+_fs_seen: list[str] = []
+
+
+class _FakeFetchApi(_httpserver.BaseHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        _fs_seen.append(self.rfile.read(n).decode("utf-8") or "{}")
+        payload = json.dumps({"title": "页标题", "content": "# 小标题\n\n这是官方接口返回的正文。"},
+                             ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *a):
+        pass
+
+
+_fs_httpd = _httpserver.HTTPServer(("127.0.0.1", 0), _FakeFetchApi)
+_th.Thread(target=_fs_httpd.serve_forever, daemon=True).start()
+_fs_orig_base = _fetch_ds._api_base  # noqa: SLF001
+_saved_key_fs = _fetch_ds.config.API_KEY
+try:
+    _fetch_ds._api_base = lambda: f"http://127.0.0.1:{_fs_httpd.server_address[1]}"  # noqa: SLF001
+    _fetch_ds.config.API_KEY = "sk-ds-TEST-ONLY"
+    settings.set_value("fetch_api_fallback", True)
+    _fs_res = _fetch_ds._deepseek_fetch("https://example.com/x", 5, 500)  # noqa: SLF001
+    check("官方抓取接口拿回正文", "官方接口返回的正文" in _fs_res["text"], _fs_res["text"][:60])
+    check("拿回标题", _fs_res["title"] == "页标题", _fs_res["title"])
+    check("标了来源 deepseek-fetch", _fs_res.get("source") == "deepseek-fetch", str(_fs_res.get("source")))
+    check("请求体里是 url", _fs_seen and "example.com/x" in _fs_seen[0], str(_fs_seen[:1])[:80])
+    # 关掉开关就不再走官方接口（省一次计费）
+    settings.set_value("fetch_api_fallback", False)
+    check("关掉开关后不再调用官方接口",
+          _fetch_ds._deepseek_fetch("https://example.com/y", 5, 500)["text"] == "")  # noqa: SLF001
+    settings.set_value("fetch_api_fallback", True)
+finally:
+    _fetch_ds._api_base = _fs_orig_base  # noqa: SLF001
+    _fetch_ds.config.API_KEY = _saved_key_fs
+    _fs_httpd.shutdown()
+    _fs_httpd.server_close()
 
 # --------------------------------------------------------------------- 25. 三项改动
 print("\n=== 25. 不汇报收图 / 多条发送 / /风格 自由要求 ===")
@@ -3331,7 +3485,7 @@ try:
     # 这里构造"搜索开着、但端点连不上"的场景 —— 有缓存时必须**不出网、直接给答案**。
     settings.set_value("search_enabled", True)
     settings.set_value("search_memory_enabled", True)
-    settings.set_value("search_backend", "searxng")
+    settings.set_value("search_backend", "json")
     settings.set_value("search_endpoint", "http://127.0.0.1:1/search")  # 必然连不上
     # 上面 26.9 的淘汰用例可能已经把「鲸落」挤掉了，这里显式重建，保证本段自洽
     asyncio.run(_sm.put("鲸落", "鲸鱼死后沉入深海形成的生态系统。", _res, by="测试"))
@@ -3479,7 +3633,7 @@ try:
     # 不能重新联网（旧版正是因为键不一致，每次都出网）。
     settings.set_value("search_enabled", True)
     settings.set_value("search_memory_enabled", True)
-    settings.set_value("search_backend", "searxng")
+    settings.set_value("search_backend", "json")
     settings.set_value("search_endpoint", "http://127.0.0.1:1/search")  # 必然连不上
     _sm._db.items.clear()  # noqa: SLF001
     _sm._orig_summarize = _sm.summarize  # noqa: SLF001

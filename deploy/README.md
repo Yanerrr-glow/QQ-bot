@@ -424,33 +424,34 @@ rm -rf /var/lib/qqbot-watchdog
 
 ---
 
-## 6.6 搜索后端：自建 SearXNG（**另一套 compose，别混进来**）
+## 6.6 搜索后端：官方 Search 接口（**不再需要自建 SearXNG**）
 
-联网搜索需要一个能出 JSON 的 SearXNG 实例。公共实例在国内服务器上不可用
-（DNS 只给 IPv6 + 大多关了 JSON 输出），所以在**同一台服务器上又开了一个独立容器**。
+2026-10-17 起 DeepSeek 开放了自研的网页搜索与抓取接口，一次请求就能连正文一起拿回来：
 
-| | bot 栈 | 搜索栈 |
-|---|---|---|
-| 位置 | `/opt/qq-bot/deploy/docker-compose.yml` | `/opt/searxng/docker-compose.yml` |
-| 项目名 | `qq-ai-chat` | `searxng` |
-| 互相可见 | 通过外部网络 `qq-ai-chat_botnet` | 同左 |
+| 接口 | 端点 | 用途 | 计费 |
+|---|---|---|---|
+| Search | `POST /v1/tools/search` | 按 query 搜；`need_content=true` 时**连正文一起回** | 5 元 / 1000 次成功请求 |
+| Fetch | `POST /v1/tools/fetch` | 直连读不到时让服务端去抓，回 Markdown | 同上 |
 
-**两套编排刻意分开**：升级或重启搜索后端**绝不能碰 NapCat** ——
-扫码状态与 `napcat` 容器绑定，一次误操作就要重新扫码、甚至触发风控。
+因此**原先自建 SearXNG 的那套 compose 已经删除**（仓库里不再有 `deploy/searxng/`，
+服务器上的 `/opt/searxng` 也不需要了）：不再占那 512MB 内存、不用再挑引擎、
+不用管镜像加速器与 JSON 输出开关。
 
-配置模板在本仓库的 `deploy/searxng/`（含 `settings.yml` 与引擎实测结论）。
-完整落地步骤、两个必踩的坑（镜像 tag、引擎全开导致 0 结果）见
-[`searxng/README.md`](searxng/README.md)。
-
-bot 侧对应配置：
+bot 侧对应配置（只留这几行，key 复用 `DEEPSEEK_API_KEY`）：
 
 ```
 AI_CHAT_SEARCH_ENABLED=true
-AI_CHAT_SEARCH_BACKEND=searxng
-AI_CHAT_SEARCH_ENDPOINT=http://searxng:8080     # 容器名，不是 127.0.0.1
+AI_CHAT_SEARCH_BACKEND=deepseek
+AI_CHAT_SEARCH_ENDPOINT=            # 留空：用 DEEPSEEK_BASE_URL + /v1/tools/search
+AI_CHAT_FETCH_API_FALLBACK=true     # 直连被反爬挡住时让服务端去抓
 ```
 
-> **改完代码只重建 bot**，搜索栈不用管；反过来重启搜索栈也不需要动 bot。
+> 旧 `.env` 里若还写着 `AI_CHAT_SEARCH_BACKEND=searxng`，代码会**静默回落到 `deepseek`**
+> （不会判成"不可用"让群里突然查不了东西）。改完执行
+> `docker compose up -d --force-recreate bot`，确认日志里出现 `搜索完成：… → N 条`。
+
+抓取顺序随之变成三级：**本机直连（免费）→ 官方 Fetch（一次往返）→ 浏览器渲染 + OCR（最后手段）**。
+前两级都拿不到时才去起 Chromium，所以渲染兜底的实际触发频率会低很多。
 
 ---
 
@@ -585,7 +586,6 @@ journalctl -u qqbot -f
 | `deploy/.env.server` | 服务器配置模板（反向 WS 版） |
 | `deploy/ai-chat-bot.service` | systemd 单元（备选方案用） |
 | `deploy/watchdog.sh` + `deploy/qqbot-watchdog.{service,timer}` | NapCat 掉线自动恢复（见 6.5） |
-| `deploy/searxng/` | 自建搜索后端（另一套 compose，见 6.6） |
 | `deploy/README.md` | 本文档 |
 
 **没改**：`bot.py` 与 `plugins/` 里的任何代码。本地那套 `.env` + `_工具链\*.ps1` 照旧能用 —— 服务器和本地是两条独立的配置路径。

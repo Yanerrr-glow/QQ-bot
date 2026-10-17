@@ -17,8 +17,17 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 from .base import Page, StateSlice
-from .widgets import PALETTE, badge, esc, label
+from .widgets import (
+    PALETTE,
+    badge,
+    busy_button,
+    danger_button,
+    esc,
+    label,
+    toolbar,
+)
 
 THUMB_SIZE = 96
 
@@ -94,24 +103,25 @@ class StickersPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_refresh.clicked.connect(lambda: self.load(force=True))
-        self.btn_load_thumbs = QtWidgets.QPushButton("加载缩略图")
-        self.btn_load_thumbs.setToolTip("经认证会话逐张取图（服务端慢时不会卡界面）")
-        self.btn_load_thumbs.clicked.connect(self._load_thumbnails)
-        self.btn_delete = QtWidgets.QPushButton("删除选中")
-        self.btn_delete.clicked.connect(self._delete)
-        bar.addWidget(self.btn_refresh)
-        bar.addWidget(self.btn_load_thumbs)
-        bar.addWidget(self.btn_delete)
+        bar = toolbar("缩略图按需加载，取图不会卡住界面")
+        self.btn_refresh = busy_button("刷新", lambda: self.load(force=True))
+        self.btn_load_thumbs = busy_button(
+            "加载缩略图", self._load_thumbnails,
+            tip="经认证会话逐张取图（服务端慢时不会卡界面）",
+        )
+        self.btn_delete = danger_button("删除选中", self._delete)
         bar.addWidget(QtWidgets.QLabel("列数："))
         self.columns = QtWidgets.QSpinBox()
         self.columns.setRange(2, 12)
         self.columns.setValue(6)
+        self.columns.setFixedWidth(72)
         self.columns.valueChanged.connect(lambda _value: self._relayout())
         bar.addWidget(self.columns)
-        bar.addStretch(1)
+        bar.addSpacing(theme.SPACE["lg"])
+        bar.addWidget(self.btn_refresh)
+        bar.addWidget(self.btn_load_thumbs)
+        bar.addSpacing(theme.SPACE["lg"])
+        bar.addWidget(self.btn_delete)
         outer.addLayout(bar)
 
         self.hint = label("正在读取表情包库…")

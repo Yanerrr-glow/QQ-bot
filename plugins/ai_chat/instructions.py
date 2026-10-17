@@ -988,7 +988,7 @@ async def _cmd_search(rest: str, *, conv: str, is_master: bool, ctx: Any = None)
             return _say(
                 "search",
                 f"联网搜索现在不可用：{st['reason']}。\n"
-                "（在控制台「联网搜索」组里配置端点；SearXNG 实例需要开启 json 格式输出）",
+                "（在控制台「联网搜索」组里配好端点；deepseek 后端要确认 DEEPSEEK_API_KEY 已配）",
             )
         return _say(
             "search",

@@ -6,7 +6,7 @@
 它守的是 2026-09-28 补上的那道口子：改造前只有 `fetch.py` 有完整防护，
 而 `files.download_bytes()` / `files._download_via_ips()` / `stickers._download()`
 **都不过校验** —— 群文件 url、图片段 url/file 是外部可控输入，
-于是可以让容器去访问 `http://searxng:8080`、`http://169.254.169.254`（云元数据）。
+于是可以让容器去访问 `http://napcat:6099`、`http://169.254.169.254`（云元数据）。
 """
 from __future__ import annotations
 

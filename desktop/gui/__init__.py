@@ -4,7 +4,9 @@
     main_window.py  导航 + 顶部状态 + 页面栈 + 插件导航
     widgets.py      配色、控件工厂、后台任务（QThreadPool）、确认框
     base.py         页面基类与 `GET /api/state` 的取用助手
-    page_*.py       各内置页面
+    params_view.py  按 `settings.describe()` 的分组渲染参数表单（「参数」页与功能子菜单共用）
+    features/       「功能」目录：中心页 + 每个功能一个子菜单（catalog / panels / page_hub / page_feature）
+    page_*.py       顶层页面（总览 / 终端 / 参数 / 模型 / 记忆 / 图片策略（会话）/ 表情包 / 连接 / 插件）
 
 约定：**页面只通过 ConnectionManager 说话**，不读配置文件、不碰运行数据。
 

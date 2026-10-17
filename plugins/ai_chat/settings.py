@@ -288,9 +288,15 @@ _SPECS: list[Spec] = [
     Spec("sticker_vision", bool, "ai_chat_sticker_vision", True, "让模型真看图打分", "表情包",
          hint="deepseek-flash / deepseek-chat 支持读图；deepseek-v4-pro 不接受读图"
               "（接口收得下图片，模型会回「我无法查看这张图片」），开了也白花 token"),
-    Spec("sticker_vision_max_kb", int, "ai_chat_sticker_vision_max_kb", 800,
+    Spec("sticker_vision_max_kb", int, "ai_chat_sticker_vision_max_kb", 4096,
          "传图给模型的大小上限（KB）", "表情包", 16, 8192,
-         hint="打分和对话读图共用这条上限；超限会自动退回纯文本模式"),
+         hint="打分和对话读图共用这条上限；超限会自动退回纯文本模式。"
+              "默认 4096KB（4MB）—— 按需求调大以让群里的原图真能被看到（2026-10-02）。"
+              "⚠ 上限是**下载上限 `stickers._DOWNLOAD_LIMIT`（8MB）**："
+              "合法取值必须小于 8MB，否则 8MB 以上的图会被下载层直接丢掉（截断的图会被视觉接口判非法），"
+              "这道闸门就永远轮不到生效。这也解释了区间上限为什么写 8192。"
+              "⚠ 图的视觉 token 大致随像素线性增长，4MB 的原图每次请求要明显多花 token 和延迟；"
+              "只在意成本时可以调小。"),
     # ---- 近似去重（改造后新增）----
     # 原来的去重是 SHA-256 精确比对，同一张表情被压缩/改尺寸/转格式之后
     # 字节全变，就会被当成两张各存一份。这两个参数管的是"内容一样就算重复"。
@@ -429,18 +435,20 @@ _SPECS: list[Spec] = [
     Spec("search_enabled", bool, "ai_chat_search_enabled", False, "启用联网搜索", "联网搜索",
          hint="关掉时 `web_search` 工具压根不提供给模型 —— 它也就不会假装自己搜过。"
               "开着还需要配好 search_endpoint"),
-    Spec("search_backend", str, "ai_chat_search_backend", "searxng", "搜索后端", "联网搜索",
-         choices=("searxng", "tavily", "json"),
-         hint="searxng = 自建/公共 SearXNG（免费，需实例开启 json 输出）；"
-              "tavily = 商业 API，**国内服务器实测可达**，去 tavily.com 申请 key（有免费额度）；"
+    Spec("search_backend", str, "ai_chat_search_backend", "deepseek", "搜索后端", "联网搜索",
+         choices=("deepseek", "tavily", "json"),
+         hint="deepseek = **官方 Search 接口**（2026-10-17 开放，自研索引，一次请求连正文一起回，"
+              "按次计费；key 复用 DEEPSEEK_API_KEY）；"
+              "tavily = 商业 API，去 tavily.com 申请 key（历史配置兼容）；"
               "json = 任何返回 {\"results\": [...]} 的端点"),
     Spec("search_endpoint", str, "ai_chat_search_endpoint", "", "搜索端点 URL", "联网搜索",
-         hint="searxng 填实例地址（如 http://127.0.0.1:8888，**不要带 /search**，程序会自己拼）；"
+         hint="deepseek **留空即可**（用 DEEPSEEK_BASE_URL + /v1/tools/search）；"
               "tavily **留空即可**（用内置官方地址）；"
-              "json 填完整查询地址，可用 {query} 占位符。留空且非 tavily = 不启用搜索"),
+              "json 填完整查询地址，可用 {query} 占位符。留空且非 deepseek/tavily = 不启用搜索"),
     Spec("search_api_key", str, "ai_chat_search_api_key", "", "搜索 API Key", "联网搜索",
          secret=True,
-         hint="只有 tavily 需要（它把密钥放在请求体里）。searxng / json 留空。"
+         hint="deepseek / tavily 留空时：deepseek 用 `.env` 的 DEEPSEEK_API_KEY，"
+              "tavily 则必须在这里填。json 后端留空。"
               "这个值不会出现在任何回复或机制说明里；控制台里显示为 ***（留 `***` 不动就是不改）"),
     Spec("search_depth", str, "ai_chat_search_depth", "basic", "Tavily 检索深度", "联网搜索",
          choices=("basic", "advanced"),
@@ -459,7 +467,8 @@ _SPECS: list[Spec] = [
               "防止模型连着搜个没完"),
     Spec("search_read_enabled", bool, "ai_chat_search_read_enabled", True, "搜索时自动读正文",
          "联网搜索",
-         hint="搜完自动打开前几条链接读正文，一起交给模型 —— "
+         hint="deepseek 后端：勾上就在搜索请求里带 `need_content`，**正文随结果一起回来**"
+              "（不额外计费）；tavily/json 后端：勾上则本地打开前几条链接读正文 —— "
               "只有摘要时它常常答不出细节。关掉则完全靠模型自己调 web_fetch"),
     Spec("search_read_results", int, "ai_chat_search_read_results", 3, "自动读前几条正文",
          "联网搜索", 0, 5,
@@ -472,15 +481,22 @@ _SPECS: list[Spec] = [
          "联网搜索", 2, 30,
          hint="只影响读正文（预读会并发读，所以总等待约等于这个值）。"
               "读不到就退回摘要，不影响这次回答"),
-    # ---- 渲染兜底：HTTP 读不到时，用真浏览器截图 + 本地 OCR ----
-    # 为什么需要：百科类站点（百度百科/知乎）按机房 IP 段 403，换什么请求头都没用，
-    # 但它们拦的是"HTTP 客户端特征"，真浏览器渲染往往能过。
-    # 为什么默认就开：不开的话，中文搜索里最常见的头部结果全都读不到。
+    # ---- 官方 Fetch 接口：直连读不到时的第一道兜底 ----
+    # 直连免费但常被反爬挡（机房 IP 段）；官方接口按次计费但一次往返就拿到 Markdown，
+    # 比"起浏览器渲染 + OCR"快一个数量级，也不吃本机那份紧张的内存。
+    Spec("fetch_api_fallback", bool, "ai_chat_fetch_api_fallback", True,
+         "读不到时用官方抓取接口", "联网搜索",
+         hint="直连被反爬拒绝/超时/无正文后，调 DeepSeek 的 `/v1/tools/fetch` 让**服务端**去抓，"
+              "直接回 Markdown 正文。按次计费（5 元/千次），失败不计费。"
+              "关掉则直接退回下面的渲染兜底"),
+    # ---- 渲染兜底：上面两条都读不到时，用真浏览器截图 + 本地 OCR ----
+    # 为什么还留着：极端情况下官方接口也可能拿不到（登录墙、纯 JS 渲染），
+    # 而真浏览器往往能过 —— 它是最后一道，不是第一道。
     # 为什么只做兜底：单页 5–15s、峰值内存 200–300MB —— 本机可用内存常在 700MB 上下。
     Spec("search_render_enabled", bool, "ai_chat_search_render_enabled", True,
          "浏览器渲染兜底", "联网搜索",
-         hint="HTTP 被反爬拒绝时，用无头 Chromium 打开页面截图，再用本地 OCR 认出文字。"
-              "**单页要 5–15 秒**，所以只在 HTTP 失败后才走。"
+         hint="HTTP 与官方接口都读不到时，用无头 Chromium 打开页面截图，再用本地 OCR 认出文字。"
+              "**单页要 5–15 秒**，所以只在前面都失败后才走。"
               "关掉则只能读那些不反爬的站点"),
     Spec("search_render_timeout", int, "ai_chat_search_render_timeout", 45,
          "渲染超时（秒）", "联网搜索", 10, 120,

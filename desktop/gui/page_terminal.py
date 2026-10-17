@@ -22,13 +22,25 @@ import re
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.connection import ConnectionManager, discover_ssh
+from . import theme
 from .base import Page
-from .widgets import badge, esc, label, plain_text_edit
+from .widgets import (
+    badge,
+    busy_button,
+    esc,
+    ghost_button,
+    label,
+    plain_text_edit,
+    primary_button,
+)
 
 _SCREEN_QSS = (
-    "QPlainTextEdit { background:#111827; color:#dbe7f5; border:1px solid #344054; "
-    "border-radius:6px; padding:8px; font-family:Consolas, 'Cascadia Mono', monospace; "
-    "font-size:12px; selection-background-color:#3568c8; }"
+    "QPlainTextEdit { "
+    f"background:{theme.COLORS['terminal_bg']}; color:{theme.COLORS['terminal_fg']}; "
+    f"border:1px solid {theme.COLORS['terminal_border']}; "
+    f"border-radius:{theme.RADIUS['input']}px; padding:8px; "
+    "font-family:Consolas, 'Cascadia Mono', monospace; font-size:12px; "
+    f"selection-background-color:{theme.COLORS['accent']}; }}"
 )
 
 
@@ -64,23 +76,24 @@ class TerminalPage(Page):
         outer.addWidget(self.screen, 1)
 
         row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(theme.SPACE["sm"])
         self.command = QtWidgets.QLineEdit()
         self.command.setPlaceholderText("例如：docker compose ps")
         self.command.returnPressed.connect(self._run_command)
         row.addWidget(self.command, 1)
-        self.btn_run = QtWidgets.QPushButton("执行")
-        self.btn_run.clicked.connect(self._run_command)
+        self.btn_run = primary_button("执行", self._run_command)
         row.addWidget(self.btn_run)
-        self.btn_stop = QtWidgets.QPushButton("停止")
-        self.btn_stop.clicked.connect(self._stop_command)
+        self.btn_stop = busy_button("停止", self._stop_command)
         self.btn_stop.setEnabled(False)
         row.addWidget(self.btn_stop)
-        self.btn_clear = QtWidgets.QPushButton("清屏")
-        self.btn_clear.clicked.connect(self.screen.clear)
+        row.addSpacing(theme.SPACE["lg"])
+        self.btn_clear = ghost_button("清屏", self.screen.clear)
         row.addWidget(self.btn_clear)
-        self.btn_ssh_cmd = QtWidgets.QPushButton("复制 ssh 命令")
-        self.btn_ssh_cmd.setToolTip("把当前目标的隧道命令复制到剪贴板（不含密钥内容）")
-        self.btn_ssh_cmd.clicked.connect(self._copy_ssh_command)
+        self.btn_ssh_cmd = ghost_button(
+            "复制 ssh 命令", self._copy_ssh_command,
+            tip="把当前目标的隧道命令复制到剪贴板（不含密钥内容）",
+        )
         row.addWidget(self.btn_ssh_cmd)
         outer.addLayout(row)
 

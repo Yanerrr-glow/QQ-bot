@@ -19,8 +19,17 @@ import pathlib
 import subprocess
 import sys
 
+# 控制台代码页可能是 GBK（Windows），而套件输出里有 emoji/特殊符号 ——
+# 不重配就会在 print 摘要时抛 UnicodeEncodeError，把真实退出码掩盖掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001 - 老 Python 或非标准流就算了
+    pass
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SUITE = ROOT / "_工具链" / "离线验证_桩.py"
+# 套件与**本脚本同目录**（`验证\`）。原来写的是 `_工具链\离线验证_桩.py` ——
+# 文件搬过一次之后这里就成了死路径，报错还长得像"套件自己挂了"。
+SUITE = pathlib.Path(__file__).resolve().parent / "离线验证_桩.py"
 LOG = ROOT / "_selftest_full.log"
 
 with open(LOG, "w", encoding="utf-8") as fh:

@@ -113,7 +113,7 @@ def sample_state() -> dict[str, Any]:
             "model_profile": "deepseek",
             "time": {"now": "2026-10-02 11:00:00", "raw": "2026-10-02 10:59:58", "offset": 2.0,
                      "source": "ntp", "synced": True},
-            "search": {"enabled": False, "available": False, "backend": "searxng",
+            "search": {"enabled": False, "available": False, "backend": "deepseek",
                        "reason": "未配置端点"},
         },
         "stickers_list": [

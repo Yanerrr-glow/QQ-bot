@@ -15,6 +15,16 @@
     立即反思一次（`/api/persona/reflect`，**会花 token**）
     生成测评素材（`/api/persona/eval` mode=artifacts，**会花 token**）
     跑一轮基线分（`/api/persona/eval` mode=round，**会花 token**）
+
+## 本文件现在有两个类（2026-10-03）
+
+`PersonaPage` 是完整版（**没有挂进导航**）。挂进导航的是 `PersonaEvalPage`
+（标题「人格评估台」）：它复用完整版的**三层查看 / 评估台 / 改动日志**，但把四个动作按钮藏起来
+—— 那些动作与「人格自动迭代与评估」参数在同一个「功能」目录下的子菜单里，
+两个入口各存一份行为迟早会不一致。
+
+⚠ **标题不能叫「人格」**：那个标题归「功能」目录下的人格子菜单（`MainWindow.goto_page`
+按标题跳转，同名会二义）。这也是本页当初从导航撤下的原因（见 `desktop/README.md` 4.1）。
 """
 
 from __future__ import annotations
@@ -24,8 +34,21 @@ from typing import Any
 from PySide6 import QtCore, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 from .base import Page, StateSlice
-from .widgets import badge, esc, label, plain_text_edit, table
+from .widgets import (
+    badge,
+    busy_button,
+    danger_button,
+    description_label,
+    esc,
+    fit_table,
+    label,
+    plain_text_edit,
+    primary_button,
+    table,
+    toolbar,
+)
 
 
 class PersonaPage(Page):
@@ -42,22 +65,34 @@ class PersonaPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_refresh.clicked.connect(lambda: self.load(force=True))
-        self.btn_undo = QtWidgets.QPushButton("撤回最近自动改动")
-        self.btn_undo.setToolTip("只回退自动迭代写入的那一条（表层），并记入改动日志")
-        self.btn_undo.clicked.connect(self._undo)
-        self.btn_reflect = QtWidgets.QPushButton("立即反思一次（花 token）")
-        self.btn_reflect.clicked.connect(self._reflect)
-        self.btn_artifacts = QtWidgets.QPushButton("生成测评素材（花 token）")
-        self.btn_artifacts.clicked.connect(lambda: self._eval("artifacts"))
-        self.btn_round = QtWidgets.QPushButton("跑一轮基线分（花 token）")
-        self.btn_round.clicked.connect(lambda: self._eval("round"))
-        for widget in (self.btn_refresh, self.btn_undo, self.btn_reflect, self.btn_artifacts, self.btn_round):
+        bar = toolbar("四个动作会花 token 或改变运行状态，执行前都会确认")
+        self.btn_refresh = busy_button("刷新", lambda: self.load(force=True))
+        self.btn_undo = busy_button(
+            "撤回最近自动改动", self._undo,
+            tip="只回退自动迭代写入的那一条（表层），并记入改动日志",
+        )
+        self.btn_reflect = danger_button("立即反思一次（花 token）", self._reflect)
+        self.btn_artifacts = danger_button(
+            "生成测评素材（花 token）", lambda: self._eval("artifacts")
+        )
+        self.btn_round = danger_button(
+            "跑一轮基线分（花 token）", lambda: self._eval("round")
+        )
+        for widget in (self.btn_refresh, self.btn_undo):
             bar.addWidget(widget)
-        bar.addStretch(1)
+        bar.addSpacing(theme.SPACE["lg"])
+        for widget in (self.btn_reflect, self.btn_artifacts, self.btn_round):
+            bar.addWidget(widget)
         outer.addLayout(bar)
+        # 动作按钮收进 dict：`PersonaEvalPage` 只留「刷新」，其余藏起来
+        # （那些动作的设置在功能子菜单里，别有两个各存一份行为的入口）。
+        self._action_buttons = {
+            "刷新": self.btn_refresh,
+            "撤回最近自动改动": self.btn_undo,
+            "立即反思一次（花 token）": self.btn_reflect,
+            "生成测评素材（花 token）": self.btn_artifacts,
+            "跑一轮基线分（花 token）": self.btn_round,
+        }
 
         self.hint = label("正在读取人格信息…")
         outer.addWidget(self.hint)
@@ -66,7 +101,7 @@ class PersonaPage(Page):
         packs_box = QtWidgets.QGroupBox("人格包")
         packs_layout = QtWidgets.QVBoxLayout(packs_box)
         packs_layout.addWidget(
-            label(
+            description_label(
                 "一个包 = 一个角色需要的全部文件（`persona/packs/<id>/`）。"
                 "切换**立即生效**，不用重启；每个包的自我学习成果按包分开存，切回来还在。",
                 wrap=True,
@@ -76,8 +111,7 @@ class PersonaPage(Page):
         self.pack_selector = QtWidgets.QComboBox()
         self.pack_selector.setMinimumWidth(260)
         pick_row.addWidget(self.pack_selector, 1)
-        self.btn_switch = QtWidgets.QPushButton("切到这个包")
-        self.btn_switch.clicked.connect(self._switch)
+        self.btn_switch = primary_button("切到这个包", self._switch)
         pick_row.addWidget(self.btn_switch)
         packs_layout.addLayout(pick_row)
         self.pack_info = label("")
@@ -93,7 +127,7 @@ class PersonaPage(Page):
         layers = QtWidgets.QWidget()
         layers_layout = QtWidgets.QVBoxLayout(layers)
         layers_layout.addWidget(
-            label(
+            description_label(
                 "三层正文在**当前人格包里**，只能**直接编辑文件**才生效（控制台不能改，这是刻意的边界）："
                 "`base.txt`（它是谁）/ `forbidden.txt`（铁律）/ `surface.txt`（表层，只作首次播种，"
                 "实际生效的那份在 `data/runtime/persona/<包>/surface.txt`）",
@@ -176,7 +210,7 @@ class PersonaPage(Page):
         for row, (name, filename, size, note) in enumerate(rows):
             for column, text in enumerate((name, filename, str(size), note)):
                 self.layer_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(text)))
-        self.layer_table.resizeColumnsToContents()
+        fit_table(self.layer_table)
 
         current = self.layer_selector.currentText()
         items = ["底层人设", "表层人设", "禁止事项"]
@@ -274,7 +308,7 @@ class PersonaPage(Page):
             ]
             for column, text in enumerate(cells):
                 self.eval_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
-        self.eval_table.resizeColumnsToContents()
+        fit_table(self.eval_table)
 
     def _fill_log(self, entries: list[dict[str, Any]]) -> None:
         self.log_table.setRowCount(len(entries))
@@ -286,7 +320,7 @@ class PersonaPage(Page):
             ]
             for column, text in enumerate(cells):
                 self.log_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
-        self.log_table.resizeColumnsToContents()
+        fit_table(self.log_table)
 
     # ------------------------------------------------------------ 动作
     def _selected_pack(self) -> str:
@@ -377,3 +411,36 @@ class PersonaPage(Page):
         else:
             self.toast(f"{action}未完成：{one_line(detail, 200)}", level="warn")
         self.load(force=True)
+
+
+class PersonaEvalPage(PersonaPage):
+    """「人格评估台」：人格包切换 + 三层只读 + 评估表 + 自动改动日志（**只读**）。
+
+    与完整版的三点差别，都是刻意的：
+
+    1. **不重复放四个花 token 的动作**（撤回 / 反思 / 测评素材 / 跑分）——
+       它们与「功能」目录下「人格自动迭代与评估」子菜单里那几个开关是同一件事，
+       两个入口各存一份行为迟早对不上。要跑就在那边跑（子菜单里有对应参数）。
+    2. **标题不同名**（见模块文档）。
+    3. 保留「切到这个包」：那是"它是谁"的唯一开关，人气最高，不该埋在参数里。
+    """
+
+    title = "人格评估台"
+    subtitle = "人格包切换、三层正文（只读）、特质评分与自动改动日志"
+
+    def __init__(self, manager, parent=None) -> None:  # noqa: ANN001
+        super().__init__(manager, parent)
+        for name in ("撤回最近自动改动", "立即反思一次（花 token）",
+                     "生成测评素材（花 token）", "跑一轮基线分（花 token）"):
+            button = self._action_buttons.get(name)
+            if button is not None:
+                button.setVisible(False)
+        # 这一条**不能写进 `self.hint`**：那是加载状态行，`_apply` 每次都会覆盖它。
+        note = label(
+            "本页只读：跑反思 / 生成素材 / 跑基线分请用左侧「功能」目录下的"
+            "「人格自动迭代与评估」子菜单（那里的开关与这些动作是同一件事）。",
+            level="info",
+            wrap=True,
+        )
+        self.layout().insertWidget(2, note)   # 工具栏、hint 之后
+

@@ -94,7 +94,7 @@ def main() -> int:
         else:
             print(f"  [OK  ] {name}" + (f" —— {detail}" if detail else ""))
 
-    from desktop.gui.main_window import BUILTIN_PAGES, MainWindow
+    from desktop.gui.main_window import FEATURES_SECTION, MainWindow
 
     window = None
 
@@ -104,6 +104,8 @@ def main() -> int:
         window.show()
         _pump(app, 0.4)
         return (f"内置页面 {len(window.pages)} 个，导航顶层 {window.nav.topLevelItemCount()} 项、"
+                f"「{FEATURES_SECTION}」子项 "
+                f"{window.features_item.childCount() if window.features_item else 0} 项、"
                 f"插件子项 {window.plugins_item.childCount() if window.plugins_item else 0} 项")
 
     step("建主窗口（含插件发现/登记/激活）", _build_window)
@@ -120,15 +122,59 @@ def main() -> int:
 
     step("连接探测（桩服务）", _probe)
 
+    def _features_nav():  # noqa: ANN202
+        """「功能」目录必须与总览同级，功能子菜单必须**都在它下面**。
+
+        用户要求（2026-10-03）："在桌面端控制台的总览同级别目录新建「功能」目录存放功能设置，
+        子菜单放功能细节"。所以三层都要断言：顶层节点存在、子菜单都挂进去、目录可收起。
+        """
+        from desktop.gui.features.catalog import FEATURES
+        from desktop.gui.main_window import _NAV_ROLE  # noqa: PLC0415 - 自检里读导航载荷
+
+        node = window.features_item
+        assert node is not None, f"导航顶层没有「{FEATURES_SECTION}」节点"
+        tops = []
+        for index in range(window.nav.topLevelItemCount()):
+            item = window.nav.topLevelItem(index)
+            payload = item.data(0, _NAV_ROLE) or ()
+            if payload and payload[0] == "section":
+                tops.append(payload[1])          # 还没建入口页的空目录
+            elif item.parent() is None:
+                tops.append(item.text(0))        # 顶层页面行（含目录的入口页）
+        assert tops[:3] == ["总览", "终端", FEATURES_SECTION], f"「功能」目录位置不对：{tops}"
+        assert node.parent() is None, "「功能」应当是顶层节点"
+        # 顶层那一行必须**就是**中心页（点它要能切页），不是个选不动的空节点。
+        entry = node.data(0, _NAV_ROLE) or ()
+        assert entry[0] == "page" and entry[1].title == FEATURES_SECTION, (
+            f"「{FEATURES_SECTION}」这一行的载荷不是中心页：{entry[:1]}"
+        )
+        expected = [feature.title for feature in FEATURES]
+        got = [node.child(i).text(0) for i in range(node.childCount())]
+        assert got == expected, f"功能子菜单与目录不一致：{got} != {expected}"
+        for feature in FEATURES:
+            assert window._nav_by_title[feature.title].parent() is node, (  # noqa: SLF001
+                f"「{feature.title}」没有挂在「{FEATURES_SECTION}」目录下"
+            )
+        # 目录可收起（与「插件」目录同一套交互）
+        node.setExpanded(False)
+        assert not node.isExpanded(), "「功能」目录收不起来"
+        node.setExpanded(True)
+        return (f"顶层 {'、'.join(map(str, tops))}；子菜单 {len(expected)} 个（可收起）："
+                + "、".join(expected[:4]) + " …")
+
+    step("功能目录（总览同级 + 子菜单在它下面）", _features_nav)
+
     def _load_all_pages():  # noqa: ANN202
-        for index, page in enumerate(window.pages):
-            window.nav.setCurrentItem(window.nav.topLevelItem(index))
+        # 按**标题**跳转（`goto_page`）而不是行号：导航是两层树、还能收起，
+        # 行号不是稳定标识 —— 这条同时把跳转入口本身验了。
+        for page in window.pages:
+            assert window.goto_page(page.title), f"跳转失败：{page.title}"
             _pump(app, 0.35)
             assert window.stack.currentWidget() is page, f"{page.title} 没切过去"
         _pump(app, 1.2)  # 等最后一页的后台任务回来
         return "、".join(p.title for p in window.pages)
 
-    step("逐个页面加载（含后台请求）", _load_all_pages)
+    step("逐个页面加载（含后台请求，按标题跳转）", _load_all_pages)
 
     def _plugin_pages():  # noqa: ANN202
         assert window.plugin_pages, "插件页面没有进导航"
@@ -188,14 +234,13 @@ def main() -> int:
     step("插件状态卡取数", _status_cards)
 
     def _switch_target():  # noqa: ANN202
-        window.nav.setCurrentItem(window.nav.topLevelItem(0))
+        window.goto_page("总览")
         manager.switch_target(other.id)
         _pump(app, 0.3)
         # 切到离线目标：探测必须失败，且**不能**把失败当成"没有数据"
         result = manager.probe()
         assert not result.ok, "离线目标竟然探测成功"
-        params = next(i for i, p in enumerate(window.pages) if p.title == "参数")
-        window.nav.setCurrentItem(window.nav.topLevelItem(params))  # 参数页：应显示错误而不是空表
+        window.goto_page("参数")  # 参数页：应显示错误而不是空表
         _pump(app, 0.4)
         # 切回桩服务目标。**显式把桩地址写回去** —— `manager.store.load()` 是从文件读的
         # 一份独立副本，早先对 `local` 对象的改写不会自动同步（这个冒烟脚本原先就吃在这）。
@@ -209,7 +254,7 @@ def main() -> int:
             f"切回来之后探测应恢复：{result2.detail} {result2.hint}"
             f"｜local.base_url={local.http.base_url!r} state={manager.state.base_url!r}"
         )
-        window.nav.setCurrentItem(window.nav.topLevelItem(0))
+        window.goto_page("总览")
         _pump(app, 0.4)
         return "离线不伪装成空数据，切回后恢复"
 

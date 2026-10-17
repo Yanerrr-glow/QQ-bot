@@ -25,7 +25,7 @@ URL 是**模型给的**（间接来自网页），所以先假定它可能有害
   `127.0.0.1`、`10.x`、`192.168.x`、`169.254.x`（云元数据）一律拒；
 * **每一次重定向都重新查一遍** —— 否则一个"公网域名 → 302 → 内网"就能绕过首轮检查。
 
-这一条不是洁癖：bot 跑在云服务器上，容器还和 NapCat、SearXNG 同网，
+这一条不是洁癖：bot 跑在云服务器上，容器还和 NapCat 等同网服务相邻，
 真让它去读 `http://169.254.169.254/` 或 `http://napcat:6099/`，后果不是"读不到网页"这么轻。
 
 ### 2. 资源：宁可不读，也不能拖死回复
@@ -44,7 +44,9 @@ URL 是**模型给的**（间接来自网页），所以先假定它可能有害
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -60,7 +62,7 @@ from typing import Any
 # （百度百科/知乎按机房 IP 段 403）。表现是"读某个链接就整条回复失败"，
 # 且只在渲染成功那一刻才暴露（渲染失败时 `rendered["text"]` 为空，
 # 走的是下面那个提前 return，反而躲开了这行）。
-from . import netguard, settings, untrusted
+from . import config, netguard, settings, untrusted
 
 logger = logging.getLogger("ai_chat.fetch")
 
@@ -139,6 +141,63 @@ def _tidy(text: str) -> str:
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# ------------------------------------------------- 官方 Fetch 接口（兜底读取）
+# 2026-10-17 开放的 `POST /v1/tools/fetch`：**服务端**抓页面并回 Markdown 正文。
+#
+# 它替掉的正是本模块最贵的那条链路：本机 IP 被站点反爬 → 起无头浏览器渲染 →
+# 截图再做 OCR（单页 5–15s、峰值 200–300MB）。抓取改在 DeepSeek 侧进行之后，
+# "机房 IP 段被百度百科/知乎点名拒绝"这个问题不再属于我们。
+#
+# 它只做**兜底**，不抢 HTTP 的位置：直连成功时又快又免费（不计费），
+# 而官方接口按次计费，没必要为每次读取都花一次钱。
+_DEEPSEEK_FETCH_PATH = "/v1/tools/fetch"
+
+
+def _api_base() -> str:
+    return str(config.BASE_URL or "https://api.deepseek.com").rstrip("/")
+
+
+def _deepseek_fetch(url: str, timeout: float, max_chars: int) -> dict[str, Any]:
+    """调官方 Fetch 接口读一页。**任何失败都返回空正文 + 原因，绝不抛。**"""
+    empty = {"url": url, "title": "", "text": "", "error": "", "truncated": False}
+    if not settings.get("fetch_api_fallback"):
+        return empty
+    key = str(config.API_KEY or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if not key:
+        return empty
+    body = json.dumps({"url": url}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        _api_base() + _DEEPSEEK_FETCH_PATH,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "nonebot-ai-chat/1.0 (+local qq bot; fetch on demand)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 - 端点是官方地址
+            raw = resp.read(2 * 1024 * 1024)
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:  # noqa: BLE001 - 网络/超时/被拒都归这里
+        logger.info("官方抓取接口失败 %s（%s）", url[:110], type(exc).__name__)
+        return {**empty, "error": f"官方抓取接口：{type(exc).__name__}"}
+    title = _sanitize(str(data.get("title") or ""))[:200]
+    text = _sanitize(_tidy(str(data.get("content") or "")))
+    limit = max(200, int(max_chars))
+    if not text:
+        return {**empty, "title": title, "error": "官方抓取接口没有返回正文"}
+    return {
+        "url": url,
+        "title": title,
+        "text": text[:limit],
+        "error": "",
+        "truncated": len(text) > limit,
+        "source": "deepseek-fetch",
+    }
 
 
 # --------------------------------------------------------------------- 安全
@@ -459,6 +518,11 @@ async def fetch_page(url: str, timeout: float = 8.0, max_chars: int = 1200) -> d
         return result
     if not _should_render_fallback(result.get("error", "")):
         return result
+    # 官方接口排在"起浏览器"之前：一次 HTTP 往返就够，比渲染快一个数量级，
+    # 也不占本机那点内存（渲染单页峰值 200–300MB）。
+    api = await asyncio.to_thread(_deepseek_fetch, url, timeout, max_chars)
+    if api.get("text"):
+        return api
     try:
         from . import render  # 局部导入，避免模块级循环
     except Exception:  # noqa: BLE001
@@ -531,6 +595,16 @@ async def fetch_pages(
         except Exception as exc:  # noqa: BLE001
             out[url] = {"url": url, "title": "", "text": "",
                         "error": str(exc)[:160], "truncated": False}
+    # 直连没读到的那几条：先试官方抓取接口（一次往返、不吃本机资源），
+    # 再决定要不要对首条补一次渲染兜底。
+    for url, res in list(out.items()):
+        if res.get("text"):
+            continue
+        if not _should_render_fallback(res.get("error", "")):
+            continue
+        api = await asyncio.to_thread(_deepseek_fetch, url, timeout, max_chars)
+        if api.get("text"):
+            out[url] = api
     if allow_render and not any(v.get("text") for v in out.values()):
         first = targets[0]
         try:

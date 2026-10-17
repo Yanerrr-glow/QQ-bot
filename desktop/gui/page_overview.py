@@ -11,8 +11,20 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 from .base import Page, StateSlice
-from .widgets import PALETTE, badge, esc, hline, read_only_item
+from .widgets import (
+    PALETTE,
+    badge,
+    danger_button,
+    esc,
+    fit_table,
+    ghost_button,
+    primary_button,
+    read_only_item,
+    table,
+    toolbar,
+)
 
 
 class OverviewPage(Page):
@@ -28,40 +40,47 @@ class OverviewPage(Page):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
 
-        bar = QtWidgets.QHBoxLayout()
-        self.btn_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_refresh.clicked.connect(lambda: self.load(force=True))
-        self.btn_speak = QtWidgets.QPushButton("主动发言一次")
-        self.btn_speak.setToolTip("让机器人在某个活跃群主动说一句（会调用模型，可能产生费用）")
-        self.btn_speak.clicked.connect(self._speak)
-        self.btn_greet = QtWidgets.QPushButton("手动问候")
-        self.btn_greet.setToolTip("按当前钟点发一次问候（绕开总开关，不消耗当天的自动次数）")
-        self.btn_greet.clicked.connect(self._greet)
-        self.btn_webui = QtWidgets.QPushButton("打开旧 WebUI（回退入口）")
-        self.btn_webui.clicked.connect(self._open_webui)
-        for widget in (self.btn_refresh, self.btn_speak, self.btn_greet):
-            bar.addWidget(widget)
-        bar.addStretch(1)
+        bar = toolbar("快捷操作")
+        self.btn_refresh = primary_button("刷新", lambda: self.load(force=True))
+        self.btn_speak = danger_button(
+            "主动发言一次", self._speak,
+            tip="让机器人在某个活跃群主动说一句（会调用模型，可能产生费用）",
+        )
+        self.btn_greet = danger_button(
+            "手动问候", self._greet,
+            tip="按当前钟点发一次问候（绕开总开关，不消耗当天的自动次数；会调用模型）",
+        )
+        self.btn_webui = ghost_button("打开旧 WebUI（回退入口）", self._open_webui)
+        bar.addWidget(self.btn_refresh)
+        bar.addSpacing(theme.SPACE["lg"])
+        bar.addWidget(self.btn_speak)
+        bar.addWidget(self.btn_greet)
+        bar.addSpacing(theme.SPACE["lg"])
         bar.addWidget(self.btn_webui)
-        outer.addLayout(bar)
 
+        # 操作行 + 状态徽标收进同一张白卡：不要散在灰画布上（用户反馈过"悬在卡片外"）。
+        status_card = QtWidgets.QFrame()
+        status_card.setObjectName("card")
+        status_layout = QtWidgets.QVBoxLayout(status_card)
+        status_layout.setContentsMargins(
+            theme.SPACE["lg"], theme.SPACE["md"], theme.SPACE["lg"], theme.SPACE["md"]
+        )
+        status_layout.setSpacing(theme.SPACE["sm"])
+        status_layout.addLayout(bar)
         self.badges = QtWidgets.QLabel("加载中…")
         # 徽标是我们自己拼的富文本；里面的**外部字符串**一律先过 esc()。
         self.badges.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self.badges.setWordWrap(True)
         self.badges.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        outer.addWidget(self.badges)
-        outer.addWidget(hline())
+        status_layout.addWidget(self.badges)
+        outer.addWidget(status_card)
 
-        self.detail = QtWidgets.QTableWidget(0, 2)
-        self.detail.setHorizontalHeaderLabels(["项目", "值"])
-        self.detail.verticalHeader().setVisible(False)
-        self.detail.horizontalHeader().setStretchLastSection(True)
-        self.detail.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.detail = table(["项目", "值"])
         outer.addWidget(self.detail, 1)
 
         cards_group = QtWidgets.QGroupBox("插件状态卡（只读）")
         cards_layout = QtWidgets.QVBoxLayout(cards_group)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards = QtWidgets.QLabel("（没有启用的插件状态卡）")
         self.cards.setWordWrap(True)
         self.cards.setTextFormat(QtCore.Qt.TextFormat.RichText)
@@ -160,7 +179,7 @@ class OverviewPage(Page):
         for index, (key, value) in enumerate(rows):
             self.detail.setItem(index, 0, read_only_item(key))
             self.detail.setItem(index, 1, read_only_item(one_line(value, 200), tip=value))
-        self.detail.resizeColumnsToContents()
+        fit_table(self.detail)
 
     def _fill_cards(self) -> None:
         window = self.window()

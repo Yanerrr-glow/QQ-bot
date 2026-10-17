@@ -87,6 +87,12 @@ def _download(url: str, timeout: float = 15.0) -> bytes:
     用 urllib 而不是引入 aiohttp/httpx：这个项目只在这一处需要拉图，
     不值得为一个功能多背一个 HTTP 依赖。
 
+    ⚠ `_DOWNLOAD_LIMIT` 是**硬截断**：超过它的图片只会拿到前 8MB，而截断后的
+    JPEG **不是图片**（头部完好、尾部缺失）。这种半张图送去视觉接口必定被
+    400 拒掉，却被后面每一轮对话反复复用 —— 2026-10-02 线上「群里反复无响应」
+    就是这么来的。所以这里多读 1 字节来**探测超限**，超了返回 `b""`
+    （空字节是既有的「这张图不可用」约定），而不是安静地返回半张图。
+
     ⚠ 图片段的 `url` / `file` 是**外部可控输入**，所以这里必须过公网校验，
     并且用带逐跳复检的 opener（默认 `urlopen` 不查重定向）—— 2026-09-28 补。
     """
@@ -95,7 +101,11 @@ def _download(url: str, timeout: float = 15.0) -> bytes:
         raise OSError(f"拒绝下载：{why}")
     req = urllib.request.Request(url, headers={"User-Agent": "nonebot-ai-chat/1.0"})
     with netguard.open_checked(req, timeout=timeout) as resp:
-        return resp.read(_DOWNLOAD_LIMIT)
+        data = resp.read(_DOWNLOAD_LIMIT + 1)
+    if len(data) > _DOWNLOAD_LIMIT:
+        logger.info("图片超过下载上限 %dMB，丢弃（截断的图会被视觉接口判为非法）", _DOWNLOAD_LIMIT // 1024 // 1024)
+        return b""
+    return data
 
 
 class StickerLibrary:
@@ -548,7 +558,12 @@ async def download_image(seg: dict[str, Any]) -> bytes:
     except Exception:  # noqa: BLE001 - 图片链接过期是常态
         logger.info("下载图片失败（链接可能已过期）")
         return b""
-    return data or b""
+    if not data:
+        # 空字节有两种来源：链接给了空响应，或图片超过 `_DOWNLOAD_LIMIT` 被拒。
+        # 两者都不能当成功 —— 调用方拿到 `b""` 就会退回纯文本路径。
+        logger.info("下载图片未取到可用字节（超过上限或响应为空）")
+        return b""
+    return data
 
 
 def image_source(seg: dict[str, Any]) -> str:

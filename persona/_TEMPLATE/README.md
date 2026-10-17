@@ -18,7 +18,8 @@ Copy-Item -Recurse 'persona\_TEMPLATE' 'persona\packs\mybot'
 python '验证\_人格包检查.py' --pack mybot
 
 # 4. 切过去（立即生效，不用重启）
-#    群里：/人设 切换 mybot     控制台：「人格」页 → 人格包 → 切换
+#    群里：/人设 切换 mybot
+#    桌面控制台：左侧「功能」目录 →「人格」子菜单 → 选一个包 →「切到这个包」
 ```
 
 ## 一个包由什么组成

@@ -157,7 +157,7 @@ async def _ensure_browser() -> Any:
             "--disable-gpu",
             "--no-first-run",
             "--no-default-browser-check",
-            # 本机总内存只有 1.6GB（还要养 NapCat + SearXNG + bot 本身），
+            # 本机总内存只有 1.6GB（还要养 NapCat + bot 本身），
             # 所以把 Chromium 的内存往死里压。这些都是关缓存/关后台功能的开关，
             # 对"打开一页读文字"没有任何影响。
             "--disable-extensions",

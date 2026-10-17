@@ -42,15 +42,23 @@
 这一条跟 `files.py` 读文件时是同一个原则 —— 凡是外部来的文本，都先假定它有害。
 具体削哪几个注入起手式，规则本体在 `untrusted.py`（全项目只此一份）。
 
-## 搜索后端是可插拔的
+## 搜索后端：DeepSeek 官方 Search 接口（默认）
 
-只实现两种，都是"正当使用"而不是偷抓页面：
+2026-10-17 起 DeepSeek API 开放了自研搜索接口（`POST /v1/tools/search`）：
+返回结构化结果，`need_content=true` 时**连网页正文一起给出** —— 所以不再需要自建
+SearXNG，也不需要第三方搜索服务。默认走它，鉴权复用 `DEEPSEEK_API_KEY`。
 
-* **SearXNG** —— 自建/公共实例，免费、无需 key，返回 JSON。默认走这个；
-* **自定义 JSON 接口** —— 任何返回 `{"results": [...]}` 的端点（Tavily / Brave / 自建聚合）。
+另外保留两个兼容后端（老配置不必立刻改，但都不再是推荐路径）：
 
-**没有 http 或没有端点的文字**一律不采信。所以 httpx 没装 / 没配端点时，
-`available()` 返回 False，工具根本不会被提供给模型 —— 它也就不会假装自己搜过。
+* **tavily** —— 商业 API，密钥放请求体；
+* **json** —— 任何返回 `{"results": [...]}` 的端点。
+
+**没有 key / 没有端点的后端**一律不采信：`available()` 返回 False 时工具根本不会
+提供给模型 —— 它也就不会假装自己搜过。
+
+> 计费提醒：Search / Fetch 按**成功请求次数**计费（5 元 / 1000 次），
+> 失败、空结果、超时不计费。所以"少搜但搜准"比"多搜几次"更省钱，
+> 这也是下面 `needs_search()` 宁可漏判也不误判的另一个理由。
 
 ## 配额
 
@@ -68,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -88,18 +97,50 @@ _MAX_TITLE = 120
 
 
 # --------------------------------------------------------------------- 可用性
+# DeepSeek 官方接口路径。基址复用模型那边同一个 `DEEPSEEK_BASE_URL`，
+# 这样自建反代 / 换域名时只改一处。
+_DEEPSEEK_SEARCH_PATH = "/v1/tools/search"
+
+
+def _api_base() -> str:
+    return str(config.BASE_URL or "https://api.deepseek.com").rstrip("/")
+
+
+def _api_key() -> str:
+    """搜索用的 key：控制台填了就用它，否则复用模型那把 `DEEPSEEK_API_KEY`。
+
+    为什么允许覆盖：同一个账号的模型与搜索接口共用 key 是最省事的默认，
+    但也有人想用另一把 key 单独控额度。
+    """
+    configured = str(settings.get("search_api_key") or "").strip()
+    if configured:
+        return configured
+    # 二级兜底看环境变量：容器里自定义字段是从挂载的 `.env` 读的，
+    # 但如果哪天改成只注环境变量（不挂文件），这里仍然拿得到 key。
+    return str(config.API_KEY or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+
+
 def _endpoint() -> str:
-    """搜索端点。tavily 后端不填时用内置的官方地址。"""
+    """搜索端点。deepseek / tavily 不填时用内置的官方地址。"""
     configured = str(settings.get("search_endpoint") or "").strip()
     if configured:
         return configured
-    if _backend() == "tavily":
+    backend = _backend()
+    if backend == "deepseek":
+        return _api_base() + _DEEPSEEK_SEARCH_PATH
+    if backend == "tavily":
         return _TAVILY_URL
     return ""
 
 
+_BACKENDS = ("deepseek", "tavily", "json")
+
+
 def _backend() -> str:
-    return str(settings.get("search_backend") or "searxng").strip().lower()
+    value = str(settings.get("search_backend") or "deepseek").strip().lower()
+    # 老配置里可能还留着 searxng（那个自建栈已经拆掉）。静默回落到默认后端，
+    # 而不是判成"不可用" —— 否则升级后群里会突然查不了东西，还看不出原因。
+    return value if value in _BACKENDS else "deepseek"
 
 
 def available() -> bool:
@@ -108,8 +149,12 @@ def available() -> bool:
         return False
     if not _endpoint():
         return False
-    # Tavily 把密钥放在请求体里，没有 key 就一定 401 —— 这种情况直接判为不可用，
+    # 要 key 的后端：没 key 就一定 401 —— 这种情况直接判为不可用，
     # 而不是等每次搜索都失败一次再在群里说"查不到"。
+    # 注意两个后端的 key 来源不同：deepseek 可复用模型那把 DEEPSEEK_API_KEY，
+    # 而 tavily 的密钥**只能**来自 search_api_key（它要求放在请求体里）。
+    if _backend() == "deepseek" and not _api_key():
+        return False
     if _backend() == "tavily" and not str(settings.get("search_api_key") or "").strip():
         return False
     return True
@@ -118,6 +163,8 @@ def available() -> bool:
 def unavailable_reason() -> str:
     if not settings.get("search_enabled"):
         return "搜索功能关着（控制台「联网搜索」组）"
+    if _backend() == "deepseek" and not _api_key():
+        return "deepseek 后端需要 DEEPSEEK_API_KEY（`.env` 里填，或在控制台填 search_api_key）"
     if _backend() == "tavily" and not str(settings.get("search_api_key") or "").strip():
         return "tavily 后端要先填 search_api_key（去 tavily.com 注册拿 key）"
     if not _endpoint():
@@ -176,30 +223,36 @@ def _sanitize(text: str, limit: int) -> str:
     return untrusted.sanitize_flat(text, limit)
 
 
-def _fetch_json(url: str, timeout: float, payload: dict[str, Any] | None = None) -> Any:
+def _fetch_json(
+    url: str,
+    timeout: float,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
     """取 JSON。给的 payload 不为空就发 POST（JSON body），否则 GET。
 
-    为什么需要 POST：有些后端（Tavily）把**密钥放在请求体**里，而且只接受 POST。
-    只做 GET + query 参数的话，这类后端根本没法用 —— 而它们往往正是
-    "国内服务器唯一连得上的那些"（见 README 里的实测表）。
+    为什么需要 POST：有的后端把**密钥放在请求体**里（Tavily），有的走
+    `Authorization` 头（DeepSeek）；只做 GET + query 参数的话这些都用不了。
     """
-    headers = {
+    merged = {
         # 老实报上自己是谁：有些实例会因此放宽限速，也便于对方封禁
         "User-Agent": "nonebot-ai-chat/1.0 (+local qq bot; search on demand)",
         "Accept": "application/json",
     }
+    if headers:
+        merged.update(headers)
     data = None
     if payload:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers)
+        merged["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=merged)
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 端点是用户自己配的
         raw = resp.read(2 * 1024 * 1024)  # 硬上限 2MB，别让一个坏端点把内存拉爆
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
 # Tavily 的固定端点。单独支持它是因为**它的服务端在国内可达**，
-# 而公共 SearXNG / Google / DuckDuckGo / Brave 在这个网络里实测都不通。
+# 而公共搜索端点 / Google / DuckDuckGo / Brave 在这个网络里实测都不通。
 _TAVILY_URL = "https://api.tavily.com/search"
 
 
@@ -216,8 +269,27 @@ def _tavily_payload(query: str) -> dict[str, Any]:
     }
 
 
+def _deepseek_payload(query: str) -> dict[str, Any]:
+    """DeepSeek Search 的请求体。
+
+    `need_content=True` 是这个后端最值钱的地方：**一次请求就把正文带回来**，
+    省掉本地再抓三条网页（也就省掉反爬、渲染、OCR 那一整条链路）。
+    它对单价没有影响（按次计费，与 `count`、正文大小无关），只影响响应体大小，
+    而正文最终会被 `search_read_chars` 截断后再进 prompt。
+    """
+    return {
+        "query": query,
+        "count": max(1, min(10, int(settings.get("search_max_results")))),
+        "need_content": bool(settings.get("search_read_enabled")),
+    }
+
+
 def _normalize_items(items: Any) -> list[dict[str, str]]:
-    """把各家后端的结果统一成 {title, url, snippet}。认不出的形态直接跳过。"""
+    """把各家后端的结果统一成 `{title, url, snippet[, content]}`。认不出的形态直接跳过。
+
+    `content` 只在后端**主动给了正文**时才有（DeepSeek Search 的 `need_content`），
+    有它就不再需要本地预读那一步 —— 见 `search()`。
+    """
     out: list[dict[str, str]] = []
     if not isinstance(items, list):
         return out
@@ -228,23 +300,33 @@ def _normalize_items(items: Any) -> list[dict[str, str]]:
         if not url.startswith(("http://", "https://")):
             continue
         title = _sanitize(it.get("title") or it.get("name") or "", _MAX_TITLE)
+        # 摘要优先级：深搜的长摘要（summary，600~800 字）> 短摘要 > 描述 > 正文兜底。
+        # **不能先取 content** —— 那是整页正文，塞进"摘要"位置既浪费又容易跑题。
         snippet = _sanitize(
-            it.get("content") or it.get("snippet") or it.get("description") or it.get("body") or "",
+            it.get("summary") or it.get("snippet") or it.get("description")
+            or it.get("content") or it.get("body") or "",
             _MAX_SNIPPET,
         )
-        out.append({"title": title or "(无标题)", "url": url, "snippet": snippet})
+        item = {"title": title or "(无标题)", "url": url, "snippet": snippet}
+        content = str(it.get("content") or "")
+        if content.strip():
+            item["content"] = content
+        # 时效与权威性：渲染时可以给模型一个"这条新不新、靠不靠谱"的线索
+        date = str(it.get("date") or "").strip()
+        if date:
+            item["date"] = date
+        out.append(item)
     return out
 
 
 def _build_url(query: str) -> str:
+    """通用 JSON 后端（`json`）的查询地址：query 走 GET 参数。
+
+    `deepseek` / `tavily` 不用它 —— 那两个都是 POST JSON。
+    """
     base = _endpoint()
-    backend = _backend()
     count = max(1, min(10, int(settings.get("search_max_results"))))
-    if backend == "searxng":
-        # SearXNG 的 JSON 输出：/search?q=...&format=json
-        sep = "&" if "?" in base else "?"
-        return f"{base}{sep}q={urllib.parse.quote(query)}&format=json&language=zh-CN&safesearch=1"
-    # 通用 JSON 后端：同时给 q 与 query 两个参数名，覆盖面广一些；
+    # 同时给 q 与 query 两个参数名，覆盖面广一些；
     # 若端点里已经有 {query} 占位符，就按占位符替换。
     if "{query}" in base:
         return base.replace("{query}", urllib.parse.quote(query))
@@ -262,6 +344,30 @@ def _extract_items(payload: Any) -> list[dict[str, str]]:
                 return _normalize_items(value)
         return []
     return _normalize_items(payload)
+
+
+def _inline_pages(results: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+    """把**随搜索结果一起返回的正文**整理成"预读"结构。
+
+    只有 DeepSeek Search（`need_content=True`）会带正文。它一到位就完全不用本地
+    抓取：省掉 3 次 HTTP、反爬、渲染兜底与 OCR 那一整条最慢的链路。
+    """
+    chars = max(200, int(settings.get("search_read_chars")))
+    pages: dict[str, dict[str, Any]] = {}
+    for item in results:
+        url = str(item.get("url") or "")
+        text = str(item.get("content") or "").strip()
+        if not url or not text:
+            continue
+        pages[url] = {
+            "url": url,
+            "title": str(item.get("title") or ""),
+            "text": _sanitize(text, chars),
+            "error": "",
+            "truncated": len(text) > chars,
+            "from": "search",
+        }
+    return pages
 
 
 async def _attach_pages(results: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
@@ -329,9 +435,22 @@ def search_blocking(query: str, timeout: float | None = None) -> dict[str, Any]:
 
     if timeout is None:
         timeout = float(settings.get("search_timeout"))
+    backend = _backend()
     url = _build_url(query)
     payload: dict[str, Any] | None = None
-    if _backend() == "tavily":
+    headers: dict[str, str] | None = None
+    if backend == "deepseek":
+        key = _api_key()
+        if not key:
+            return {
+                "query": query,
+                "results": [],
+                "error": "DeepSeek 搜索需要 API Key（`.env` 的 DEEPSEEK_API_KEY，或控制台 search_api_key）",
+            }
+        url = _endpoint()
+        payload = _deepseek_payload(query)
+        headers = {"Authorization": f"Bearer {key}"}
+    elif backend == "tavily":
         url = str(settings.get("search_endpoint") or "").strip() or _TAVILY_URL
         if not str(settings.get("search_api_key") or "").strip():
             return {
@@ -341,7 +460,7 @@ def search_blocking(query: str, timeout: float | None = None) -> dict[str, Any]:
             }
         payload = _tavily_payload(query)
     try:
-        data = _fetch_json(url, timeout, payload)
+        data = _fetch_json(url, timeout, payload, headers)
     except Exception as exc:  # noqa: BLE001 - 网络/超时/JSON 坏掉都归到这里
         logger.info("搜索失败：%s（%s）", query, type(exc).__name__)
         return {"query": query, "results": [], "error": f"{type(exc).__name__}: {exc}"[:160]}
@@ -352,11 +471,14 @@ def search_blocking(query: str, timeout: float | None = None) -> dict[str, Any]:
     results = results[:limit]
     logger.info("搜索完成：%s → %d 条", query, len(results))
     # 请求是成功的，但解析不出任何条目 —— 这几乎一定是**端点的返回格式不对**
-    # （比如 SearXNG 没开 json 输出，或后端不是预期的那个）。
+    # （比如端点没开 JSON 输出，或返回的不是预期那种形状）。
     # 这种情况要给出原因，否则用户只会看到"没搜到"，然后去怀疑关键词。
     error = ""
     if not results:
-        error = f"请求成功但没有解析出结果（端点格式可能不是 {_backend()}；检查是否需要开启 json 输出）"
+        if backend == "deepseek":
+            error = "接口返回了空结果（关键词可能太窄，或这段时间没有可用的网页）"
+        else:
+            error = f"请求成功但没有解析出结果（端点格式可能不是 {backend}；检查是否需要开启 json 输出）"
     # ⚠️ **这里绝对不能再调 `_attach_pages`** —— 它是协程，而本函数是同步的：
     #    直接调会得到一个从未被 await 的 coroutine 对象（只有一条 RuntimeWarning，
     #    很容易被日志刷掉），塞进返回值里就成了"永远空的预读"。
@@ -374,10 +496,17 @@ async def search(query: str) -> dict[str, Any]:
     调用方（`__init__._run_tool_calls`、`instructions._cmd_search`）一律用这个。
     """
     payload = await asyncio.to_thread(search_blocking, query)
-    # ⚠️ `_attach_pages` 是协程，**必须 await** —— 漏了 await 时它不会报错，
-    # 只会静默返回一个 coroutine 对象（RuntimeWarning 也容易被日志刷掉），
-    # 表现就是"预读永远 0 条、渲染兜底从不触发"。
-    payload["pages"] = await _attach_pages(payload.get("results") or [])
+    results = payload.get("results") or []
+    # ① 先用后端直接带回来的正文（DeepSeek Search）
+    pages = _inline_pages(results)
+    # ② 还有没带正文的那几条，才走本地"纯 HTTP 预读"（tavily / json 后端全靠这一步）
+    missing = [r for r in results if str(r.get("url") or "") not in pages]
+    if missing and settings.get("search_read_enabled"):
+        # ⚠️ `_attach_pages` 是协程，**必须 await** —— 漏了 await 时它不会报错，
+        # 只会静默返回一个 coroutine 对象（RuntimeWarning 也容易被日志刷掉），
+        # 表现就是"预读永远 0 条、渲染兜底从不触发"。
+        pages.update(await _attach_pages(missing))
+    payload["pages"] = pages
     return payload
 
 
@@ -768,7 +897,9 @@ def stats() -> dict[str, Any]:
         "reason": unavailable_reason(),
         "backend": _backend(),
         "endpoint": _endpoint(),
-        "has_key": bool(str(settings.get("search_api_key") or "").strip()),
+        # 这里要报**实际会用的那把 key**（deepseek 会回落到 DEEPSEEK_API_KEY），
+        # 否则控制台显示"没配 key"、实际却能搜，排查时会绕远路。
+        "has_key": bool(_api_key()),
         "max_results": int(settings.get("search_max_results")),
         "rate_limit": int(settings.get("search_rate_limit")),
         "max_per_message": int(settings.get("search_max_per_message")),

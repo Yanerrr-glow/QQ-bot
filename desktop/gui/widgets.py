@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -23,22 +24,17 @@ from typing import Any, Callable
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.util import one_line
+from . import theme
 
 logger = logging.getLogger("qqbot.desktop.gui")
 
-# ---------------------------------------------------------------- 配色
+# ---------------------------------------------------------------- 配色 / 样式
+# **令牌与 QSS 的唯一来源是 `theme.py`**。这里保留旧名字做兼容别名：
+# 页面里已有大量 `PALETTE['dim']` / `from .widgets import STYLESHEET` 的引用，
+# 改名会直接 ImportError。新代码请直接 `from . import theme`。
+PALETTE = theme.PALETTE
+STYLESHEET = theme.STYLESHEET
 
-PALETTE = {
-    "bg": "#f3f6fb",
-    "panel": "#ffffff",
-    "panel2": "#e8edf5",
-    "fg": "#1d2939",
-    "dim": "#667085",
-    "accent": "#3568c8",
-    "ok": "#16845b",
-    "warn": "#a96100",
-    "err": "#c53945",
-}
 # 状态级别 → 颜色。两种写法都收：`err` 与 `error` 指的是同一件事，
 # 但页面里两种都出现过，与其到处改成一种，不如在这里收敛成别名。
 LEVEL_COLOR = {
@@ -50,68 +46,6 @@ LEVEL_COLOR = {
     "error": PALETTE["err"],
 }
 
-STYLESHEET = f"""
-QWidget {{ background: {PALETTE['bg']}; color: {PALETTE['fg']}; font-size: 13px;
-           font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }}
-QMainWindow {{ background: {PALETTE['bg']}; }}
-QFrame {{ border-color: {PALETTE['panel2']}; }}
-QListWidget {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['panel2']};
-               outline: none; padding: 6px; border-radius: 8px; }}
-QListWidget::item {{ padding: 8px 10px; border-radius: 6px; margin: 1px 0; }}
-QListWidget::item:hover {{ background: {PALETTE['panel2']}; }}
-QListWidget::item:selected {{ background: {PALETTE['accent']}; color: #ffffff; }}
-/* 左侧导航是 QTreeWidget（插件页面挂在「插件」节点下、目录可收起）。
-   这几条要盖住下面那条通用的 `QTableWidget, QTreeWidget, ...` 表格样式 —— `#nav` 更具体。 */
-QTreeWidget#nav {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['panel2']};
-                   outline: none; padding: 4px; border-radius: 8px; }}
-QTreeWidget#nav::item {{ padding: 7px 6px; border-radius: 6px; margin: 1px 0; }}
-QTreeWidget#nav::item:hover {{ background: {PALETTE['panel2']}; }}
-QTreeWidget#nav::item:selected {{ background: {PALETTE['accent']}; color: #ffffff; }}
-QTreeWidget#nav::branch {{ background: transparent; }}
-QTabWidget::pane {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['panel2']};
-                     border-radius: 8px; top: -1px; }}
-QTabBar::tab {{ padding: 8px 14px; background: {PALETTE['panel2']};
-                border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 3px; }}
-QTabBar::tab:selected {{ background: {PALETTE['panel']}; color: {PALETTE['accent']};
-                         font-weight: 600; }}
-QPushButton {{ background: {PALETTE['panel']}; border: 1px solid #d0d7e2;
-               border-radius: 6px; padding: 7px 12px; min-height: 18px; }}
-QPushButton:hover {{ background: #edf3ff; border-color: {PALETTE['accent']}; }}
-QPushButton:pressed {{ background: #dce8ff; }}
-QPushButton:disabled {{ color: #98a2b3; background: #f2f4f7; border-color: #eaecf0; }}
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTextEdit {{
-    background: {PALETTE['panel']}; border: 1px solid #d0d7e2;
-    border-radius: 6px; padding: 6px 8px; selection-background-color: {PALETTE['accent']}; }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus,
-QTextEdit:focus, QComboBox:focus {{ border: 1px solid {PALETTE['accent']}; }}
-QComboBox QAbstractItemView {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['panel2']};
-                               selection-background-color: #e4edff; selection-color: {PALETTE['fg']}; }}
-QTableWidget, QTreeWidget, QListWidget#plain {{ background: {PALETTE['panel']};
-    border: 1px solid {PALETTE['panel2']}; gridline-color: #edf0f5; alternate-background-color: #f8faff; }}
-QTableWidget::item:selected, QTreeWidget::item:selected {{ background: #e4edff; color: {PALETTE['fg']}; }}
-QHeaderView::section {{ background: #f1f4f9; color: #475467; padding: 7px 8px;
-                         border: none; border-bottom: 1px solid {PALETTE['panel2']}; font-weight: 600; }}
-QGroupBox {{ background: {PALETTE['panel']}; border: 1px solid {PALETTE['panel2']};
-             border-radius: 8px; margin-top: 12px; padding: 12px 10px 10px; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px;
-                    color: {PALETTE['dim']}; font-weight: 600; }}
-QStatusBar {{ background: {PALETTE['panel']}; color: {PALETTE['dim']};
-              border-top: 1px solid {PALETTE['panel2']}; }}
-QScrollArea {{ background: transparent; border: none; }}
-QScrollBar:vertical {{ background: transparent; width: 11px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: #c5ceda; border-radius: 5px; min-height: 28px; }}
-QScrollBar::handle:vertical:hover {{ background: #98a6ba; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QCheckBox {{ spacing: 7px; }}
-QToolTip {{ background: #1d2939; color: #ffffff; border: 1px solid #344054;
-            padding: 5px 7px; border-radius: 4px; }}
-QSplitter::handle {{ background: {PALETTE['bg']}; }}
-QSplitter::handle:hover {{ background: #dbe6f6; }}
-QProgressBar {{ background: {PALETTE['panel2']}; border: none; border-radius: 4px;
-                text-align: center; min-height: 8px; }}
-QProgressBar::chunk {{ background: {PALETTE['accent']}; border-radius: 4px; }}
-"""
-
 
 def esc(text: Any) -> str:
     """任何要拼进富文本的外部字符串都先过这里（默认按纯文本处理）。"""
@@ -121,6 +55,35 @@ def esc(text: Any) -> str:
 def badge(text: str, *, level: str = "info") -> str:
     color = LEVEL_COLOR.get(level, PALETTE["fg"])
     return f"<span style='color:{color};font-weight:600'>{esc(text)}</span>"
+
+
+# 只给**本地固定的说明文案**用（`features/catalog.py` 里的 description 是带
+# `**粗体**` / `` `键名` `` 的 Markdown）。服务端数据一律仍走 `esc()` / `label()`，
+# 绝不在这里解释富文本 —— 那条边界由 `widgets.label` 与各页面自己守着。
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+_CODE_SPAN = (
+    "<span style='font-family:Consolas,\"Cascadia Mono\",monospace;"
+    f"color:{PALETTE['dim']}'>\\1</span>"
+)
+
+
+def local_rich(text: str) -> str:
+    """本地说明文案的**最小** Markdown 处理：先转义，再只认 `**粗体**` 与反引号代码。"""
+    out = esc(text)
+    out = _MD_BOLD.sub(r"<b>\1</b>", out)
+    out = _MD_CODE.sub(_CODE_SPAN, out)
+    return out
+
+
+def description_label(text: str, *, wrap: bool = True) -> QtWidgets.QLabel:
+    """功能说明这类**本地固定文案**的富文本标签（外部字符串不要用这个）。"""
+    widget = QtWidgets.QLabel(local_rich(text))
+    widget.setObjectName("descriptionText")
+    widget.setTextFormat(QtCore.Qt.TextFormat.RichText)
+    widget.setWordWrap(wrap)
+    widget.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+    return widget
 
 
 # 折行 + 截断的实现只有一份，在 `core/util.py`（那一层不依赖 Qt，所以能被两边共用）。
@@ -263,12 +226,111 @@ class Async(QtCore.QObject):
 # ---------------------------------------------------------------- 控件工厂
 
 
-def busy_button(text: str, on_click: Callable[[], None], *, tip: str = "") -> QtWidgets.QPushButton:
+#: 按钮角色。QSS 用 `QPushButton[variant="…"]` 选择器上色，**不逐页写 inline stylesheet**。
+BUTTON_VARIANTS = ("", "primary", "danger", "ghost")
+
+
+def set_variant(button: QtWidgets.QPushButton, kind: str = "secondary") -> QtWidgets.QPushButton:
+    """给已有按钮换角色（`primary` / `danger` / `ghost` / `secondary`）。
+
+    QSS 的动态属性选择器不会在属性变化时自动重绘，所以这里显式 unpolish/polish。
+    """
+    value = "" if kind in ("", "secondary", "default") else str(kind)
+    if value not in BUTTON_VARIANTS:
+        raise ValueError(f"未知按钮角色：{kind!r}")
+    button.setProperty("variant", value)
+    style = button.style()
+    style.unpolish(button)
+    style.polish(button)
+    button.update()
+    return button
+
+
+def _action_button(
+    text: str,
+    on_click: Callable[[], None],
+    *,
+    tip: str = "",
+    variant: str = "",
+) -> QtWidgets.QPushButton:
     button = QtWidgets.QPushButton(text)
     button.clicked.connect(lambda: on_click())
+    button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+    # QSS 的 min-width 是内容盒（42 + padding 28 + 边框 2 = 72）；这里再钉一次实际宽度，
+    # 页面代码就算误设了更小的 maxWidth 也不会把文字挤掉（按钮文字截断是踩过的）。
+    button.setMinimumWidth(theme.BUTTON_MIN_WIDTH)
+    if variant:
+        set_variant(button, variant)
     if tip:
         button.setToolTip(tip)
     return button
+
+
+def primary_button(text: str, on_click: Callable[[], None], *, tip: str = "") -> QtWidgets.QPushButton:
+    """**每页唯一的主操作**：强调色实底 + 白字。"""
+    return _action_button(text, on_click, tip=tip, variant="primary")
+
+
+def danger_button(text: str, on_click: Callable[[], None], *, tip: str = "") -> QtWidgets.QPushButton:
+    """危险操作：删除 / 清除 / 重置 / 花 token。错误色描边 + 文字。"""
+    return _action_button(text, on_click, tip=tip, variant="danger")
+
+
+def ghost_button(text: str, on_click: Callable[[], None], *, tip: str = "") -> QtWidgets.QPushButton:
+    """低强调操作（跳转、辅助入口）：透明底、无边框，hover 才出现浅底。"""
+    return _action_button(text, on_click, tip=tip, variant="ghost")
+
+
+def busy_button(text: str, on_click: Callable[[], None], *, tip: str = "") -> QtWidgets.QPushButton:
+    return _action_button(text, on_click, tip=tip)
+
+
+def toolbar_note(text: str) -> QtWidgets.QLabel:
+    """工具条左侧的弱色说明（12px、次要色）。"""
+    note = QtWidgets.QLabel(str(text))
+    note.setObjectName("toolbarNote")
+    note.setWordWrap(False)
+    return note
+
+
+def toolbar(description: str = "") -> QtWidgets.QHBoxLayout:
+    """统一工具条：**左说明、右操作**，组内间距 8。
+
+    返回的布局已经放了左侧说明与一个 stretch；调用方只需继续 `addWidget`
+    右对齐的操作按钮。危险按钮组前面自己 `addSpacing(theme.SPACE["lg"])` 隔开。
+    """
+    bar = QtWidgets.QHBoxLayout()
+    bar.setContentsMargins(0, 0, 0, 0)
+    bar.setSpacing(theme.SPACE["sm"])
+    if description:
+        bar.addWidget(toolbar_note(description))
+    bar.addStretch(1)
+    return bar
+
+
+def section_separator() -> QtWidgets.QFrame:
+    """竖分隔线（危险操作与普通操作之间用；不需要时用 `addSpacing(16)` 也行）。"""
+    line = QtWidgets.QFrame()
+    line.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+    line.setFixedWidth(1)
+    line.setStyleSheet(f"color:{PALETTE['border']}; background:{PALETTE['border']}; border:none;")
+    return line
+
+
+def style_form(form: QtWidgets.QFormLayout, *, label_width: int = theme.FORM_LABEL_WIDTH) -> None:
+    """表单统一：label 右对齐、固定宽 110、行距 10、字段可伸展。"""
+    form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+    form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+    form.setHorizontalSpacing(theme.SPACE["md"])
+    form.setVerticalSpacing(10)
+    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows)
+    for row in range(form.rowCount()):
+        item = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.LabelRole)
+        widget = item.widget() if item is not None else None
+        if widget is not None:
+            widget.setMinimumWidth(label_width)
+            widget.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
 
 def plain_text_edit(text: str = "", *, readonly: bool = True) -> QtWidgets.QPlainTextEdit:
@@ -285,14 +347,40 @@ def table(headers: list[str], *, stretch_last: bool = True) -> QtWidgets.QTableW
     widget = QtWidgets.QTableWidget(0, len(headers))
     widget.setHorizontalHeaderLabels(headers)
     widget.verticalHeader().setVisible(False)
+    widget.verticalHeader().setDefaultSectionSize(theme.TABLE_ROW_HEIGHT)
     widget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
     widget.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
     widget.setAlternatingRowColors(True)
     header = widget.horizontalHeader()
+    header.setFixedHeight(theme.TABLE_HEADER_HEIGHT)
+    header.setDefaultAlignment(
+        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+    )
     header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-    if stretch_last:
+    if stretch_last and headers:
+        # `setStretchLastSection(True)` 在「所有列都是 ResizeToContents」时不会真的拉伸
+        # （实测：表宽 824、最后一列仍按内容 411，右侧留下大片空白）。必须把最后一列
+        # 的 resize mode 也改成 Stretch，内容才会横向铺满。
         header.setStretchLastSection(True)
+        header.setSectionResizeMode(
+            len(headers) - 1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
     return widget
+
+
+def fit_table(widget: QtWidgets.QTableWidget) -> None:
+    """按内容定列宽，并**重新下令**让最后一列拉伸铺满。
+
+    踩过的坑：`resizeColumnsToContents()` 会把最后一列也按内容定宽，把
+    `Stretch` 的实际宽度打回去；必须在 resize 之后再设一次 Stretch，
+    否则表格右侧会留一条几百像素的空白（用户截图里报过）。
+    """
+    header = widget.horizontalHeader()
+    widget.resizeColumnsToContents()
+    if widget.columnCount() and header.stretchLastSection():
+        header.setSectionResizeMode(
+            widget.columnCount() - 1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
 
 
 def read_only_item(text: Any, *, tip: str = "") -> QtWidgets.QTableWidgetItem:
@@ -321,7 +409,8 @@ def label(text: str, *, level: str = "info", wrap: bool = False) -> QtWidgets.QL
 def hline() -> QtWidgets.QFrame:
     line = QtWidgets.QFrame()
     line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-    line.setStyleSheet(f"color:{PALETTE['panel2']}")
+    line.setFixedHeight(1)
+    line.setStyleSheet(f"color:{PALETTE['border']}; background:{PALETTE['border']}; border:none;")
     return line
 
 

@@ -9,7 +9,7 @@
 * `files._download_via_ips()` —— 同一个入口，且它还会**临时替换全局 `socket.getaddrinfo`**；
 * `stickers._download()` —— 图片段的 `url` / `file` 同样是外部可控输入。
 
-于是群友发一条消息就能让容器去访问 `http://searxng:8080`（同 compose 网络内的服务）、
+于是群友发一条消息就能让容器去访问 `http://napcat:6099`（同 compose 网络内的服务）、
 `http://169.254.169.254`（云元数据）这类内网目标。现在四处统一走这里。
 
 ## 判据（任一条不满足即拒绝）

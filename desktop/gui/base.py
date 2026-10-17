@@ -215,7 +215,7 @@ def build_field(spec: dict[str, Any], on_commit: Callable[[str, Any], None]) -> 
     widget = QtWidgets.QLineEdit(str(spec.get("value") if spec.get("value") is not None else ""))
     if secret:
         widget.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        widget.setPlaceholderText("已保存（显示为掩码；改这里才会覆盖）")
+        widget.setPlaceholderText("已保存（掩码）")
     widget.editingFinished.connect(lambda k=key, w=widget: on_commit(k, w.text()))
     return Field(spec, widget, lambda: widget.text(), lambda v: widget.setText(str(v)))
 
