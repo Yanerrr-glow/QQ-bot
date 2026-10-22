@@ -50,12 +50,13 @@
 
 | 主题 | 文档 |
 |---|---|
+| 代码分层与功能扩展入口 | [`docs/架构与扩展_2026-10-22.md`](docs/架构与扩展_2026-10-22.md) |
+| 减少 AI 腔的人格写法与迭代方案 | [`docs/自然对话与人格迭代_2026-10-22.md`](docs/自然对话与人格迭代_2026-10-22.md) |
 | 架构、配置、运行机制、数据文件与开发记录 | [`docs/开发日志.md`](docs/开发日志.md) |
 | **人格包每一份文件怎么写**（内容规范） | [`docs/人格包内容规范.md`](docs/人格包内容规范.md) |
 | 人格、目录、运行数据及日志写入规范 | [`docs/文档与日志规范.md`](docs/文档与日志规范.md) |
 | 服务器部署 | [`deploy/README.md`](deploy/README.md) |
 | 机器人源码模块地图 | [`plugins/ai_chat/README.md`](plugins/ai_chat/README.md) |
 | 桌面管理端 | [`desktop/README.md`](desktop/README.md) |
-| 桌面管理端与插件开发 | [`desktop/README.md`](desktop/README.md) |
 
 许可与第三方依赖信息以仓库随附文件为准。

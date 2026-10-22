@@ -103,6 +103,7 @@ def main() -> int:
         window = MainWindow(manager)
         window.show()
         _pump(app, 0.4)
+        assert all(not p._loaded for p in window.pages[1:]), "启动不应预加载后台页面"
         return (f"内置页面 {len(window.pages)} 个，导航顶层 {window.nav.topLevelItemCount()} 项、"
                 f"「{FEATURES_SECTION}」子项 "
                 f"{window.features_item.childCount() if window.features_item else 0} 项、"
@@ -121,6 +122,64 @@ def main() -> int:
         return f"{result.elapsed_ms} ms"
 
     step("连接探测（桩服务）", _probe)
+
+    def _search_navigation():
+        window.features_item.setExpanded(False)
+        window.nav_search.setText("人格自动迭代")
+        assert window.features_item.isExpanded()
+        window._open_search_result()
+        assert "人格自动迭代" in window._current_page().title
+        window.nav_search.setText("no-such-page-4891")
+        assert not window.nav_empty.isHidden()
+        window.nav_search.clear()
+        assert not window.features_item.isExpanded(), "清空搜索应恢复目录折叠状态"
+        window.goto_page("总览")
+        page = window._current_page()
+        page.invalidate()
+        window.goto_page("总览")
+        assert page._loaded, "重复跳转当前页也应重载失效数据"
+        return "搜索、回车跳转、空结果、折叠恢复与当前页重载"
+
+    step("导航搜索与重复跳转", _search_navigation)
+
+    def _page_lifecycle():
+        from desktop.gui.base import Page
+        from desktop.gui.widgets import TaskResult
+
+        callbacks = []
+        delivered = []
+
+        class Deferred:
+            def run(self, fn, *, on_done):
+                callbacks.append(on_done)
+
+        class SamplePage(Page):
+            def _load(self):
+                self.run_task(lambda: None, on_done=lambda r: delivered.append(r.value))
+
+        page = SamplePage(manager)
+        page.async_ = Deferred()
+        page.load()
+        page.load(force=True)
+        assert len(callbacks) == 1, "加载期间重复刷新不应重复请求"
+        page.invalidate()
+        page.load()
+        callbacks[0](TaskResult(ok=True, value="旧目标"))
+        assert not delivered and page._pending_tasks == 1
+        callbacks[1](TaskResult(ok=False, error=ValueError("模拟失败")))
+        assert not page._loaded
+        page.load()
+        callbacks[2](TaskResult(ok=True, value="新目标"))
+        assert delivered[-1] == "新目标" and page._pending_tasks == 0
+        from desktop.gui.page_connections import ConnectionsPage
+        connection_page = ConnectionsPage(manager)
+        connection_page.invalidate()
+        assert isinstance(connection_page.token, QtWidgets.QLineEdit)
+        connection_page.deleteLater()
+        page.deleteLater()
+        return "合并刷新、丢弃过期回调、失败重试、令牌输入框与生命周期隔离"
+
+    step("页面异步生命周期", _page_lifecycle)
 
     def _features_nav():  # noqa: ANN202
         """「功能」目录必须与总览同级，功能子菜单必须**都在它下面**。
@@ -302,6 +361,7 @@ def main() -> int:
 
         page = next((p for p in window.pages if isinstance(p, ConnectionsPage)), None)
         assert page is not None, "找不到连接设置页"
+        window.goto_page(page.title)
         assert page.target_list.count() > 0, "连接页首屏目标列表是空的"
         assert page._target is not None, "连接页首屏没有选中目标"  # noqa: SLF001
 
@@ -357,7 +417,7 @@ def main() -> int:
 
         设计说明：**SSH 端指向本机 sshd，转发目标指向桩服务端口**。
         这样"隧道通不通"是可断言的（不依赖机器人是否在跑），
-        而且完全不碰真实服务器。本机没有可用别名/没有 sshd 就跳过 ——
+        通过 QQBOT_SMOKE_SSH_ALIAS 显式提供本机测试别名，没有配置/没有 sshd 就跳过 ——
         不把"环境没有 sshd"算成失败。
         """
         from desktop.core.targets import MODE_SSH, SshConfig, Target
@@ -366,10 +426,10 @@ def main() -> int:
         page = next((p for p in window.pages if isinstance(p, ConnectionsPage)), None)
         assert page is not None
 
-        names = ConnectionsPage.read_ssh_aliases()
-        if not names:
-            return "跳过：本机 ~/.ssh/config 里没有可用的 Host 别名"
-        alias = names[0]
+        # 必须显式指定测试别名，不能把用户的第一个真实服务器当测试环境。
+        alias = os.environ.get("QQBOT_SMOKE_SSH_ALIAS", "").strip()
+        if not alias:
+            return "跳过：未设置 QQBOT_SMOKE_SSH_ALIAS（应指向本机测试 sshd）"
 
         target = Target(name="冒烟隧道目标", mode=MODE_SSH)
         target.ssh = SshConfig(use_alias=True, alias=alias, remote_host="127.0.0.1",
@@ -415,6 +475,17 @@ def main() -> int:
         return f"别名 {alias} → 自动填入 {filled} → 可连通 → 停止后清空"
 
     step("启动隧道 → 地址自动填入并可连通", _tunnel_autofill)
+
+    screenshot = os.environ.get("QQBOT_GUI_SMOKE_SCREENSHOT", "")
+    if screenshot:
+        window.goto_page("总览")
+        _pump(app, 0.6)
+
+        def _save_preview():
+            if not window.grab().save(screenshot):
+                raise RuntimeError("截图保存失败")
+
+        step("保存界面预览", _save_preview)
 
     def _close():  # noqa: ANN202
         window.close()

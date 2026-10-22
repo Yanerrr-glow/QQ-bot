@@ -12,7 +12,7 @@
 | 消息与记忆 | `chatlog.py`、`memory.py`、`memstore.py`、`summaries.py`、`msgindex.py`、`search_memory.py` | 聊天记录、摘要、长期记忆及检索索引 |
 | 会话状态与主动任务 | `state.py`、`attention.py`、`proactive.py`、`greetings.py`、`clock.py`、`signals.py`、`task_manager.py` | 可恢复状态、提醒、主动发言、时间与后台任务 |
 | 外部内容与安全 | `search.py`、`fetch.py`、`files.py`、`pdf.py`、`netguard.py`、`render.py` | 搜索、网页/文件读取、出站访问校验和渲染回退 |
-| 媒体与界面 | `stickers.py`、`perceptual.py`、`webui.py`、`dsh_bridge.py` | 表情包、图像感知、机器人 Web 控制台和本机桥接 |
+| 媒体与界面 | `stickers.py`、`perceptual.py`、`webui.py`、`web/console.html`、`dsh_bridge.py` | 表情包、图像感知、管理 API、独立 Web 模板和本机桥接 |
 
 改动前先找现有职责归属；新模块应有单一职责，并在本表补一行。避免把配置、持久化、网络访问和业务判断集中塞进 `__init__.py`。
 

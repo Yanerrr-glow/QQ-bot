@@ -34,8 +34,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -43,7 +45,15 @@ from typing import Any
 
 logger = logging.getLogger("ai_chat.memstore")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+class MemoryWriteError(RuntimeError):
+    """记忆写盘失败。
+
+    调用方**必须**把它当作失败处理：不能刷新缓存、不能推进抽取水位线。
+    只读状态、数据库提交失败、JSON 原子替换失败都统一抛这个异常。
+    """
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -118,6 +128,18 @@ CREATE TABLE IF NOT EXISTS extract_state (
     total       INTEGER NOT NULL DEFAULT 0,
     updated_at  TEXT NOT NULL DEFAULT ''
 );
+
+-- 抽取批次：先落库、后推进 JSON 水位线。提交后若在写水位线前崩溃，
+-- 重启时用这张表把水位线补到已提交的批次，不重复抽取。
+CREATE TABLE IF NOT EXISTS memory_batches (
+    batch_id          TEXT PRIMARY KEY,
+    conv              TEXT NOT NULL,
+    last_message_id   INTEGER NOT NULL DEFAULT 0,
+    message_count     INTEGER NOT NULL DEFAULT 0,
+    extractor_version TEXT NOT NULL DEFAULT '',
+    committed_at      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_batches_conv ON memory_batches(conv, last_message_id);
 """
 
 
@@ -145,10 +167,13 @@ class JsonStore:
         self.facts: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
         self.entities: dict[str, dict[str, Any]] = {}
+        self.batches: dict[str, dict[str, Any]] = {}
         self.next_id = 1
         self.meta: dict[str, Any] = {}
         self.readonly_reason = ""
         self.loaded = False
+        self._batch_active = False
+        self._batch_snapshot: dict[str, Any] | None = None
 
     # -------------------------------------------------- 生命周期
     def ensure(self) -> None:
@@ -177,6 +202,9 @@ class JsonStore:
         self.entities = {
             str(k): v for k, v in (raw.get("entities") or {}).items() if isinstance(v, dict)
         }
+        self.batches = {
+            str(k): v for k, v in (raw.get("batches") or {}).items() if isinstance(v, dict)
+        }
         self.next_id = int(raw.get("next_id", len(self.facts) + 1))
         self.meta = dict(raw.get("meta") or {})
         if self.facts:
@@ -194,25 +222,158 @@ class JsonStore:
             logger.error("记忆库损坏（%s）且改名失败，仍进入只读：%s", self.readonly_reason, self.path)
 
     def save(self) -> None:
+        if self._batch_active:
+            return  # 批次提交时统一写一次，避免中途落半成品
+        self._save_now()
+
+    def _save_now(self) -> None:
         if self.readonly_reason:
-            logger.error(
-                "记忆库处于只读模式（原因：%s），本次不写盘", self.readonly_reason,
-            )
-            return
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 2,
+            "version": 3,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "next_id": self.next_id,
             "profile": self.profile,
             "facts": self.facts,
             "events": self.events,
             "entities": self.entities,
+            "batches": self.batches,
             "meta": self.meta,
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(self.path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, indent=1))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise MemoryWriteError(f"JSON 记忆库写入失败：{exc}") from exc
+
+    # -------------------------------------------------- 画像写入（显式快照）
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "profile": {k: copy.deepcopy(v) for k, v in self.profile.items()},
+            "facts": [copy.deepcopy(f) for f in self.facts],
+            "events": [copy.deepcopy(e) for e in self.events],
+            "entities": copy.deepcopy(self.entities),
+            "batches": copy.deepcopy(self.batches),
+            "next_id": self.next_id,
+        }
+
+    def _restore(self, snapshot: dict[str, Any]) -> None:
+        self.profile = snapshot["profile"]
+        self.facts = snapshot["facts"]
+        self.events = snapshot["events"]
+        self.entities = snapshot["entities"]
+        self.batches = snapshot["batches"]
+        self.next_id = snapshot["next_id"]
+
+    def write_profile(self, key: str, info: dict[str, Any]) -> None:
+        """整条覆盖写入。成功才发布内存快照；失败保留旧值。"""
+        self.ensure()
+        if self.readonly_reason:
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
+        snapshot = self._snapshot()
+        self.profile[str(key)] = copy.deepcopy(info)
+        try:
+            self.save()
+        except Exception:
+            self._restore(snapshot)
+            raise
+
+    def delete_profile(self, key: str) -> bool:
+        self.ensure()
+        if self.readonly_reason:
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
+        snapshot = self._snapshot()
+        existed = str(key) in self.profile
+        self.profile.pop(str(key), None)
+        if not existed:
+            return False
+        try:
+            self.save()
+        except Exception:
+            self._restore(snapshot)
+            raise
+        return True
+
+    def merge_profile_keys(self, source_key: str, target_key: str,
+                           merged: dict[str, Any]) -> None:
+        """把 source 合并进 target 并删除 source，整体一次写入。"""
+        self.ensure()
+        if self.readonly_reason:
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
+        snapshot = self._snapshot()
+        self.profile[str(target_key)] = copy.deepcopy(merged)
+        self.profile.pop(str(source_key), None)
+        try:
+            self.save()
+        except Exception:
+            self._restore(snapshot)
+            raise
+
+    def clear_bucket(self, kind: str) -> None:
+        """清空一整类数据。先写盘、后清内存，失败保持原状。"""
+        self.ensure()
+        if self.readonly_reason:
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
+        if kind not in ("facts", "events", "profile"):
+            raise ValueError(f"未知数据类型：{kind}")
+        snapshot = self._snapshot()
+        getattr(self, kind).clear()
+        try:
+            self.save()
+        except Exception:
+            self._restore(snapshot)
+            raise
+
+    # -------------------------------------------------- 批次
+    def begin_batch(self) -> None:
+        self.ensure()
+        if self._batch_active:
+            raise MemoryWriteError("已有进行中的记忆写入批次")
+        self._batch_snapshot = self._snapshot()
+        self._batch_active = True
+
+    def commit_batch(self, batch_id: str, conv: str, last_message_id: int,
+                     message_count: int, extractor_version: str) -> None:
+        if not self._batch_active:
+            raise MemoryWriteError("没有进行中的记忆写入批次")
+        snapshot = self._batch_snapshot or self._snapshot()
+        self.batches[str(batch_id)] = {
+            "conv": conv,
+            "last_message_id": int(last_message_id),
+            "message_count": int(message_count),
+            "extractor_version": str(extractor_version),
+            "committed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._batch_active = False
+        try:
+            self._save_now()
+        except Exception:
+            self._restore(snapshot)
+            raise
+        self._batch_snapshot = None
+
+    def rollback_batch(self) -> None:
+        if self._batch_active:
+            self._batch_active = False
+            if self._batch_snapshot is not None:
+                self._restore(self._batch_snapshot)
+            self._batch_snapshot = None
+
+    def latest_committed_batch(self, conv: str) -> dict[str, Any] | None:
+        self.ensure()
+        rows = [v for v in self.batches.values() if str(v.get("conv") or "") == conv]
+        if not rows:
+            return None
+        return max(rows, key=lambda v: int(v.get("last_message_id", 0) or 0))
 
     def close(self) -> None:
         return None
@@ -253,6 +414,8 @@ class SqliteStore:
         self.loaded = False
         self._deleted_facts: set[int] = set()
         self._deleted_events: set[int] = set()
+        self._batch_active = False
+        self._batch_snapshot: dict[str, Any] | None = None
 
     # -------------------------------------------------- 生命周期
     def ensure(self) -> None:
@@ -333,6 +496,118 @@ class SqliteStore:
                 pass
             self.conn = None
 
+    # -------------------------------------------------- 批次 / 事务辅助
+    def _require_writable(self) -> None:
+        if self.readonly_reason:
+            raise MemoryWriteError(f"记忆库只读：{self.readonly_reason}")
+
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        if not self._batch_active:
+            conn.commit()
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            # 只复制纯数据：容器上挂着 _store（含 sqlite 连接），不能整对象 deepcopy
+            "profile": {k: copy.deepcopy(v) for k, v in self.profile.items()},
+            "facts": [copy.deepcopy(f) for f in self.facts],
+            "events": [copy.deepcopy(e) for e in self.events],
+            "entities": copy.deepcopy(self.entities),
+            "next_id": self.next_id,
+            "meta": copy.deepcopy(self.meta),
+            "deleted_facts": set(self._deleted_facts),
+            "deleted_events": set(self._deleted_events),
+        }
+
+    def _restore(self, snapshot: dict[str, Any]) -> None:
+        self._raw_facts = snapshot["facts"]
+        self._raw_events = snapshot["events"]
+        self._raw_profile = snapshot["profile"]
+        self.facts = _WriteThroughList(self._raw_facts, self, "facts")
+        self.events = _WriteThroughList(self._raw_events, self, "events")
+        self.profile = _WriteThroughDict(self._raw_profile, self)
+        self.entities = snapshot["entities"]
+        self.next_id = snapshot["next_id"]
+        self.meta = snapshot["meta"]
+        self._deleted_facts = snapshot["deleted_facts"]
+        self._deleted_events = snapshot["deleted_events"]
+
+    def begin_batch(self) -> None:
+        self.ensure()
+        if self._batch_active:
+            raise MemoryWriteError("已有进行中的记忆写入批次")
+        self._require_writable()
+        conn = self._connect()
+        if conn.in_transaction:
+            conn.commit()
+        self._batch_snapshot = self._snapshot()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            self._batch_snapshot = None
+            raise MemoryWriteError(f"开启记忆事务失败：{exc}") from exc
+        self._batch_active = True
+
+    def commit_batch(self, batch_id: str, conv: str, last_message_id: int,
+                     message_count: int, extractor_version: str) -> None:
+        if not self._batch_active:
+            raise MemoryWriteError("没有进行中的记忆写入批次")
+        conn = self._connect()
+        snapshot = self._batch_snapshot or self._snapshot()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_batches"
+                "(batch_id, conv, last_message_id, message_count, extractor_version, committed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    str(batch_id), conv, int(last_message_id), int(message_count),
+                    str(extractor_version), time.strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            self._batch_active = False
+            self._restore(snapshot)
+            self._batch_snapshot = None
+            raise MemoryWriteError(f"提交记忆批次失败：{exc}") from exc
+        self._batch_active = False
+        self._batch_snapshot = None
+
+    def rollback_batch(self) -> None:
+        if not self._batch_active:
+            return
+        try:
+            if self.conn is not None:
+                self.conn.rollback()
+        finally:
+            self._batch_active = False
+            if self._batch_snapshot is not None:
+                self._restore(self._batch_snapshot)
+            self._batch_snapshot = None
+
+    def latest_committed_batch(self, conv: str) -> dict[str, Any] | None:
+        self.ensure()
+        try:
+            row = self._connect().execute(
+                "SELECT * FROM memory_batches WHERE conv=? ORDER BY last_message_id DESC LIMIT 1",
+                (conv,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        return {
+            "batch_id": str(row["batch_id"]),
+            "conv": str(row["conv"]),
+            "last_message_id": int(row["last_message_id"] or 0),
+            "message_count": int(row["message_count"] or 0),
+            "extractor_version": str(row["extractor_version"] or ""),
+            "committed_at": str(row["committed_at"] or ""),
+        }
+
     # -------------------------------------------------- 写入
     def next_fact_id(self) -> int:
         self.ensure()
@@ -341,22 +616,24 @@ class SqliteStore:
         return fid
 
     def upsert_fact(self, fact: dict[str, Any]) -> None:
-        """新增或整体更新一条事实（按 id）。"""
+        """新增或整体更新一条事实（按 id）。失败必须抛出，内存不变。"""
         self.ensure()
-        if self.readonly_reason:
-            return
-        _upsert_fact(self._raw_facts, fact)
+        self._require_writable()
         try:
             conn = self._connect()
             conn.execute(_FACT_UPSERT_SQL, _fact_to_row(fact))
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("写事实失败 id=%s", fact.get("id"))
+            raise MemoryWriteError(f"写事实失败：{exc}") from exc
+        _upsert_fact(self._raw_facts, fact)
 
     def touch_facts(self, facts: list[dict[str, Any]]) -> None:
         """只更新这些条目的可变字段（used / hits / last_used）。给 `mark_used` 用。"""
-        if not facts or self.readonly_reason:
+        if not facts:
             return
+        self.ensure()
+        self._require_writable()
         try:
             conn = self._connect()
             for fact in facts:
@@ -370,9 +647,10 @@ class SqliteStore:
                         int(fact.get("id", 0) or 0),
                     ),
                 )
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("更新使用计数失败")
+            raise MemoryWriteError(f"更新使用计数失败：{exc}") from exc
 
     def delete_fact(self, fact_id: int) -> bool:
         return self._delete("facts", fact_id, self._deleted_facts)
@@ -382,15 +660,15 @@ class SqliteStore:
 
     def upsert_event(self, event: dict[str, Any]) -> None:
         self.ensure()
-        if self.readonly_reason:
-            return
-        _upsert_fact(self._raw_events, event)  # 同一个"按 id 覆盖"逻辑，复用它
+        self._require_writable()
         try:
             conn = self._connect()
             conn.execute(_EVENT_UPSERT_SQL, _event_to_row(event))
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("写群事件失败 id=%s", event.get("id"))
+            raise MemoryWriteError(f"写群事件失败：{exc}") from exc
+        _upsert_fact(self._raw_events, event)  # 同一个"按 id 覆盖"逻辑，复用它
 
     def delete_item(self, kind: str, item_id: int) -> bool:
         """按表名删一行。给写入穿透列表用（它只知道 "facts" / "events"）。"""
@@ -402,46 +680,46 @@ class SqliteStore:
 
     def delete_profile(self, key: str) -> bool:
         self.ensure()
-        if self.readonly_reason:
-            return False
-        self._raw_profile.pop(str(key), None)
+        self._require_writable()
         try:
             conn = self._connect()
             conn.execute("DELETE FROM profile WHERE key=?", (str(key),))
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("删人物画像失败 key=%s", key)
-            return False
-        return True
+            raise MemoryWriteError(f"删人物画像失败：{exc}") from exc
+        existed = str(key) in self._raw_profile
+        self._raw_profile.pop(str(key), None)
+        return existed
 
     def _delete(self, table: str, item_id: int, bucket: set[int]) -> bool:
         self.ensure()
-        if self.readonly_reason:
-            return False
+        self._require_writable()
         bucket.add(int(item_id))
         try:
             conn = self._connect()
             conn.execute(f"DELETE FROM {table} WHERE id=?", (int(item_id),))
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("删除 %s#%s 失败", table, item_id)
-            return False
+            raise MemoryWriteError(f"删除 {table}#{item_id} 失败：{exc}") from exc
         return True
 
     def replace_all(self, *, profile: dict[str, Any], facts: list[dict[str, Any]],
                     events: list[dict[str, Any]], entities: dict[str, Any] | None = None) -> None:
-        """整库重写。只在 `clear()` / 迁移这类"成批改动"时用。"""
+        """整库重写。只在 `clear()` / 迁移这类"成批改动"时用。
+
+        **先写库、后换内存**：库失败时内存保持旧值，不能出现"控制台看起来清空了、
+        重启又回来"。
+        """
         self.ensure()
-        if self.readonly_reason:
-            return
-        self.profile = profile
-        self.facts = facts
-        self.events = events
-        if entities is not None:
-            self.entities = entities
+        self._require_writable()
+        conn = self._connect()
         try:
-            conn = self._connect()
-            conn.execute("BEGIN")
+            if not self._batch_active:
+                if conn.in_transaction:
+                    conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM facts")
             conn.execute("DELETE FROM events")
             conn.execute("DELETE FROM profile")
@@ -452,46 +730,121 @@ class SqliteStore:
             conn.executemany(
                 _ENTITY_UPSERT_SQL, [_entity_to_row(k, v) for k, v in (entities or {}).items()]
             )
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             logger.exception("整库重写失败")
+            raise MemoryWriteError(f"整库重写失败：{exc}") from exc
+        self._raw_facts = copy.deepcopy(list(facts))
+        self._raw_events = copy.deepcopy(list(events))
+        self._raw_profile = copy.deepcopy(dict(profile))
+        self.facts = _WriteThroughList(self._raw_facts, self, "facts")
+        self.events = _WriteThroughList(self._raw_events, self, "events")
+        self.profile = _WriteThroughDict(self._raw_profile, self)
+        if entities is not None:
+            self.entities = copy.deepcopy(dict(entities))
 
-    def upsert_profile(self, key: str, info: dict[str, Any]) -> None:
+    def write_profile(self, key: str, info: dict[str, Any]) -> None:
+        """整条覆盖写入：先提交 SQL，成功后才同步内存。"""
         self.ensure()
-        if self.readonly_reason:
-            return
-        self._raw_profile[key] = info
+        self._require_writable()
+        conn = None
         try:
             conn = self._connect()
-            conn.execute(_PROFILE_UPSERT_SQL, _profile_to_row(key, info))
-            conn.commit()
-        except sqlite3.Error:
+            conn.execute(_PROFILE_UPSERT_SQL, _profile_to_row(str(key), info))
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("写人物画像失败 key=%s", key)
+            try:
+                if conn is not None and conn.in_transaction and not self._batch_active:
+                    conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise MemoryWriteError(f"写人物画像失败：{exc}") from exc
+        self._raw_profile[str(key)] = copy.deepcopy(info)
+
+    def upsert_profile(self, key: str, info: dict[str, Any]) -> None:
+        """兼容旧接口；语义与 `write_profile` 相同。"""
+        self.write_profile(key, info)
+
+    def merge_profile_keys(self, source_key: str, target_key: str,
+                           merged: dict[str, Any]) -> None:
+        """同一事务内更新目标、删除源；失败整体回滚。"""
+        self.ensure()
+        self._require_writable()
+        conn = None
+        try:
+            conn = self._connect()
+            if not self._batch_active:
+                if conn.in_transaction:
+                    conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+            conn.execute(_PROFILE_UPSERT_SQL, _profile_to_row(str(target_key), merged))
+            conn.execute("DELETE FROM profile WHERE key=?", (str(source_key),))
+            self._commit(conn)
+        except sqlite3.Error as exc:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except sqlite3.Error:
+                pass
+            logger.exception("归并人物画像失败 %s → %s", source_key, target_key)
+            raise MemoryWriteError(f"归并人物画像失败：{exc}") from exc
+        self._raw_profile[str(target_key)] = copy.deepcopy(merged)
+        self._raw_profile.pop(str(source_key), None)
+
+    def clear_bucket(self, kind: str) -> None:
+        """清空一整类数据：先提交 DELETE，成功后才清内存。"""
+        self.ensure()
+        self._require_writable()
+        if kind not in ("facts", "events", "profile"):
+            raise ValueError(f"未知数据类型：{kind}")
+        conn = None
+        try:
+            conn = self._connect()
+            conn.execute(f"DELETE FROM {kind}")
+            self._commit(conn)
+        except sqlite3.Error as exc:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise MemoryWriteError(f"清空 {kind} 失败：{exc}") from exc
+        if kind == "facts":
+            self._raw_facts = []
+            self.facts = _WriteThroughList(self._raw_facts, self, "facts")
+        elif kind == "events":
+            self._raw_events = []
+            self.events = _WriteThroughList(self._raw_events, self, "events")
+        else:
+            self._raw_profile = {}
+            self.profile = _WriteThroughDict(self._raw_profile, self)
 
     def upsert_entity(self, name: str, info: dict[str, Any]) -> None:
         self.ensure()
-        if self.readonly_reason:
-            return
-        self.entities[name] = info
+        self._require_writable()
         try:
             conn = self._connect()
             conn.execute(_ENTITY_UPSERT_SQL, _entity_to_row(name, info))
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("写名字索引失败 name=%s", name)
+            raise MemoryWriteError(f"写名字索引失败：{exc}") from exc
+        self.entities[name] = info
 
     def save(self) -> None:
         """兜底：把内存里的 next_id 落一次。
 
         与 JSON 后端不同，SQLite 后端**每次写操作已经单独落盘**，
         所以 `save()` 不再是"把整库写一遍"，只是补一个计数器。
+        失败必须抛出；批次进行中不单独提交。
         """
         self.ensure()
-        if self.readonly_reason:
-            logger.error(
-                "记忆库处于只读模式（原因：%s），本次不写盘", self.readonly_reason,
-            )
-            return
+        self._require_writable()
         try:
             conn = self._connect()
             conn.execute(
@@ -499,9 +852,10 @@ class SqliteStore:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (_dumps(self.next_id),),
             )
-            conn.commit()
-        except sqlite3.Error:
+            self._commit(conn)
+        except sqlite3.Error as exc:
             logger.exception("写 meta 失败")
+            raise MemoryWriteError(f"写 meta 失败：{exc}") from exc
 
 
 # --------------------------------------------------------------------- 写入穿透
@@ -532,27 +886,31 @@ class _WriteThroughList(list):
             self._store.upsert_event(item)
 
     def append(self, item: dict[str, Any]) -> None:  # type: ignore[override]
+        self._sync(item)          # 先落盘；失败时内存不出现"假成功"
         super().append(item)
-        self._sync(item)
 
     def remove(self, item: dict[str, Any]) -> None:  # type: ignore[override]
-        super().remove(item)
         self._store.delete_item(self._kind, int(item.get("id", 0) or 0))
+        super().remove(item)
 
     def pop(self, index: int = -1) -> dict[str, Any]:  # type: ignore[override]
-        item = super().pop(index)
+        item = self[index]
         self._store.delete_item(self._kind, int(item.get("id", 0) or 0))
-        return item
+        return super().pop(index)
 
     def __delitem__(self, index: Any) -> None:  # type: ignore[override]
         victims = self[index] if isinstance(index, slice) else [self[index]]
-        super().__delitem__(index)
         for item in victims:
             self._store.delete_item(self._kind, int(item.get("id", 0) or 0))
+        super().__delitem__(index)
 
 
 class _WriteThroughDict(dict):
-    """人物画像的写入穿透。键是名字（归一后的规范名）。"""
+    """人物画像的写入穿透：**先写盘，成功后才改内存**。
+
+    这条路径只供兼容写法使用。业务代码应优先走 `_Db.write_profile()` /
+    `_Db.merge_profile_keys()`；两者最终落到同一个 store 契约。
+    """
 
     __slots__ = ("_store",)
 
@@ -561,20 +919,23 @@ class _WriteThroughDict(dict):
         self._store = store
 
     def __setitem__(self, key: str, value: Any) -> None:  # type: ignore[override]
-        super().__setitem__(key, value)
-        self._store.upsert_profile(str(key), value)
+        self._store.write_profile(str(key), value)
+        dict.__setitem__(self, key, value)
 
     def setdefault(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
-        if key not in self:
-            self[key] = default
-        return self[key]
+        """禁用：先写空占位再原地改，正是画像落盘丢失的根因。
+
+        业务代码请先构造完整快照，再调用 `_Db.write_profile()`。
+        """
+        raise RuntimeError(
+            "profile.setdefault 已禁用：请构造完整画像快照后调用 _Db.write_profile()"
+        )
 
     def pop(self, key: str, *args: Any) -> Any:  # type: ignore[override]
         existed = key in self
-        value = super().pop(key, *args)
         if existed:
             self._store.delete_profile(str(key))
-        return value
+        return dict.pop(self, key, *args)
 
 
 # --------------------------------------------------------------------- 行 ↔ 字典

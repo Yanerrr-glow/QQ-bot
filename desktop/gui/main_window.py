@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -28,124 +27,21 @@ from ..core.connection import ConnectionManager
 from ..core.targets import MODE_LOCAL
 from ..core.tunnel import STATE_RUNNING
 from ..core.util import one_line
-from ..sdk.api import UiBridge
 from ..sdk.loader import PluginHost
 from . import theme
 from .base import Page
-from .features.page_feature import build_feature_pages
-from .features.page_hub import FeatureHubPage
-from .page_connections import ConnectionsPage
-from .page_imagepolicy import ImagePolicyPage
-from .page_memory import MemoryPage
-from .page_models import ModelsPage
-from .page_overview import OverviewPage
-from .page_params import ParamsPage
-from .page_persona import PersonaEvalPage
-from .page_plugins import PluginsPage
-from .page_stickers import StickersPage
+from .page_registry import BUILTIN_PAGES, FEATURES_SECTION, FEATURE_PAGE_CLASSES
 from .page_terminal import TerminalPage
+from .page_plugins import PluginsPage
+from .plugin_bridge import QtUiBridge
 from .widgets import Async, STYLESHEET, TaskResult, busy_button, hline
 
 logger = logging.getLogger("qqbot.desktop.gui.main")
-
-#: 「功能」目录的标题。参数页的 `nav_after` 与顶部「刷新当前页」都按它对齐 ——
-#: 这里改一个字，那两个地方不用跟着改（都走常量）。
-FEATURES_SECTION = "功能"
-
-#: 内置页面。**顺序即导航顺序**，逐页写而不是排序 —— 用户看的是这个先后。
-#: `nav_section` 非空的页面挂进同名目录（与总览、终端同级），目录**可收起**。
-BUILTIN_PAGES = (
-    OverviewPage,
-    # 终端紧跟在总览之后（用户要求）：它和总览一样是"一眼要看的常驻视图"，
-    # 而不是连接设置页的附属面板。
-    TerminalPage,
-    # 「功能」目录：中心页 + 每个功能一个子菜单（见 `gui/features/`）。
-    # 功能设置全在这下面，顶层不再一排平铺 —— 用户要求"总览同级别建「功能」目录，
-    # 子菜单放功能细节"。
-    FeatureHubPage,
-    *build_feature_pages(),
-    ParamsPage,
-    ModelsPage,
-    PersonaEvalPage,
-    MemoryPage,
-    ImagePolicyPage,
-    StickersPage,
-    ConnectionsPage,
-    PluginsPage,
-)
-
-#: 为什么导航里**没有**标题为「人格」的独立页：那个标题归「功能」目录下的「人格」子菜单
-#: （页面标题是跳转用的身份 —— `goto_page` 按标题查，同名会二义）。
-#: 人格的**表格式明细**（三层正文、评估台、改动日志）在 `PersonaEvalPage`（标题「人格评估台」），
-#: 它复用 `PersonaPage` 的界面但把四个花 token 的动作藏起来 —— 那些动作与
-#: 「人格自动迭代与评估」子菜单里的开关是同一件事，两个入口各存一份行为迟早对不上。
-
-#: 挂进「功能」目录的页面（页面类自己声明 `in_features`，这里只是取出来用）。
-FEATURE_PAGE_CLASSES = tuple(
-    cls for cls in BUILTIN_PAGES if bool(getattr(cls, "in_features", False))
-)
 
 #: 导航树节点的载荷：`("page", Page 实例)` / `("section", 标题)` /
 #: `("plugin", page_id, title)`。页面栈索引不再和导航行号绑定 ——
 #: 树可以收起、还有目录节点，行号本身已经不是个稳定标识了。
 _NAV_ROLE = QtCore.Qt.ItemDataRole.UserRole
-
-
-class QtUiBridge(UiBridge):
-    """把宿主的 UI 能力交给插件（插件拿不到主窗口对象，只能调这几个方法）。"""
-
-    def __init__(self, window: "MainWindow") -> None:
-        self._window = window
-
-    def toast(self, message: str, *, level: str = "info") -> None:
-        self._window.notify(str(message), level=level)
-
-    def confirm(self, title: str, message: str) -> bool:
-        return QtWidgets.QMessageBox.question(
-            self._window, str(title), str(message),
-            QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Cancel,
-        ) == QtWidgets.QMessageBox.StandardButton.Ok
-
-    def open_dialog(self, title: str, content: object) -> None:
-        window = QtWidgets.QDialog(self._window)
-        window.setWindowTitle(str(title))
-        window.resize(720, 520)
-        layout = QtWidgets.QVBoxLayout(window)
-        text = QtWidgets.QPlainTextEdit()
-        text.setReadOnly(True)
-        if hasattr(content, "toPlainText"):
-            text.setPlainText(content.toPlainText())  # type: ignore[attr-defined]
-        else:
-            text.setPlainText(str(content))
-        layout.addWidget(text)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(window.reject)
-        buttons.accepted.connect(window.accept)
-        layout.addWidget(buttons)
-        window.exec()
-
-    def run_async(
-        self,
-        work: Callable[[], Any],
-        *,
-        on_done: Callable[[Any], None],
-        on_error: Callable[[str], None] | None = None,
-    ) -> None:
-        """后台跑一件阻塞事（插件页面取数、批量请求），完成后回 GUI 线程。
-
-        插件手里没有 QThreadPool，这是它唯一"不卡界面"的正路。
-        `work` 里**禁止碰控件** —— Qt 要求碰 widget 的代码只在 GUI 线程跑。
-        """
-        def _done(result: TaskResult) -> None:
-            if result.ok:
-                on_done(result.value)
-            elif on_error is not None:
-                on_error(result.message)
-            else:
-                self.toast(f"后台任务失败：{result.message}", level="error")
-
-        self._window._async.run(work, on_done=_done)
 
 
 class _NavItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -219,22 +115,14 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.addLayout(body, 1)
         self.setCentralWidget(central)
 
-        # 内建页面全部装进页面栈。**导航是两层**：
-        #   * `nav_section` 为空的页面各占一个顶层节点（总览 / 终端 / 参数 / …）；
-        #   * `nav_section` 非空的页面挂在**同名顶层目录**下面（`QTreeWidget` 子节点，
-        #     目录可收起）。「功能」目录的顶层入口是中心页（它自己的 `nav_section`
-        #     也是「功能」），17 个功能子菜单挂在它下面。
-        # **导航高亮与"哪一页被加载"必须一次定清楚**，踩过的两种写法都不行：
-        #   * 只设 current 项：当前项本来就对时 Qt 不发 `currentItemChanged`，
-        #     页面永远不 `_load()`（连接设置页目标列表空白、点启动隧道没反应）；
-        #   * 只手动调一次 `_on_nav_changed()`：页面装好了但**导航没有高亮**。
-        # 所以：先占位高亮，再**显式**把每页 `load()` 一遍（`Page.load()` 自身有 `_loaded` 去重）。
+        # 注册导航与页面栈；数据在首次访问时加载。
         sections: dict[str, QtWidgets.QTreeWidgetItem] = {}
         for cls in BUILTIN_PAGES:
             page = cls(self.manager)
             self._normalize_page_layout(page)
             self.pages.append(page)
             self.stack.addWidget(page)
+            page.busy_changed.connect(self._sync_refresh_button)
             if isinstance(page, TerminalPage):
                 self.terminal_page = page
             item = QtWidgets.QTreeWidgetItem([page.title])
@@ -277,8 +165,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setCurrentItem(first)
         if self.pages:
             self._set_page_header(self.pages[0].title, self.pages[0].subtitle)
-        for page in self.pages:      # 先让每页都 load 一次：数据驱动型的页面首屏就是真数据
-            page.load()
+        # 只加载当前页；其它页面在首次导航时加载，避免启动时并发拉取完整状态。
+        if self.pages:
+            self.pages[0].load()
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+K"), self, activated=self.nav_search.setFocus)
+        QtGui.QShortcut(QtGui.QKeySequence("F5"), self, activated=self._refresh_current)
 
     @staticmethod
     def _normalize_page_layout(page: Page) -> None:
@@ -310,6 +201,18 @@ class MainWindow(QtWidgets.QMainWindow):
         brand_layout.addWidget(brand_sub)
         layout.addWidget(brand)
         layout.addWidget(hline())
+
+        self.nav_search = QtWidgets.QLineEdit()
+        self.nav_search.setPlaceholderText("搜索页面  Ctrl+K")
+        self.nav_search.setAccessibleName("搜索导航页面")
+        self.nav_search.setClearButtonEnabled(True)
+        self.nav_search.textChanged.connect(self._filter_nav)
+        self.nav_search.returnPressed.connect(self._open_search_result)
+        layout.addWidget(self.nav_search)
+        self.nav_empty = QtWidgets.QLabel("没有匹配的页面")
+        self.nav_empty.setWordWrap(True)
+        self.nav_empty.hide()
+        layout.addWidget(self.nav_empty)
 
         # 导航是一棵树（`QTreeWidget`）：插件页面挂在「插件」节点下，**目录可收起**。
         self.nav = QtWidgets.QTreeWidget()
@@ -374,6 +277,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(theme.SPACE["sm"])
 
         self.conn_detail = QtWidgets.QLabel("")
+        self.conn_detail.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self.conn_detail.setObjectName("connDetail")
         self.conn_detail.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Preferred
@@ -469,6 +373,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_current()
 
     # ------------------------------------------------------------ 导航
+    def _sync_refresh_button(self, _busy: bool = False) -> None:
+        page = self._current_page()
+        busy = page is not None and page.busy
+        self.btn_refresh.setEnabled(not busy)
+        self.btn_refresh.setText("加载中…" if busy else "刷新当前页")
+        self.btn_refresh.setToolTip("正在处理当前页面的请求" if busy else "刷新当前页（F5）")
+
+    def _filter_nav(self, text: str) -> None:
+        """标题和说明均可搜索；保留匹配项的父目录。"""
+        query = text.strip().casefold()
+        if query and not getattr(self, "_nav_search_active", False):
+            self._nav_expanded = {
+                self.nav.topLevelItem(i).text(0): self.nav.topLevelItem(i).isExpanded()
+                for i in range(self.nav.topLevelItemCount())
+            }
+        self._nav_search_active = bool(query)
+        visible = 0
+        for i in range(self.nav.topLevelItemCount()):
+            node = self.nav.topLevelItem(i)
+            match = query in (node.text(0) + " " + node.toolTip(0)).casefold()
+            children = False
+            for j in range(node.childCount()):
+                child = node.child(j)
+                show = match or query in (child.text(0) + " " + child.toolTip(0)).casefold()
+                child.setHidden(not show)
+                children |= show
+            node.setHidden(not (match or children))
+            visible += int(match or children)
+            if query and children:
+                node.setExpanded(True)
+            elif not query and hasattr(self, "_nav_expanded"):
+                node.setExpanded(self._nav_expanded.get(node.text(0), node.isExpanded()))
+        self.nav_empty.setVisible(not visible)
+
+    def _open_search_result(self) -> None:
+        for i in range(self.nav.topLevelItemCount()):
+            node = self.nav.topLevelItem(i)
+            if node.isHidden():
+                continue
+            # 目录仅因子项匹配时，回车直接打开子项。
+            query = self.nav_search.text().strip().casefold()
+            item = node
+            if query not in (node.text(0) + " " + node.toolTip(0)).casefold():
+                item = next((node.child(j) for j in range(node.childCount())
+                             if not node.child(j).isHidden()), node)
+            already_current = self.nav.currentItem() is item
+            self.nav.setCurrentItem(item)
+            if already_current:
+                self._on_nav_changed(item)
+            self.nav.setFocus()
+            return
+
     def _on_nav_changed(self, current: QtWidgets.QTreeWidgetItem | None,
                         _previous: QtWidgets.QTreeWidgetItem | None = None) -> None:
         """导航选中项变了：内置页直接切过去，插件页面按需构建。"""
@@ -488,6 +444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif payload[0] == "plugin":
             self._set_page_header(str(payload[2]), "插件页面")
             self._ensure_plugin_page(str(payload[1]), str(payload[2]))
+        self._sync_refresh_button()
 
     def _current_page(self) -> Page | None:
         widget = self.stack.currentWidget()
@@ -521,13 +478,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if item is None:
             logger.warning("要跳转的页面不存在：%s", title)
             return False
+        self.nav_search.clear()
         parent = item.parent()
         if parent is not None:
             parent.setExpanded(True)     # 目录收起时得先展开，否则"切过去了但看不见"
+        already_current = self.nav.currentItem() is item
         self.nav.setCurrentItem(item)    # 触发 `_on_nav_changed`：切栈 + load
-        if self.nav.currentItem() is not item:
+        if already_current:
             # 已经选中该项时 Qt 不发信号，手动补一次（与首屏同样的坑）。
             self._on_nav_changed(item, None)
+        self.nav.scrollToItem(item)
         return True
 
     def notify(self, message: str, *, level: str = "info") -> None:
@@ -644,6 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
             node.addChild(child)
             self.plugin_pages.append((spec.id, spec.title, spec.plugin_id))
         node.setExpanded(bool(self.plugin_pages))   # 有子项就默认展开，随时可点箭头收起
+        self._filter_nav(self.nav_search.text())
         if self.plugin_pages:
             logger.info("导航里加入了 %s 个插件页面", len(self.plugin_pages))
 
