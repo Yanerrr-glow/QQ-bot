@@ -29,13 +29,19 @@ class Page(QtWidgets.QWidget):
 
     #: 页面数据就绪后再广播，用于顶部状态条同步
     refreshed = QtCore.Signal()
+    busy_changed = QtCore.Signal(bool)
 
     def __init__(self, manager: ConnectionManager, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.manager = manager
         self.async_ = Async(self)
-        self.token = CancellationToken()
+        self._lifecycle_token = CancellationToken()
+        self._pending_tasks = 0
         self._loaded = False
+
+    @property
+    def busy(self) -> bool:
+        return self._pending_tasks > 0
 
     # -- 便捷入口 --------------------------------------------------------
     def client(self):  # noqa: ANN201 - 返回 ApiClient
@@ -62,9 +68,24 @@ class Page(QtWidgets.QWidget):
     ) -> None:
         """后台跑一件阻塞事（网络/隧道），完成后回 GUI 线程。"""
         self.toast(busy_text, level="info")
+        token = self._lifecycle_token
+        self._pending_tasks += 1
+        self.busy_changed.emit(True)
+
+        def complete(result: TaskResult) -> None:
+            if token.cancelled:
+                return
+            self._pending_tasks = max(0, self._pending_tasks - 1)
+            if not result.ok:
+                self._loaded = False
+            try:
+                self._handle(result, on_done)
+            finally:
+                self.busy_changed.emit(self.busy)
+
         self.async_.run(
             fn,
-            on_done=lambda result: self._handle(result, on_done),
+            on_done=complete,
         )
 
     def _handle(self, result: TaskResult, on_done: Callable[[TaskResult], None] | None) -> None:
@@ -78,16 +99,22 @@ class Page(QtWidgets.QWidget):
     # -- 生命周期 --------------------------------------------------------
     def load(self, *, force: bool = False) -> None:
         """首次显示或用户点刷新时调用。子类覆盖 `_load`。"""
-        if self._loaded and not force:
+        if self._pending_tasks or (self._loaded and not force):
             return
         self._loaded = True
-        self._load()
+        try:
+            self._load()
+        except Exception:
+            self._loaded = False
+            raise
 
     def invalidate(self) -> None:
         """切目标时调用：数据全部作废，下次显示重新拉。"""
         self._loaded = False
-        self.token.cancel("切换了目标")
-        self.token = CancellationToken()
+        self._lifecycle_token.cancel("切换了目标")
+        self._lifecycle_token = CancellationToken()
+        self._pending_tasks = 0
+        self.busy_changed.emit(False)
         self._on_target_changed()
 
     def _load(self) -> None:  # pragma: no cover - 子类实现

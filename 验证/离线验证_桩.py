@@ -3777,7 +3777,11 @@ try:
           _mem._db.store.readonly_reason)  # noqa: SLF001
     check("损坏记忆库已改名留证", not _memfile.exists()
           and len(list(_funnel.glob("memories.json.corrupt-*"))) == 1)
-    asyncio.run(_mem.remember("这条不该被写进任何地方", subject="测试"))
+    try:
+        asyncio.run(_mem.remember("这条不该被写进任何地方", subject="测试"))
+        check("只读模式下写入必须失败", False)
+    except _ms.MemoryWriteError:
+        check("只读模式下写入抛 MemoryWriteError", True)
     check("只读模式下不会写出新的记忆库文件", not _memfile.exists())
     _mem._db.store.facts.clear()  # noqa: SLF001
     # 换回默认后端（第 30 组要验"默认选 sqlite"）
@@ -3795,7 +3799,7 @@ try:
     _orig_extract = _mem._extract  # noqa: SLF001
     _seen: list[int] = []
 
-    async def _fake_extract(lines):  # noqa: ANN001
+    async def _fake_extract(lines, *, context=""):  # noqa: ANN001
         _seen.append(len(lines))
         return {"profile": [], "facts": [], "events": []}
 
@@ -3839,7 +3843,7 @@ try:
     _mem._extract_state["day"] = ""  # noqa: SLF001
     _mem._extract_state["day_messages"] = 0  # noqa: SLF001
 
-    async def _fail_extract(lines):  # noqa: ANN001
+    async def _fail_extract(lines, *, context=""):  # noqa: ANN001
         return {}
 
     _mem._extract = _fail_extract  # type: ignore[assignment]  # noqa: SLF001

@@ -47,10 +47,13 @@ events    群事件  ：这个会话里发生过的节点   —— 只在本会�
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +64,7 @@ logger = logging.getLogger("ai_chat.memory")
 
 
 _FILE = "memories.json"
+_EXTRACTOR_VERSION = "2"   # 提示词/schema 的语义版本；升级不会自动重跑历史
 _MAX_TEXT = 300      # 事实一句话的上限。原来是 200 —— 实测最长才 63 字，200 是浪费
 _MAX_KEY = 24        # 画像的键（人名）上限
 _MAX_NAME = 40       # 名字做**显示**用，可以比键长：群里昵称经常又长又带符号
@@ -170,35 +174,80 @@ class _Db:
         self.store.ensure()
 
     def load(self) -> None:
+        """纯读取。
+
+        **载入不再顺带写库。** 旧实现为了把老画像截到当前上限，会在 `load()` 里
+        逐条给 `store.profile[key]` 赋值；在写入穿透容器上这会触发落盘，导致
+        "只读启动也改数据库"。现在规范化只发生在写入路径：`set_profile()` 构造
+        快照时统一清洗，老数据按原样读出，避免加载副作用。
+        """
         self.loaded = True
         self._open()
         self.store.load()
-        # 载入后做一次清洗：把老数据的画像字段按当前上限规范化
-        # （原来这段在 JSON 载入时做，现在挪到这里，两种后端共用）
-        #
-        # **注意**：这里原来写死 30 / 60 / [:12] / [:8]，而写侧
-        # （`set_profile`）用的是 `_MAX_PROFILE_ITEM`(80) 与 `_MAX_PROFILE_FIELD`(12)。
-        # 两边不一致的后果不是"截短一点"那么轻：**80 字的条目在写盘后重载时被
-        # 降级回 30 字**，即"断在括号里"（`_MAX_PROFILE_ITEM` 的注释记的正是这个
-        # bug）在重启后又复活一次 —— 而且是静默的，因为 `_MAX_PROFILE_FIELD` 恰好
-        # 也是 12，条数没变，只有内容被割。
-        # 修法是**消掉字面量**：载入规范化与写入约束共用同一组常量，以后再调只改一处。
-        for key, item in list(self.store.profile.items()):
-            if not isinstance(item, dict):
-                continue
-            self.store.profile[key] = {
-                "display": _clean(item.get("display"), _MAX_NAME),
-                "love": [_clean(x, _MAX_PROFILE_ITEM) for x in (item.get("love") or [])][:_MAX_PROFILE_FIELD],
-                "dislike": [_clean(x, _MAX_PROFILE_ITEM) for x in (item.get("dislike") or [])][:_MAX_PROFILE_FIELD],
-                "habit": [_clean(x, _MAX_PROFILE_ITEM) for x in (item.get("habit") or [])][:_MAX_PROFILE_FIELD],
-                "note": _clean(item.get("note"), _MAX_PROFILE_ITEM),
-                "updated_at": str(item.get("updated_at") or ""),
-            }
 
     def save(self) -> None:
         self._open()
         self.store.ensure()
         self.store.save()
+
+    # -------------------------------------------------------- 画像写入
+    def write_profile(self, key: str, snapshot: dict[str, Any]) -> None:
+        """整条覆盖写入；store 失败时内存保持旧值。"""
+        self._open()
+        self.store.ensure()
+        self.store.write_profile(str(key), snapshot)
+        dict.__setitem__(self.profile, str(key), snapshot)
+
+    def delete_profile(self, key: str) -> bool:
+        self._open()
+        self.store.ensure()
+        existed = self.store.delete_profile(str(key))
+        dict.pop(self.profile, str(key), None)
+        return bool(existed)
+
+    def merge_profile_keys(self, source_key: str, target_key: str,
+                           merged: dict[str, Any]) -> None:
+        self._open()
+        self.store.ensure()
+        self.store.merge_profile_keys(str(source_key), str(target_key), merged)
+        dict.pop(self.profile, str(source_key), None)
+        dict.__setitem__(self.profile, str(target_key), merged)
+
+    def clear_bucket(self, kind: str) -> None:
+        """清空一整类数据；store 保证先写盘、失败不改内存。"""
+        self._open()
+        self.store.ensure()
+        self.store.clear_bucket(kind)
+
+    # -------------------------------------------------------- 批次
+    @contextmanager
+    def batch(self, *, batch_id: str, conv: str, last_message_id: int,
+              message_count: int):
+        """把一批抽取写入包在同一个事务里。
+
+        成功：提交全部数据 + 批次标记；失败：回滚并恢复内存快照。
+        **调用方必须在退出上下文成功后才推进水位线。**
+        """
+        self._open()
+        self.store.ensure()
+        self.store.begin_batch()
+        try:
+            yield self
+        except BaseException:
+            self.store.rollback_batch()
+            raise
+        self.store.commit_batch(
+            batch_id=batch_id,
+            conv=conv,
+            last_message_id=int(last_message_id),
+            message_count=int(message_count),
+            extractor_version=_EXTRACTOR_VERSION,
+        )
+
+    def latest_committed_batch(self, conv: str) -> dict[str, Any] | None:
+        self._open()
+        self.store.ensure()
+        return self.store.latest_committed_batch(conv)
 
     def upsert_fact(self, fact: dict[str, Any]) -> None:
         """把**就地改过**的一条事实落盘。
@@ -330,9 +379,33 @@ def extract_state_stats() -> dict[str, Any]:
     }
 
 
+def _reconcile_watermark(conv: str) -> None:
+    """把水位线补到已提交批次的位置。
+
+    崩溃窗口：批次事务已提交、JSON 水位线还没写。重启后这里只补进度，
+    不重新抽取，也就不会重复生成记忆。只处理当前会话，成本是一次索引查询。
+    """
+    try:
+        batch = _db.latest_committed_batch(conv)
+    except Exception:  # noqa: BLE001 - 补进度失败不能挡住正常抽取
+        logger.exception("读取已提交批次失败 conv=%s", conv)
+        return
+    if not batch:
+        return
+    last = int(batch.get("last_message_id", 0) or 0)
+    if last <= watermark(conv):
+        return
+    _advance_watermark(conv, last, int(batch.get("message_count", 0) or 0))
+    logger.warning(
+        "水位线落后于已提交批次，已补齐 conv=%s 到 #%d（批次 %s）",
+        conv, last, batch.get("batch_id"),
+    )
+
+
 def _advance_watermark(conv: str, last_id: int, n_messages: int) -> None:
     """把水位线推进到 `last_id`，并记账。**只在处理成功之后调用。**"""
     _load_extract_state()
+    _roll_day()
     cur = _extract_state["conv"].get(conv)
     if not isinstance(cur, dict):
         cur = {}
@@ -562,7 +635,7 @@ def add_fact(
         return dup, False
 
     item = {
-        "id": _db.next_id,
+        "id": _db.next_fact_id(),
         "ts": float(ts) if ts else _ts(),
         "time": _now(),
         "text": text,
@@ -582,7 +655,6 @@ def add_fact(
         "used": 0,
         "last_used": None,
     }
-    _db.next_id += 1
     _db.facts.append(item)
     return item, True
 
@@ -668,7 +740,7 @@ def add_event(text: str, *, conv: str, importance: float = 0.5,
     """记一条群事件（会话内可检索，跨群不串）。`ts` 同上，供补提取还原发生时间。"""
     _db.ensure()
     item = {
-        "id": _db.next_id,
+        "id": _db.next_fact_id(),
         "ts": float(ts) if ts else _ts(),
         "time": _now(),
         "text": _clean(text),
@@ -676,7 +748,6 @@ def add_event(text: str, *, conv: str, importance: float = 0.5,
         "importance": max(0.0, min(1.0, float(importance))),
         "used": 0,
     }
-    _db.next_id += 1
     _db.events.append(item)
     return item
 
@@ -700,6 +771,22 @@ def protect(item_id: int, locked: bool = True) -> bool:
     return False
 
 
+def _profile_snapshot(item: Any) -> dict[str, Any]:
+    """把任意来源的画像条目清洗成完整快照。
+
+    写入路径统一走这里，避免"先写空占位、再原地改"导致的落盘丢失。
+    """
+    raw = item if isinstance(item, dict) else {}
+    return {
+        "display": _clean(raw.get("display"), _MAX_NAME),
+        "love": [_clean(x, _MAX_PROFILE_ITEM) for x in (raw.get("love") or [])][:_MAX_PROFILE_FIELD],
+        "dislike": [_clean(x, _MAX_PROFILE_ITEM) for x in (raw.get("dislike") or [])][:_MAX_PROFILE_FIELD],
+        "habit": [_clean(x, _MAX_PROFILE_ITEM) for x in (raw.get("habit") or [])][:_MAX_PROFILE_FIELD],
+        "note": _clean(raw.get("note"), _MAX_PROFILE_ITEM),
+        "updated_at": str(raw.get("updated_at") or ""),
+    }
+
+
 def set_profile(
     key: str,
     *,
@@ -707,42 +794,51 @@ def set_profile(
     love: list[str] | None = None,
     dislike: list[str] | None = None,
     habit: list[str] | None = None,
-    note: str = "",
-) -> None:
-    """覆盖式更新一个人的画像。传 None 的字段保持不变，传 [] 则清空该字段。
+    note: str | None = None,
+    mode: str = "merge",
+) -> dict[str, Any] | None:
+    """更新一个人的画像，**构造完整快照后一次写入**。
 
-    **列表字段走相似度去重**（`_merge_unique`），不是精确字符串比对 ——
-    否则模型的每次换个说法都会新增一条，同一件事越堆越多、把配额吃光。
-    单条上限也从 30 提到 `_MAX_PROFILE_ITEM`(80)：30 字会把句子拦腰截断
-    （实测 6 条恰好卡在 30 字，出现"……（如 21:44、凌晨"这种断在括号里的条目）。
+    - `mode="merge"`（默认）：列表字段与旧值做相似度去重合并，用于自动抽取；
+    - `mode="replace"`：传入的列表整体替换旧值，允许 `[]` 清空，用于人工编辑；
+    - `mode="clear"`：清空列表与 note，保留 display，用于显式清除。
 
-    `key` 现在是 `entity.uid_key(uid)`（`uid:100000001`）或退回人名。
-    合并旧键由 `entity.consolidate` 在抽取时按别名做，见 README 5.6.6.4。
+    传 `None` 的字段保持原值；`note=None` 保持原值，`note=""` 在 replace/clear
+    模式下表示清空。写入失败会抛 `MemoryWriteError`，内存不会被改成半成品。
     """
     _db.ensure()
     # **键先去掉首尾空白再截断**。
     # `_clean` 会把内部空白折叠、超长加省略号，但**不 strip**：模型偶尔会在名字后面
     # 多带一个空格，而 `"小明 "` 与 `"小明"` 是两个不同的键 —— 控制台里就多一条
-    # 看起来一模一样的画像。实测库里真出现过带尾空格的键。
+    # 看起来一模一样的画像。实测库里真出现过带空格的键。
     key = _clean(str(key or "").strip(), _MAX_KEY)
     if not key:
-        return
-    cur = _db.profile.setdefault(
-        key, {"display": "", "love": [], "dislike": [], "habit": [], "note": "", "updated_at": ""}
-    )
+        return None
+
+    snapshot = _profile_snapshot(_db.profile.get(key))
     if display:
         # 名字是**显示**用，可以长一点：群里昵称经常又长又带符号
-        cur["display"] = _clean(display, _MAX_NAME)
+        snapshot["display"] = _clean(display, _MAX_NAME)
     for field_name, incoming in (("love", love), ("dislike", dislike), ("habit", habit)):
+        if mode == "clear":
+            snapshot[field_name] = []
+            continue
         if incoming is None:
             continue
         values = [_clean(v, _MAX_PROFILE_ITEM) for v in incoming]
-        cur[field_name] = _merge_unique(
-            list(cur.get(field_name) or []), values, _MAX_PROFILE_FIELD
-        )
-    if note:
-        cur["note"] = _clean(note, _MAX_PROFILE_ITEM)
-    cur["updated_at"] = _now()
+        if mode == "replace":
+            snapshot[field_name] = _merge_unique([], values, _MAX_PROFILE_FIELD)
+        else:
+            snapshot[field_name] = _merge_unique(
+                list(snapshot.get(field_name) or []), values, _MAX_PROFILE_FIELD
+            )
+    if mode == "clear":
+        snapshot["note"] = ""
+    elif note is not None:
+        snapshot["note"] = _clean(note, _MAX_PROFILE_ITEM)
+    snapshot["updated_at"] = _now()
+    _db.write_profile(key, snapshot)
+    return snapshot
 
 
 # --------------------------------------------------------------------- 身份归一
@@ -927,24 +1023,23 @@ def consolidate_profile(name: str, uid_key: str) -> None:
     if not uid_key or name == uid_key:
         return
     _db.ensure()
-    old = _db.profile.get(name)
-    if not isinstance(old, dict):
+    old_raw = _db.profile.get(name)
+    if not isinstance(old_raw, dict):
         return
-    cur = _db.profile.setdefault(
-        uid_key, {"display": "", "love": [], "dislike": [], "habit": [], "note": "", "updated_at": ""}
-    )
-    if not cur.get("display"):
-        cur["display"] = old.get("display") or name
+    old = _profile_snapshot(old_raw)
+    merged = _profile_snapshot(_db.profile.get(uid_key))
+    if not merged.get("display"):
+        merged["display"] = old.get("display") or name
     for field_name in ("love", "dislike", "habit"):
-        cur[field_name] = _merge_unique(
-            list(cur.get(field_name) or []),
+        merged[field_name] = _merge_unique(
+            list(merged.get(field_name) or []),
             [str(x) for x in (old.get(field_name) or [])],
             _MAX_PROFILE_FIELD,
         )
-    if not cur.get("note") and old.get("note"):
-        cur["note"] = old["note"]
-    cur["updated_at"] = _now()
-    _db.profile.pop(name, None)
+    if not merged.get("note") and old.get("note"):
+        merged["note"] = old["note"]
+    merged["updated_at"] = _now()
+    _db.merge_profile_keys(name, uid_key, merged)
     logger.info("画像已按 uid 归并：%s → %s", name, uid_key)
 
 
@@ -952,35 +1047,29 @@ def consolidate_profile(name: str, uid_key: str) -> None:
 def clear(kind: str = "all") -> int:
     """清空记忆。kind: all / facts / events / profile。
 
-    **逐条删，不要用 `list.clear()` / `dict.clear()`。**
-    穿透容器（`memstore._WriteThroughList` / `_WriteThroughDict`）只覆盖了
-    `append/remove/pop/__delitem__`（画像另有 `__setitem__/setdefault`）——`clear()`
-    **没有**被覆盖，所以直接 `clear()` 只清内存。而 sqlite 后端的 `save()` 只补一个
-    `next_id`、**不整库重写**，于是重启之后旧条目原样复活；JSON 后端因为 `save()`
-    会整库重写，所以这个问题在 JSON 上看不出来（实测在服务器上踩到：
-    `/记忆 清 画像` 回执说清掉了 N 项，控制台里也空了，重启后又全回来了）。
+    **整类清空走 store 的 `clear_bucket()`**：先提交 DELETE，成功后才清内存。
+    不能用 `list.clear()` / `dict.clear()` —— 穿透容器没有覆盖 `clear()`，
+    直接清只会清内存；也不能逐条 `pop()`，中途失败会留下半清空状态。
     """
     _db.ensure()
     n = 0
     if kind in ("all", "facts"):
         n += len(_db.facts)
-        for item in list(_db.facts):
-            _db.facts.remove(item)
+        _db.clear_bucket("facts")
     if kind in ("all", "events"):
         n += len(_db.events)
-        for item in list(_db.events):
-            _db.events.remove(item)
+        _db.clear_bucket("events")
     if kind in ("all", "profile"):
         n += len(_db.profile)
-        for key in list(_db.profile):
-            _db.profile.pop(key, None)
+        _db.clear_bucket("profile")
     return n
 
 
 # --------------------------------------------------------------------- 持久化封装
 async def _persist() -> None:
+    """落盘。同步调用：SQLite 连接不能跨线程复用，且这里只写少量元数据。"""
     async with _lock:
-        await asyncio.to_thread(_db.save)
+        _db.save()
 
 
 async def remember(text: str, **kwargs: Any) -> tuple[dict[str, Any], bool]:
@@ -1579,39 +1668,95 @@ def compact() -> int:
 
 _EXTRACT_PROMPT = """你是记忆提取器。下面是一段群聊/私聊记录，请提取**值得长期记住**的信息。
 
-只提取这几类：
-1. 关于某个人的稳定信息：称呼、喜好、厌恶、习惯、职业、作息、正在长期做的事；
-2. 明确发生过的、以后可能还会提到的事件或决定；
-3. 谁纠正过你、或明确让你记住的事（这类重要度给 0.9 以上）。
+先判断类型，再决定放进哪个桶：
+1. 某个人的稳定属性：称呼、喜好、厌恶、习惯、职业、作息、长期状态 → `profile`；
+2. 明确发生的事、决定、承诺、纠正 → `facts` / `events`；
+3. 一时的情绪、玩笑、没有后续的闲话、你自己说过的话 → 不提取。
 
-不要提取：一时的情绪、玩笑、没有后续的闲话、你自己说过的话、重复已有记忆的内容。
-不确定是否重要时，宁可不提 —— 垃圾记忆比没有记忆更糟。
+规则：
+- `profile` 只放稳定、以后还可能用到的信息。临时状态（求职、考试准备）放
+  `note`，并写清时间范围或“最近”；不要写成永久事实。
+- `facts` 放事件、决定和更正；不要只是把画像换个说法再写一遍。
+- 区分**本人自述**、**他人转述**、**玩笑/反讽**。拿不准就不提取，不要为凑条数硬写。
+- 每条尽量带 `line`（本批第几行，从 1 开始）；程序用它回填原始时间。
+- 不要求固定条数；没有就返回空数组。
 
 **如果这条信息是在更正「已有记忆」里的某一条**（作息变了、换了工作、之前记错了），
 就把那条旧记忆的原文照抄到 `prev_text` 里，我们会用它覆盖旧条目。
-不写 `prev_text` 就会留下两条互相矛盾的事实并存 —— 那比不记更糟。
 
 【对话记录】
 {lines}
 
-已有记忆（不要重复这些，除非是要更正它）：
+已有记忆（本批涉及的现有画像与相关事实，只用于补充/更正，不要重复）：
 {existing}
 
 只输出 JSON，不要任何多余文字：
-{{"profile": [{{"who": "显示名", "love": ["喜欢的东西"], "dislike": ["不喜欢的"], "habit": ["习惯或长期状态"]}}],
-  "facts": [{{"text": "一句话事实，第三人称，含主体", "importance": 0.5, "subject": "谁", "prev_text": "（可选）被更正的旧记忆原文"}}],
-  "events": [{{"text": "这个群里发生的事", "importance": 0.5}}]}}
+{"profile": [{"who": "显示名", "love": ["喜欢的东西"], "dislike": ["不喜欢的东西"], "habit": ["习惯或长期状态"], "note": "职业/作息/临时状态（可空）"}],
+  "facts": [{"text": "一句话事实，第三人称，含主体", "importance": 0.5, "subject": "谁", "line": 1, "prev_text": "（可选）被更正的旧记忆原文"}],
+  "events": [{"text": "这个群里发生的事", "importance": 0.5, "line": 1}]}
 
-没有可提取的就输出 {{"profile": [], "facts": [], "events": []}}。"""
+没有可提取的就输出 {"profile": [], "facts": [], "events": []}。"""
 
 
-async def _extract(lines: list[str]) -> dict[str, Any]:
-    """调一次小模型做抽取。失败返回空结构，绝不抛。"""
+def _extraction_context(messages: list[dict[str, Any]], *, conv: str = "") -> str:
+    """给抽取提示词准备「这些人的现有画像 + 相关事实」。
+
+    只注入本批发送者，不注入全库最近 20 条无关事实；没有就返回空串，
+    由 `_extract()` 回落到旧的最近事实逻辑。相关事实按当前会话可见性过滤，
+    避免把别的私聊内容带进这个会话的抽取上下文。
+    """
+    _db.ensure()
+    try:
+        bot_ids, _ = _bot_ids(messages)
+        senders = _senders_of(messages, bot_ids=bot_ids)
+    except Exception:  # noqa: BLE001 - 上下文失败不能挡住抽取
+        return ""
+    blocks: list[str] = []
+    for name, uid in list(senders.items())[:6]:
+        key = _uid_key(uid) or name
+        info = _db.profile.get(key)
+        if isinstance(info, dict):
+            line = render_profile([key], budget=220)
+            if line:
+                blocks.append(line)
+        related = []
+        for f in _db.facts:
+            if conv and not _visible_in(f, conv):
+                continue
+            same_uid = False
+            try:
+                same_uid = f.get("uid") not in (None, "") and int(f.get("uid")) == int(uid)
+            except (TypeError, ValueError):
+                same_uid = False
+            if (
+                same_uid
+                or str(f.get("subject") or "") == name
+                or str(f.get("name") or "") == name
+            ):
+                related.append(f)
+        related.sort(key=lambda f: float(f.get("ts", 0) or 0), reverse=True)
+        for fact in related[:4]:
+            text = str(fact.get("text") or "").strip()
+            if text:
+                blocks.append(f"- 相关事实：{text[:120]}")
+    return "\n".join(blocks)[:1800]
+
+
+async def _extract(lines: list[str], *, context: str = "") -> dict[str, Any]:
+    """调一次小模型做抽取。失败返回空结构，绝不抛。
+
+    `context` 由 `_extraction_context()` 生成；离线测试可以传空串。
+    """
     if not lines:
         return {}
-    existing = "\n".join(
-        f"- {f.get('text','')}" for f in sorted(_db.facts, key=lambda f: float(f.get("ts", 0)), reverse=True)[:20]
-    )
+    if context:
+        existing = context
+    else:
+        existing = "\n".join(
+            f"- {f.get('text','')}" for f in sorted(
+                _db.facts, key=lambda f: float(f.get("ts", 0)), reverse=True
+            )[:20]
+        )
     prompt = _EXTRACT_PROMPT.replace("{lines}", "\n".join(lines)).replace(
         "{existing}", existing or "（还没有）"
     )
@@ -1724,12 +1869,14 @@ async def _apply_extraction(data: dict[str, Any], *, conv: str, ts_map: dict[int
             # 就并过去。
             key = _link_key_to_uid(key)
 
+        note = _clean(person.get("note"), _MAX_PROFILE_ITEM)
         set_profile(
             key,
             display=who,
             love=_list("love"),
             dislike=_list("dislike"),
             habit=_list("habit"),
+            note=note or None,
         )
         added += 1
 
@@ -1803,6 +1950,9 @@ def _ts_map_pick(ts_map: dict[int, float] | None, item: dict[str, Any]) -> float
     模型偶尔会带 `line`（第几行）字段；带了就用它，没带就退化成「这一批里最早的一条」——
     宁可时间早一点，也不要全部挤在「今天」。完全没有 ts_map（线上正常路径）返回 None，
     由 `add_fact` 用当前时刻，行为和改造前一致。
+
+    如果带了 `line` 但越界/不存在，返回 None（拒绝无效引用），而不是拿这一批里
+    最早的时间顶替 —— 那会把一条新事实错标到别人说话的时刻。
     """
     if not ts_map:
         return None
@@ -1812,11 +1962,9 @@ def _ts_map_pick(ts_map: dict[int, float] | None, item: dict[str, Any]) -> float
         line_no = None
     if line_no is not None:
         try:
-            hit = ts_map.get(int(line_no))
-            if hit:
-                return float(hit)
+            return ts_map.get(int(line_no)) or None
         except (TypeError, ValueError):
-            pass
+            return None
     return min(ts_map.values()) if ts_map else None
 
 
@@ -1838,6 +1986,9 @@ async def drain_extraction(conv: str, *, max_messages: int = 0, only_rolled: boo
     `only_rolled=True` 时只处理**已经结束的会话轮次**（到 `last_session_boundary_id` 为止）——
     正在进行中的那一轮由回复路径负责，避免同一批消息被抽两遍。
     `max_messages` 覆盖单批条数（默认取 `memory_extract_batch`）。
+
+    **提交顺序**：批次数据 + `memory_batches` 标记在同一个事务里提交，成功后才写
+    JSON 水位线。若在两者之间崩溃，下次启动会从已提交批次把水位线补齐，不重复抽取。
     """
     from . import chatlog  # 局部导入，避免循环依赖
 
@@ -1847,6 +1998,7 @@ async def drain_extraction(conv: str, *, max_messages: int = 0, only_rolled: boo
     if not _budget_ok(1):
         return 0
 
+    _reconcile_watermark(conv)
     log = chatlog.get_log_sync(conv)
     if log is None:
         return 0
@@ -1884,25 +2036,36 @@ async def drain_extraction(conv: str, *, max_messages: int = 0, only_rolled: boo
     ts_map = {i + 1: float(m.get("ts") or 0) for i, m in enumerate(messages)}
     ts_map = {k: v for k, v in ts_map.items() if v > 0}
 
-    data = await _extract(lines)
+    context = _extraction_context(messages, conv=conv)
+    data = await _extract(lines, context=context)
     if not data:
         # 抽取失败：**不动水位线**，下一轮同一批会再试一次。
         return 0
 
     _bot_uid_set, _bot_name_set = _bot_ids(messages)
-    added = await _apply_extraction(
-        data, conv=conv, ts_map=ts_map, source="extract",
-        senders=_senders_of(messages, bot_ids=_bot_uid_set),
-        bot_ids=_bot_uid_set, bot_names=_bot_name_set,
-    )
+    first_id = int(messages[0].get("id", 0))
     last_id = int(messages[-1].get("id", 0))
-    dropped = compact()
-    # **先落盘记忆，再推进水位线 —— 顺序不能反。**
-    # `_advance_watermark()` 内部是**同步写盘**的，它是"这批已经抽完了"的凭据。
-    # 若先推水位线再落盘，这两步之间被杀/掉电就会出现"水位线已永久前进、记忆却没了"，
-    # 而且当日额度也已经计入 —— 那一段话就等于**永久丢掉**（不可恢复）。
-    # 反过来最多把这批再抽一遍，而抽取对已有条目走覆盖/去重，是幂等的。
-    await _persist()
+    batch_id = hashlib.sha1(
+        f"{conv}|{first_id}-{last_id}|{_EXTRACTOR_VERSION}".encode("utf-8")
+    ).hexdigest()[:16]
+    try:
+        with _db.batch(
+            batch_id=batch_id, conv=conv, last_message_id=last_id,
+            message_count=len(messages),
+        ):
+            added = await _apply_extraction(
+                data, conv=conv, ts_map=ts_map, source="extract",
+                senders=_senders_of(messages, bot_ids=_bot_uid_set),
+                bot_ids=_bot_uid_set, bot_names=_bot_name_set,
+            )
+            dropped = compact()
+            # 批次内 save 只写 next_id，不提交；由 batch 上下文统一提交。
+            await _persist()
+    except memstore.MemoryWriteError:
+        logger.exception(
+            "记忆抽取写入失败，批次已回滚（conv=%s，消息 #%s..#%s）", conv, first_id, last_id
+        )
+        return 0
     _advance_watermark(conv, last_id, len(messages))
     flush_usage(force=True)  # 抽取是低频动作，顺手把使用计数收尾，免得攒着
     logger.info(
