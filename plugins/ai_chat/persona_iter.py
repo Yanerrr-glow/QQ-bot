@@ -50,6 +50,26 @@ logger = logging.getLogger("ai_chat.persona_iter")
 
 _MAX_CANDIDATE = 200     # 与 persona._MAX_ITEM 对齐（闸门也会挡一次）
 
+# 2026-10-24 旧的「定期反思」已停用，`persona_iter_*` 参数也从 `_SPECS` 里移除了。
+# 但这段代码仍是「过闸门即生效」这条老路径的唯一入口（§33 回归用例靠它守着），
+# 所以保留代码级默认值：显式打开开关时行为不变，而不再依赖已被删除的配置项。
+# 以前这里有 spec 兜底，settings.get() 不会返回 None；spec 一删就变成了
+# `int(None)` 直接崩（2026-10-29 跑离线验证时撞出来）。
+_DEFAULT_MIN_LINES = 20
+_DEFAULT_MAX_ITEMS = 4
+_DEFAULT_INTERVAL = 6 * 3600
+
+
+def _int_setting(name: str, default: int) -> int:
+    """读整数配置：缺省、None、脏值一律回落到默认值，绝不抛。"""
+    try:
+        value = settings.get(name)
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 _PROMPT = """你在帮一个群聊机器人「{name}」**改进它说话的方式**。
 
@@ -152,7 +172,7 @@ async def _ask_model(base: str, forbidden: str, surface: str, demands: str, line
         .replace("{forbidden}", forbidden[:1500])
         .replace("{surface}", surface[:2500])
         .replace("{demands}", demands)
-        .replace("{max_items}", str(int(settings.get("persona_iter_max"))))
+        .replace("{max_items}", str(_int_setting("persona_iter_max", _DEFAULT_MAX_ITEMS)))
         .replace("{max_len}", "60")
         .replace("{lines}", "\n".join(lines)[-4000:])
     )
@@ -174,7 +194,7 @@ async def _ask_model(base: str, forbidden: str, surface: str, demands: str, line
     if not isinstance(items, list):
         return []
     out: list[dict[str, Any]] = []
-    for item in items[: int(settings.get("persona_iter_max"))]:
+    for item in items[: _int_setting("persona_iter_max", _DEFAULT_MAX_ITEMS)]:
         if not isinstance(item, dict):
             continue
         text = " ".join(str(item.get("text") or "").split())
@@ -200,7 +220,7 @@ async def reflect_once(*, notify: bool = True) -> dict[str, Any]:
         # 没有底层人设就没有"约束"可言，闸门也就失去依据 —— 拒绝跑
         return {"ok": False, "why": "底层人设是空的，没有约束可依，先写 persona/packs/<包>/base.txt"}
 
-    lines = _recent_lines(int(settings.get("persona_iter_min_lines")))
+    lines = _recent_lines(_int_setting("persona_iter_min_lines", _DEFAULT_MIN_LINES))
     if len(lines) < 3:
         return {"ok": False, "why": f"最近的对话太少（{len(lines)} 条），没什么可反思的"}
     demands, n_demands = _demands_text()
@@ -318,19 +338,23 @@ async def reflect_loop() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("人格反思循环出错（下一轮继续）")
         try:
-            await asyncio.sleep(max(1800, int(settings.get("persona_iter_interval"))))
+            await asyncio.sleep(max(1800, _int_setting("persona_iter_interval", _DEFAULT_INTERVAL)))
         except asyncio.CancelledError:
             raise
 
 
 def stats() -> dict[str, Any]:
-    """给控制台与启动日志看的现状。"""
+    """给控制台与启动日志看的现状。
+
+    2026-10-24：旧的自动迭代已停用（参数也从 `_SPECS` 移除），
+    这里的 `enabled/interval/max` 只作兼容字段保留，恒为关/0。
+    """
     added = persona.changelog(500, action="added")
     rejected = persona.changelog(500, action="rejected")
     return {
-        "enabled": bool(settings.get("persona_iter_enabled")),
-        "interval": int(settings.get("persona_iter_interval")),
-        "max": int(settings.get("persona_iter_max")),
+        "enabled": False,
+        "interval": 0,
+        "max": 0,
         "written_total": len(added),
         "rejected_total": len(rejected),
         "last_added": added[-1] if added else None,
