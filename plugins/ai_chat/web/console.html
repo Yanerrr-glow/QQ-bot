@@ -98,12 +98,12 @@
     <button class="tab" data-tab="memory" onclick="tab('memory')">记忆库</button>
     <button class="tab" data-tab="image" onclick="tab('image')">图片策略</button>
     <button class="tab" data-tab="sticker" onclick="tab('sticker')">表情包库</button>
+    <button class="tab" data-tab="voice" onclick="tab('voice')">语音</button>
   </div>
 
   <!-- ---------------------------------------------------------- 参数 -->
   <div class="panel active" id="panel-settings">
     <div class="toolbar">
-      <button class="primary" onclick="speak()">让它现在说一句</button>
       <button onclick="greet()">现在问候一次</button>
       <button onclick="resetAll()">全部恢复 .env 默认</button>
       <button onclick="load()">刷新</button>
@@ -182,14 +182,13 @@
     <div class="card">
       <h2>人格三层 <span class="count" id="personaCount"></span></h2>
       <div class="muted" style="margin-bottom:12px">
-        三层由<b>文件</b>划分权限：
-        <b>底层人设</b>（它是谁）与<b>禁止事项</b>（铁律）
-        <b>只能由你直接编辑文件修改</b> —— 聊天指令、控制台、自动迭代都改不了它们。
-        <b>表层人设</b>（怎么说话）是唯一会自动迭代的部分，
-        而且与上面两层冲突的条目会被<b>直接丢弃、不写入</b>。
+        v2 结构：<b>底层人设</b>只写身份与大方向，<b>只有人能改</b>（评估台也不能写）；
+        <b>禁止事项</b>与<b>表层人设</b>由人 / 评估台改；
+        情绪与关系在「行为矢量」里，示例按场景检索注入。
         三层都是<b>每轮现读</b>，改完即生效（不用重启）。
       </div>
       <div id="personaList"></div>
+      <div id="likenessSection" style="margin-top:16px"></div>
     </div>
   </div>
 
@@ -235,6 +234,57 @@
     <div class="card">
       <h2>表情包库 <span class="count" id="stickerCount"></span></h2>
       <div class="gallery" id="gallery"></div>
+    </div>
+  </div>
+
+  <!-- ---------------------------------------------------------- 语音 -->
+  <div class="panel" id="panel-voice">
+    <div class="toolbar">
+      <button class="primary" onclick="voiceNew()">新增语音包</button>
+      <button onclick="load()">刷新</button>
+    </div>
+    <div class="card">
+      <h2>语音包 <span class="count" id="voiceCount"></span></h2>
+      <div class="muted" style="margin-bottom:10px">
+        一个语音包 = <b>GPT 权重（.ckpt）+ SoVITS 权重（.pth）+ 参考音频 + 参考文本</b>。
+        权重与参考音频都是 <b>TTS 服务端（那台 Windows）上的绝对路径</b>，容器里读不到；
+        权重留空 = 沿用引擎当前已加载的权重。<b>两套权重必须是同一版本</b>（v2 / v2ProPlus / v5 不能混用），
+        混用不会报错但声音会坏。切换语音包只影响下一次 <code>/语音</code>，不用重启。
+      </div>
+      <div id="voiceStatus" class="muted" style="margin-bottom:10px"></div>
+      <div id="voiceList"></div>
+    </div>
+    <div class="card">
+      <h2 id="voiceFormTitle">编辑语音包</h2>
+      <div class="grid">
+        <div class="row"><label for="v_id">id <span class="hint">留空自动生成；字母数字与 . _ -</span></label>
+          <input type="text" id="v_id" placeholder="default"></div>
+        <div class="row"><label for="v_name">名称</label>
+          <input type="text" id="v_name" placeholder="我的音色"></div>
+        <div class="row"><label for="v_gpt">GPT 权重（.ckpt）<span class="hint">可留空</span></label>
+          <input type="text" id="v_gpt" placeholder="E:\...\s1v3.ckpt"></div>
+        <div class="row"><label for="v_sovits">SoVITS 权重（.pth）<span class="hint">可留空</span></label>
+          <input type="text" id="v_sovits" placeholder="E:\...\s2Gv2ProPlus.pth"></div>
+        <div class="row" style="grid-column:1/-1"><label for="v_ref">参考音频（服务端绝对路径）</label>
+          <input type="text" id="v_ref" placeholder="E:\...\ref_zh.wav"></div>
+        <div class="row" style="grid-column:1/-1"><label for="v_prompt">参考文本 <span class="hint">必须与实际说出的内容一致</span></label>
+          <textarea id="v_prompt" rows="2" style="width:100%"></textarea></div>
+        <div class="row"><label for="v_plang">参考语言</label>
+          <select id="v_plang"><option value="zh">zh</option><option value="en">en</option>
+            <option value="ja">ja</option><option value="ko">ko</option><option value="yue">yue</option></select></div>
+        <div class="row"><label for="v_tlang">合成语言</label>
+          <select id="v_tlang"><option value="zh">zh</option><option value="en">en</option>
+            <option value="ja">ja</option><option value="ko">ko</option><option value="yue">yue</option></select></div>
+      </div>
+      <div style="margin-top:10px">
+        <button class="primary" onclick="voiceSave()">保存语音包</button>
+        <button onclick="voiceResetForm()">清空表单</button>
+        <button onclick="voiceTest()">用这份配置试听</button>
+        <span id="voiceMsg" class="muted" style="margin-left:8px"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        试听会真的走一次 <code>/api/voice/test</code>（relay → 引擎），只在本机浏览器播放，不发 QQ。
+      </div>
     </div>
   </div>
 
@@ -349,19 +399,138 @@ async function resetAll() {
   toast('已恢复默认'); load();
 }
 
-async function speak() {
-  try {
-    const r = await api('/api/speak', {method:'POST', body: '{}'});
-    toast(r.said ? '说了一句，去群里看看' : ('没有发言：' + (r.reason || '未知')));
-  } catch (e) { toast('触发失败：' + e.message, true); }
-}
-
 async function greet() {
   try {
     const r = await api('/api/greet', {method:'POST', body: '{}'});
     toast(r.said ? ('已发出「' + (r.label || '') + '」，去私聊 / 群里看看')
                  : ('没发出去：' + (r.reason || '看机器人日志')));
   } catch (e) { toast('触发失败：' + e.message, true); }
+}
+
+// ---------------------------------------------------------------- 语音
+// 语音包只改"下次 /语音 用哪套权重和参考音频"；开关与上限在「参数 → 语音」组里。
+// 所有路径都是 **TTS 服务端（Windows）** 的绝对路径 —— 这里不做本地存在性校验，
+// 真正能不能加载由引擎的 /set_*_weights 返回错误，试听会立刻暴露。
+let VOICE = {};
+
+function voiceForm() {
+  return {
+    id: document.getElementById('v_id').value.trim(),
+    name: document.getElementById('v_name').value.trim(),
+    gpt_weights: document.getElementById('v_gpt').value.trim(),
+    sovits_weights: document.getElementById('v_sovits').value.trim(),
+    ref_audio: document.getElementById('v_ref').value.trim(),
+    prompt_text: document.getElementById('v_prompt').value,
+    prompt_lang: document.getElementById('v_plang').value,
+    text_lang: document.getElementById('v_tlang').value,
+  };
+}
+
+function voiceFill(p) {
+  p = p || {};
+  document.getElementById('v_id').value = p.id || '';
+  document.getElementById('v_name').value = p.name || '';
+  document.getElementById('v_gpt').value = p.gpt_weights || '';
+  document.getElementById('v_sovits').value = p.sovits_weights || '';
+  document.getElementById('v_ref').value = p.ref_audio || '';
+  document.getElementById('v_prompt').value = p.prompt_text || '';
+  document.getElementById('v_plang').value = p.prompt_lang || 'zh';
+  document.getElementById('v_tlang').value = p.text_lang || 'zh';
+}
+
+function voiceNew() {
+  voiceFill({});
+  document.getElementById('voiceFormTitle').textContent = '新增语音包';
+  document.getElementById('voiceMsg').textContent = '';
+}
+
+function renderVoice(v) {
+  VOICE = v || {};
+  const items = VOICE.items || [];
+  const active = items.find(x => x.id === VOICE.active) || {};
+  document.getElementById('voiceCount').textContent =
+    `（共 ${items.length} 个，当前：${active.name || VOICE.active || '—'}）`;
+  const state = VOICE.enabled ? '开' : '关';
+  document.getElementById('voiceStatus').innerHTML =
+    `状态：<b>${state}</b>｜endpoint：<code>${esc(VOICE.endpoint || '未配置')}</code>｜` +
+    `令牌：${VOICE.token_configured ? '已配置' : '<b>未配置</b>'}｜文件：<code>${esc(VOICE.path || '')}</code>`;
+  const rows = items.map(x => {
+    const cur = x.id === VOICE.active;
+    const w = [x.gpt_weights, x.sovits_weights].filter(Boolean);
+    return `<tr>
+      <td>${cur ? '✅ ' : ''}<b>${esc(x.name)}</b><br><code class="muted">${esc(x.id)}</code></td>
+      <td>${w.length ? w.map(p => `<code class="muted">${esc(p.split(/[\/]/).pop())}</code>`).join(' + ')
+                     : '<span class="muted">沿用引擎当前权重</span>'}
+        <br><span class="muted">参考：${esc((x.ref_audio || '').split(/[\/]/).pop() || '（空）')}</span></td>
+      <td class="act">
+        ${cur ? '<span class="muted">当前</span>' : `<button onclick="voiceUse('${esc(x.id)}')">设为当前</button>`}
+        <button onclick="voiceEdit('${esc(x.id)}')">编辑</button>
+        <button onclick="voiceTest('${esc(x.id)}')">试听</button>
+        <button onclick="voiceDel('${esc(x.id)}')">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  document.getElementById('voiceList').innerHTML =
+    `<table class="items"><thead><tr><th>语音包</th><th>权重 / 参考</th><th class="act">操作</th></tr></thead>
+     <tbody>${rows || '<tr><td colspan="3" class="muted">还没有语音包</td></tr>'}</tbody></table>`;
+}
+
+function voiceEdit(id) {
+  const p = (VOICE.items || []).find(x => x.id === id);
+  if (!p) return;
+  voiceFill(p);
+  document.getElementById('voiceFormTitle').textContent = '编辑语音包：' + p.name;
+  document.getElementById('voiceMsg').textContent = '';
+}
+
+async function voiceSave() {
+  const msg = document.getElementById('voiceMsg');
+  msg.textContent = '保存中…';
+  try {
+    const r = await api('/api/voice/save', {method:'POST', body: JSON.stringify({profile: voiceForm()})});
+    msg.textContent = (r.ok ? '✅ ' : '❌ ') + (r.detail || '');
+    if (r.ok) { renderVoice(r.voice); toast('已保存'); }
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+
+async function voiceUse(id) {
+  try {
+    const r = await api('/api/voice/active', {method:'POST', body: JSON.stringify({id})});
+    toast(r.ok ? r.detail : ('没切：' + r.detail), !r.ok);
+    if (r.ok) renderVoice(r.voice);
+  } catch (e) { toast('切换失败：' + e.message, true); }
+}
+
+async function voiceDel(id) {
+  if (!confirm('删掉语音包「' + id + '」？（不影响磁盘上的权重文件）')) return;
+  try {
+    const r = await api('/api/voice/delete', {method:'POST', body: JSON.stringify({id})});
+    toast(r.ok ? r.detail : ('没删：' + r.detail), !r.ok);
+    if (r.ok) renderVoice(r.voice);
+  } catch (e) { toast('删除失败：' + e.message, true); }
+}
+
+async function voiceTest(id) {
+  const msg = document.getElementById('voiceMsg');
+  msg.textContent = '合成中…（首次切权重/冷启动会慢，最多十几秒）';
+  const body = id ? {id} : {profile: voiceForm()};
+  body.text = '你好，这是当前语音包的试听。';
+  try {
+    const r = await fetch(PREFIX + '/api/voice/test', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error((j.kind ? j.kind + '：' : '') + (j.detail || j.error || ('HTTP ' + r.status)));
+    }
+    const url = URL.createObjectURL(await r.blob());
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    await audio.play();
+    msg.textContent = '🔊 正在播放试听';
+  } catch (e) {
+    msg.textContent = '❌ ' + e.message;
+    toast('试听失败：' + e.message, true);
+  }
 }
 
 // ---------------------------------------------------------------- 人格包
@@ -419,8 +588,7 @@ async function packSwitch(id) {
   if (r.identity_note) bits.push(r.identity_note);
   (r.warnings || []).forEach(w => bits.push('⚠ ' + w));
   if (!r.registry_written) bits.push('⚠ 注册表写不进去：重启后默认人格不会跟着变（本次部署不受影响）');
-  toast(bits.filter(Boolean).join('
-'));
+  toast(bits.filter(Boolean).join('\n'));
   if (r.persona) { renderPacks(r.persona); renderPersona(r.persona); }
   load();
 }
@@ -436,9 +604,9 @@ function renderPersona(p) {
     `（底色 ${st.base_chars || 0} 字 / 铁律 ${(p.forbidden || []).length} 条 / 表层 ${st.surface_chars || 0} 字）`;
 
   const rows = [
-    ['底层人设', st.base_chars, st.base_file, '只有你能改'],
-    ['禁止事项', `${st.forbidden_chars} 字 · ${(p.forbidden || []).length} 条`, st.forbidden_file, '只有你能改'],
-    ['表层人设', st.surface_chars, st.surface_file, '**自动迭代只写这一层**'],
+    ['底层人设', st.base_chars, st.base_file, '只有你能改；评估台也不能写'],
+    ['禁止事项', `${st.forbidden_chars} 字 · ${(p.forbidden || []).length} 条`, st.forbidden_file, '人 / 评估台可改'],
+    ['表层人设', st.surface_chars, st.surface_file, '人 / 评估台可改'],
   ];
   let html = `<div class="kv">
     ${rows.map(r => `<div><b>${r[0]}</b>：${r[1]} 字 <span class="muted">（${r[3]}）</span>
@@ -447,30 +615,68 @@ function renderPersona(p) {
   <div class="muted" style="margin:8px 0">
     改人设内容直接编辑上面三个文件（它们在<b>当前人格包</b>里）。
     <b>三层都是每轮现读</b>，改完即生效、不用重启。
-    自动迭代每 ${iter.interval || 0} 秒跑一次，最多写入 ${iter.max || 0} 条；
-    与上面两层冲突的条目会被<b>直接丢弃</b>。
+    评估台只在大评估后按需修订；具体见下面的评估台。
   </div>
   <div style="margin:8px 0">
     <button onclick="piUndo()">撤回最近一次自动改动</button>
-    <button onclick="piReflect()">立刻反思一次</button>
+    <button onclick="piReflect()">立刻评估并修订</button>
   </div>`;
 
-  // ---- 人设评估台：论文那套「对比素材 + 0-100 打分」 ----
-  // 开关本身在「参数 → 人设评估」组里（那是 settings._SPECS 自动渲染的），
-  // 这里只放两个**显式动作**：评估要花 token，花不花由主人点。
+  // ---- 人设评估台（v2）：像人 / 边界 / 情绪 / 关系 / 示例 ----
+  // 调度：每天小评估（边界 + 可选少量像人），每 N 天大评估（完整像人 + 特质诊断）。
+  // 动作按钮都会花 token，先确认。
   const ev = p.eval || {};
+  const vec = p.vector || {}, rel = p.relation || {}, ex = p.examples || {};
+  const lk = ev.likeness || {}, bd = ev.boundary || {}, win = ev.window || {};
+  const values = vec.values || {};
+  const axes = vec.axes || [];
+  const num = (v) => (v === null || v === undefined) ? '-' : (Math.round(v * 100) / 100);
   const evAll = (ev.traits || []).length;
   html += `<h3 style="margin:18px 0 6px">人设评估台
     <span class="muted">${ev.enabled ? '已启用' : '未启用 —— 去「参数 → 人设评估」打开'}</span></h3>
     <div class="muted" style="margin:4px 0">
-      裁判 ${esc(ev.judge_model || '')}　每题采样 ${ev.rollouts || 0} 次　每特质 ${ev.questions || 0} 题<br>
-      素材 ${ev.with_artifacts || 0} / ${evAll}　基线 ${ev.with_baseline || 0} / ${evAll}
-      ${ev.last_run ? '　最近一轮 ' + esc(ev.last_run) : ''}
+      小评估：每天 ${ev.small_enabled ? '开' : '关'}（边界 + ${ev.small_samples || 0} 条像人）　
+      大评估：每 ${ev.big_every_days || 3} 天（${ev.big_samples || 0} 条像人${ev.traits_on_big ? ' + 特质分' : ''}）<br>
+      上次大评估 ${esc(ev.last_big || '还没跑')}　下次 ${esc(ev.next_big || '')}　自动修订 ${ev.iter_enabled ? '开' : '关'}
+    </div>
+    <div class="kv">
+      <div><b>口语偏好 L</b>：${lk.L ?? '-'}
+        <span class="muted">${lk.n ? `n=${lk.n}，对照偏好 ${Math.round((lk.acc || 0) * 100)}%${lk.reliable ? '' : '（未经人工校准，仅供参考）'}` : '还没跑'}</span></div>
+      <div><b>边界</b>：检查 ${bd.checked || 0} 条，越界 ${(bd.violations || []).length}，拿不准 ${(bd.borderline || []).length}
+        <span class="muted">${bd.at ? esc(bd.at) : '还没跑'}</span></div>
+      <div><b>语料评估</b>：${win.scored || 0} 段，均分 ${win.avg ?? '-'}，低分 ${(win.low || []).length} 段
+        <span class="muted">${win.at ? esc(win.at) : '还没跑'}</span></div>
+      <div><b>示例库</b>：${ex.total || 0} 条（good ${ex.good || 0} / bad ${ex.bad || 0}）</div>
     </div>
     <div style="margin:8px 0">
+      <button onclick="piWindowEval()">评估当前窗口</button>
+      <button onclick="piBoundary()">跑边界检查</button>
+      <button onclick="piLikeness()">跑像人判别</button>
+      <button onclick="piVectorReset()">重置情绪</button>
       <button onclick="piEvalArtifacts()">生成测评素材</button>
       <button onclick="piEvalRound()">跑一轮基线分</button>
     </div>`;
+
+  if (axes.length) {
+    html += `<h4>行为矢量</h4><table class="items"><tr><th>轴</th><th>当前</th><th>基线</th><th>状态</th></tr>` +
+      axes.map(a => {
+        const v = values[a.id], b = a.baseline;
+        const diff = (v === undefined || b === undefined) ? 0 : v - b;
+        const state = Math.abs(diff) >= 0.2 ? (diff > 0 ? '偏高' : '偏低') : '正常';
+        return `<tr><td>${esc(a.name || a.id)}</td><td>${num(v)}</td><td>${num(b)}</td>
+          <td class="muted">${state}</td></tr>`;
+      }).join('') + `</table>`;
+  }
+  if ((rel.items || []).length) {
+    html += `<h4>关系（前 ${rel.items.length} 人）</h4>
+      <table class="items"><tr><th>对象</th><th>play</th><th>亲密度</th><th>能开的玩笑</th></tr>` +
+      rel.items.map(x => `<tr><td>${esc(x.who || x.uid)}${x.master ? '（主人）' : ''}</td>
+        <td>${num(x.play)}</td><td>${num(x.intimacy)}</td>
+        <td class="muted">${esc((x.tease_topics || []).join('、') || '-')}</td></tr>`).join('') + `</table>`;
+  } else {
+    html += '<div class="empty">还没有关系数据：等它和具体的人聊过之后再看。</div>';
+  }
+  html += `<h4>诊断项（旧特质，不参与否决）</h4>`;
   const scored = (ev.traits || []).filter(x => x.score !== null && x.score !== undefined);
   if (scored.length) {
     scored.sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -487,7 +693,7 @@ function renderPersona(p) {
           <td class="muted">${esc((x.at || '').slice(0, 16))}</td></tr>`;
       }).join('') + `</table>`;
   } else {
-    html += '<div class="empty">还没有基线分：先「生成测评素材」，再「跑一轮基线分」。</div>';
+    html += '<div class="empty">诊断项还没有分数：大评估跑过特质分后才会出现。</div>';
   }
 
   // 自动改动日志：**被拦下的也列出来** —— 那是判断闸门松紧的唯一依据
@@ -550,6 +756,102 @@ async function piEvalRound() {
     toast(`跑完 ${r.traits} 个特质`);
     load();
   } catch (e) { toast('跑分失败：' + e.message, true); }
+}
+
+// v2：边界 / 像人 / 重置情绪。前两个要花 token，先确认。
+async function piWindowEval() {
+  if (!confirm('评估「上次评估 → 现在」的连续对话片段（每段一次裁判调用）。继续？')) return;
+  toast('评估中…');
+  try {
+    const r = await api('/api/persona/window', {method:'POST', body: '{}'});
+    if (!r.ok) { toast('没跑成：' + (r.why || ''), true); return; }
+    toast(`评估 ${r.scored} 段，均分 ${r.avg}，低分 ${(r.low || []).length} 段`);
+    load();
+  } catch (e) { toast('评估失败：' + e.message, true); }
+}
+
+async function piBoundary() {
+  if (!confirm('检查最近 12 条回复的边界（每条一次裁判调用，约几十秒）。继续？')) return;
+  toast('检查中…');
+  try {
+    const r = await api('/api/persona/boundary', {method:'POST', body: '{}'});
+    if (!r.ok) { toast('没跑成：' + (r.why || ''), true); return; }
+    toast(`检查 ${r.checked} 条，越界 ${(r.violations || []).length}，拿不准 ${(r.borderline || []).length}`);
+    load();
+  } catch (e) { toast('检查失败：' + e.message, true); }
+}
+
+async function piLikeness() {
+  if (!confirm('跑一次「像人」成对判别（每组 1 次生成 + 1 次裁判，约一两分钟）。继续？')) return;
+  toast('判别中…');
+  try {
+    const r = await api('/api/persona/likeness', {method:'POST', body: '{}'});
+    if (!r.ok) { toast('没跑成：' + (r.why || ''), true); return; }
+    toast(`L=${r.L}（n=${r.n}，对照偏好 ${Math.round((r.acc || 0) * 100)}%）`);
+    load();
+  } catch (e) { toast('判别失败：' + e.message, true); }
+}
+
+async function piVectorReset() {
+  if (!confirm('把当前情绪重置回基线？这只影响“此刻的状态”，不改人格。')) return;
+  try {
+    const r = await api('/api/persona/vector', {method:'POST',
+      body: JSON.stringify({action: 'reset'})});
+    toast(r.ok ? '情绪已重置' : ('没重置成：' + (r.why || '')), !r.ok);
+    load();
+  } catch (e) { toast('重置失败：' + e.message, true); }
+}
+
+// ---- 像人样本库：勾选真实聊天候选 / 生成模型样本 / 保存 ----
+let LIKENESS = [];
+async function loadLikeness(force) {
+  const box = document.getElementById('likenessSection');
+  if (!box) return;
+  if (!force && box.dataset.loaded === '1') return;
+  try {
+    const r = await api('/api/persona/likeness/candidates');
+    LIKENESS = r.items || [];
+    const selected = new Set(r.selected || []);
+    box.innerHTML = `<h4>像人样本库 <span class="muted">（一半聊天候选 + 一半模型生成；勾选后保存）</span></h4>
+      <div style="margin:6px 0">
+        <button onclick="piLikenessGenerate()">生成 10 条模型样本</button>
+        <button onclick="piLikenessSave()">保存勾选</button>
+        <span class="muted">已选 ${selected.size} 条 · 候选 ${LIKENESS.length} 条</span>
+      </div>
+      <table class="items"><tr><th>选</th><th>来源</th><th>上下文</th><th>真人回复</th></tr>` +
+      LIKENESS.slice(0, 100).map(x => `<tr>
+        <td><input type="checkbox" class="likenessPick" value="${esc(x.id)}" ${selected.has(x.id) ? 'checked' : ''}></td>
+        <td class="muted">${x.source === 'generated' ? '模型' : '聊天'}</td>
+        <td class="muted">${esc((x.ctx || []).join(' / ').slice(0, 90))}</td>
+        <td>${esc(x.human || '')}</td></tr>`).join('') + `</table>`;
+    box.dataset.loaded = '1';
+  } catch (e) {
+    box.textContent = '读取样本失败：' + e.message;
+  }
+}
+
+async function piLikenessSave() {
+  const ids = [...document.querySelectorAll('.likenessPick:checked')].map(x => x.value);
+  if (!ids.length) { toast('先勾选几条', true); return; }
+  try {
+    const r = await api('/api/persona/likeness/select', {method:'POST',
+      body: JSON.stringify({ids})});
+    toast(r.ok
+      ? `已保存 ${r.saved} 条（聊天 ${(r.sources || {}).chat || 0} / 模型 ${(r.sources || {}).generated || 0}）`
+      : ('保存失败：' + (r.why || '')), !r.ok);
+    loadLikeness(true);
+  } catch (e) { toast('保存失败：' + e.message, true); }
+}
+
+async function piLikenessGenerate() {
+  if (!confirm('让模型生成 10 条「普通群友」样本补进候选（一次调用）。继续？')) return;
+  toast('生成中…');
+  try {
+    const r = await api('/api/persona/likeness/generate', {method:'POST',
+      body: JSON.stringify({n: 10})});
+    toast(r.ok ? `生成 ${r.generated} 条` : ('没生成：' + (r.why || '')), !r.ok);
+    loadLikeness(true);
+  } catch (e) { toast('生成失败：' + e.message, true); }
 }
 
 // ---------------------------------------------------------------- 记忆库
@@ -667,7 +969,7 @@ function renderGallery(items) {
     if (!it.phash) tags.push('<span class="tag">无感知哈希</span>');
     const dims = it.width && it.height ? `${it.width}×${it.height}` : '';
     return `
-    <div class="thumb" title="${esc(it.reason || '')}">
+    <div class="thumb" title="${esc(it.reason ? '旧记录：' + it.reason : '')}">
       <img src="${PREFIX}/api/stickers/${it.hash}" loading="lazy" alt="">
       <button class="del" onclick="del('${it.hash}')">×</button>
       <div class="meta">${it.score} · 用${it.uses}次${it.seen ? ' · 见' + it.seen + '次' : ''}<br>
@@ -821,10 +1123,12 @@ async function load() {
   renderModelJson(data.models_editor);
   renderPacks(data.persona);
   renderPersona(data.persona);
+  loadLikeness();
   renderMemory(data.memory);
   renderImage(data.image);
   renderTime(data.status.time);
   renderGallery(data.stickers_list);
+  renderVoice(data.voice);
 
   const st = data.status;
   const gr = st.greet || {sent:{}, today:''};
@@ -850,8 +1154,6 @@ async function load() {
     <span class="badge">长期记忆 <b>${mem}</b> 条</span>
     <span class="badge">人格自动改动 <b>${pChanges}</b> 条</span>
     ${searchBadge}
-    <span class="badge">群 <b>${st.groups.length}</b> 个</span>
-    <span class="badge">主动发言 <b>${st.proactive_enabled ? '开' : '关'}</b></span>
     <span class="badge">定时问候 <b>${gr.enabled ? '开' : '关'}</b>／今日 <b>${greeted}</b></span>
     <span class="badge">模型 <b>${esc(st.model)}</b> <span class="muted">@ ${esc(st.model_profile || '')}</span></span>`;
 }

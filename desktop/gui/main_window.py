@@ -457,7 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # 「功能」目录下的页面是同一份目录生成的联动视图：在某个子菜单里改了
             # `memory_enabled` 这类开关，中心页与其它子菜单的细节 chip 就已经过期。
             # 所以刷新当前功能页时，把其它功能页标成"下次显示再拉"（`_stale_pages`）——
-            # **不在这里替它们发请求**：19 个功能页同时拉 `/api/state` 才是灾难。
+            # **不在这里替它们发请求**：全部功能页同时拉 `/api/state` 才是灾难。
             if getattr(page, "in_features", False):
                 for other in self.pages:
                     if other is not page and getattr(other, "in_features", False):

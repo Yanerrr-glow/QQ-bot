@@ -9,6 +9,7 @@ from .page_models import ModelsPage
 from .page_overview import OverviewPage
 from .page_params import ParamsPage
 from .page_persona import PersonaEvalPage
+from .page_proposals import ProposalsPage
 from .page_plugins import PluginsPage
 from .page_stickers import StickersPage
 from .page_terminal import TerminalPage
@@ -32,6 +33,11 @@ BUILTIN_PAGES = (
     ParamsPage,
     ModelsPage,
     PersonaEvalPage,
+    # 修订提案紧挨「人格评估台」：它产出的就是那边的评估/修订结果，
+    # 两个入口看的是同一件事（谁改了人格、改了什么）。**放顶层**而不是塞进
+    # 「功能」目录：那要同步改 `features/catalog.py` 的 FEATURES，
+    # 而 `gui_smoke` 断言「子菜单 == FEATURES 全序」，为一个列表页不值当（#0006）。
+    ProposalsPage,
     MemoryPage,
     ImagePolicyPage,
     StickersPage,
@@ -43,7 +49,7 @@ BUILTIN_PAGES = (
 #: （页面标题是跳转用的身份 —— `goto_page` 按标题查，同名会二义）。
 #: 人格的**表格式明细**（三层正文、评估台、改动日志）在 `PersonaEvalPage`（标题「人格评估台」），
 #: 它复用 `PersonaPage` 的界面但把四个花 token 的动作藏起来 —— 那些动作与
-#: 「人格自动迭代与评估」子菜单里的开关是同一件事，两个入口各存一份行为迟早对不上。
+#: 「人格评估与自动修订」子菜单里的开关是同一件事，两个入口各存一份行为迟早对不上。
 
 #: 挂进「功能」目录的页面（页面类自己声明 `in_features`，这里只是取出来用）。
 FEATURE_PAGE_CLASSES = tuple(

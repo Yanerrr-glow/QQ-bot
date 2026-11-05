@@ -8,7 +8,7 @@
 * **细节** —— `GET /api/state` 的 `status` / `memory` / `image` / `persona` 切片。
 
 所以一个功能 = **若干参数组（可裁剪到具体键）** + **若干读状态的小函数**。
-把这件事写成数据表，而不是 19 个手写页面，换来三条：服务端加一个参数，
+把这件事写成数据表，而不是给每个功能手写一个页面，换来三条：服务端加一个参数，
 凡是归到某功能里的组都会自动出现；状态字段改名只改这里一处；
 「功能」中心页与子菜单页天然一致（同一份目录）。
 
@@ -190,15 +190,18 @@ def _persona_state(state: Any) -> list[tuple[str, Any, str]]:
 
 def _persona_iter_state(state: Any) -> list[tuple[str, Any, str]]:
     persona = dict(state.persona or {})
-    iteration = dict(persona.get("iter") or {})
     evaluation = dict(persona.get("eval") or {})
+    traits = list(evaluation.get("traits") or [])
+    targets = list(evaluation.get("targets") or [])
+    iter_on = bool(_setting(state, "eval_iter_enabled", evaluation.get("iter_enabled", True)))
     return [
-        ("自动迭代", "开" if _setting(state, "persona_iter_enabled") else "关",
-         "ok" if _setting(state, "persona_iter_enabled") else "info"),
-        ("已跑", f"{iteration.get('runs', 0)} 次", "info"),
-        ("已写入", f"{iteration.get('written', 0)} 条", "info"),
         ("评估台", "开" if evaluation.get("enabled") else "关",
          "ok" if evaluation.get("enabled") else "warn"),
+        ("自动修订", "开" if iter_on else "关", "ok" if iter_on else "info"),
+        ("每天", f"{int(evaluation.get('daily_hour') or _setting(state, 'eval_daily_hour', 3) or 3):02d}:00", "info"),
+        ("基线", f"{evaluation.get('with_baseline', 0)} / {len(traits)}", "info"),
+        ("待修特质", len(targets), "warn" if targets else "info"),
+        ("历史修订", f"{evaluation.get('revisions', 0)} 次", "info"),
     ]
 
 
@@ -218,15 +221,6 @@ def _attention_state(state: Any) -> list[tuple[str, Any, str]]:
          "ok" if _setting(state, "attention_enabled") else "info"),
         ("对话租约", "开" if _setting(state, "attention_lease_enabled") else "关", "info"),
         ("回复冷却", f"{_setting(state, 'attention_reply_cooldown')} 秒", "info"),
-    ]
-
-
-def _random_reply_state(state: Any) -> list[tuple[str, Any, str]]:
-    enabled = bool(_setting(state, "random_reply_enabled"))
-    return [
-        ("随机插话", "开" if enabled else "关", "ok" if enabled else "info"),
-        ("概率", _setting(state, "random_reply_chance"), "info"),
-        ("冷却", f"{_setting(state, 'random_reply_cooldown')} 秒", "info"),
     ]
 
 
@@ -372,9 +366,10 @@ FEATURES: tuple[FeatureEntry, ...] = (
     FeatureEntry(
         id="context",
         title="上下文与分条发送",
-        subtitle="会话切分、已读预算、多条发送",
+        subtitle="会话切分、已读预算、回复字数、多条发送",
         description=(
-            "决定“它看到多少上下文”以及“怎么把话发出来”。分条发送是为了像真人打字"
+            "决定“它看到多少上下文”以及“怎么把话发出来”。回复字数上限是硬截断"
+            "（按句砍，不砍半句），问技术/机制时自动放宽。分条发送是为了像真人打字"
             "（逐句分次发、之间停一下），而不是把一大段一次性砸出去。"
         ),
         category="对话",
@@ -410,24 +405,16 @@ FEATURES: tuple[FeatureEntry, ...] = (
     ),
     FeatureEntry(
         id="persona_iter",
-        title="人格自动迭代与评估",
-        subtitle="自动改表层人设、评估台打分",
+        title="人格评估与自动修订",
+        subtitle="定时打分，按结果改写三层人设",
         description=(
-            "让机器人按聊天记录反思并**自动写入表层人设**（底层与禁止事项永远不动），"
-            "以及人格评估台（裁判模型给各特质打分）。两个动作都会花 token。"
+            "每天固定时刻给各人格特质打分，再把**分数不达标**的特质整理成问题清单，"
+            "让模型做**段落级替换**并直接写入底层 / 禁止事项 / 表层三层。"
+            "每次修订前整份备份，可用 `/人设 撤回` 整版回滚。评估与修订都会花 token。"
         ),
         category="人格",
-        groups={
-            "人设": (
-                "persona_iter_enabled",
-                "persona_iter_auto_apply",
-                "persona_iter_interval",
-                "persona_iter_max",
-                "persona_iter_min_lines",
-            ),
-            "人设评估": (),
-        },
-        enable_key="persona_iter_enabled",
+        groups={"人设评估": ()},
+        enable_key="eval_enabled",
         state=(_persona_iter_state,),
     ),
     FeatureEntry(
@@ -455,16 +442,6 @@ FEATURES: tuple[FeatureEntry, ...] = (
         groups={"注意力": ()},
         enable_key="attention_enabled",
         state=(_attention_state,),
-    ),
-    FeatureEntry(
-        id="random_reply",
-        title="随机插话",
-        subtitle="低概率主动搭话",
-        description="按概率在群里随机接一句（与「主动发言」是两套机制：那个按时间与沉寂度触发）。",
-        category="注意力",
-        groups={"随机插话": ()},
-        enable_key="random_reply_enabled",
-        state=(_random_reply_state,),
     ),
     FeatureEntry(
         id="stickers",
@@ -553,8 +530,8 @@ FEATURES: tuple[FeatureEntry, ...] = (
         title="主动发言",
         subtitle="主动开口的时机与当日额度",
         description=(
-            "机器人自己挑一个活跃群开口（与「随机插话」不同：它按时间间隔与群内沉寂度触发）。"
-            "会调用模型并真的发消息，可能产生费用；「总览」页有“主动发言一次”的手动入口。"
+            "机器人自己挑一个活跃群开口，按时间间隔与群内沉寂度触发。"
+            "会调用模型并真的发消息，可能产生费用。"
         ),
         category="主动",
         groups={"主动发言": ()},

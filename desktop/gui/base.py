@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.apiclient import BotApiError
 from ..core.connection import ConnectionManager
@@ -80,6 +80,11 @@ class Page(QtWidgets.QWidget):
                 self._loaded = False
             try:
                 self._handle(result, on_done)
+            except Exception as exc:  # noqa: BLE001 - 回调里的错不能静默吞掉
+                # 踩过：控件范围溢出（QQ 号超过 Qt 的 32 位）让 `_apply` 抛异常，
+                # 页面永远停在"正在读取…"，用户只看到空白。这里至少把原因弹出来。
+                _logger.exception("页面 %s 的完成回调失败", self.title)
+                self.show_error(exc)
             finally:
                 self.busy_changed.emit(self.busy)
 
@@ -181,6 +186,19 @@ class Field:
     setter: Callable[[Any], None]
 
 
+#: Qt 的整数控件（QSpinBox/QIntValidator）只有 32 位；QQ 号会超过这个范围。
+_INT32_MIN = -2_147_483_648
+_INT32_MAX = 2_147_483_647
+
+
+def _read_int(widget: QtWidgets.QLineEdit) -> int:
+    """把大整数字段的文本转成 int；空串/坏输入按 0 处理（提交时服务端还会再夹紧）。"""
+    try:
+        return int(str(widget.text()).strip() or 0)
+    except ValueError:
+        return 0
+
+
 def build_field(spec: dict[str, Any], on_commit: Callable[[str, Any], None]) -> Field:
     """按 `kind` 造控件。密钥类用密码框（**只回显掩码**）。"""
     kind = str(spec.get("kind") or "str")
@@ -205,12 +223,34 @@ def build_field(spec: dict[str, Any], on_commit: Callable[[str, Any], None]) -> 
 
     if kind in ("int", "float") and not choices:
         if kind == "int":
+            lower = int(minimum) if isinstance(minimum, (int, float)) else -2_000_000_000
+            upper = int(maximum) if isinstance(maximum, (int, float)) else 2_000_000_000
+            value = int(spec.get("value") or 0)
+            # QQ 号常是 10 位数（如 100000001），超出 Qt 控件的 32 位整数范围。
+            # `QSpinBox.setValue()` 遇到这种值会抛 OverflowError，**整页建不出来** ——
+            # 表现是「基础与身份」页空白。这类字段改用文本框，保存时再转 int。
+            if not (
+                _INT32_MIN <= lower <= upper <= _INT32_MAX
+                and _INT32_MIN <= value <= _INT32_MAX
+            ):
+                widget = QtWidgets.QLineEdit(str(value))
+                widget.setValidator(
+                    QtGui.QRegularExpressionValidator(
+                        QtCore.QRegularExpression(r"-?\d{0,19}"), widget
+                    )
+                )
+                widget.editingFinished.connect(
+                    lambda k=key, w=widget: on_commit(k, _read_int(w))
+                )
+                return Field(
+                    spec,
+                    widget,
+                    lambda: _read_int(widget),
+                    lambda v: widget.setText(str(int(v or 0))),
+                )
             widget = QtWidgets.QSpinBox()
-            widget.setRange(
-                int(minimum) if isinstance(minimum, (int, float)) else -2_000_000_000,
-                int(maximum) if isinstance(maximum, (int, float)) else 2_000_000_000,
-            )
-            widget.setValue(int(spec.get("value") or 0))
+            widget.setRange(lower, upper)
+            widget.setValue(value)
         else:
             widget = QtWidgets.QDoubleSpinBox()
             widget.setDecimals(4)

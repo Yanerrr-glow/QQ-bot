@@ -1,14 +1,14 @@
-# QQ AI 机器人 —— 服务器部署编排（NapCat + bot）
+# QQ AI 机器人 —— 服务器部署编排（SnowLuma + bot；NapCat 保留为回退）
 #
 # 用法（在 deploy/ 目录下，且已复制好 .env）：
 #     docker compose up -d
 #     docker compose logs -f
 #
-# 架构：NapCat 与 bot 在同一 bridge 网络里，用容器名互通，
-#       OneBot 端口不需要暴露到宿主，公网更碰不到。
-#       连接方式为【反向 WS】：NapCat 主动连 bot 的 /onebot/v11/ws。
+# 架构：SnowLuma 与 bot 在同一 bridge 网络里，用容器名互通。
+#       连接方式为【反向 WS】：SnowLuma 主动连 bot 的 /onebot/v11/ws。
+#       NapCat 默认不启动，回退时用 --profile napcat。
 #
-# 安全要点：两个 ports 都写死了 127.0.0.1 前缀 —— 只绑宿主回环，
+# 安全要点：所有 ports 都写死了 127.0.0.1 前缀 —— 只绑宿主回环，
 #           公网扫不到，本地靠 SSH 隧道访问。不要把前缀删掉。
 name: qq-ai-chat
 
@@ -25,6 +25,11 @@ services:
     # bot 的全部配置从这里注入（DRIVER / 密钥 / AI_CHAT_* …）。
     # 注意：env_file 只喂给容器；compose 自己的 ${变量} 插值读的是同目录的 .env。
     env_file: .env
+    # 让容器能解析宿主机：tts-relay 绑在 docker 网桥网关（172.17.0.1:19881），
+    # bot 用 host.docker.internal:19881 访问它。**不要**写死 172.17.0.1 ——
+    # host-gateway 由 Docker 解析，换网段也不会错。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # 只给宿主回环。远程访问走：ssh -L 8080:127.0.0.1:8080 用户@服务器
       - "127.0.0.1:8080:8080"
@@ -48,11 +53,59 @@ services:
     networks:
       - botnet
 
+  # --------------------------------------------------------------- snowluma
+  # 协议端（OneBot v11）。Docker 镜像内置 Linux QQ + Xvfb + VNC，
+  # 登录靠 6081 的 noVNC 扫码；所有端口只绑宿主回环。
+  #
+  # 为什么需要 SYS_PTRACE / seccomp=unconfined：它用 ptrace 把 hook 注入 QQ 进程，
+  # 默认 seccomp 会拦。shm 1g 是 QQ（Chromium）的运行要求。
+  snowluma:
+    image: motricseven7/snowluma:latest
+    container_name: snowluma
+    restart: unless-stopped
+    shm_size: 1gb
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    depends_on:
+      - bot
+    environment:
+      TZ: Asia/Shanghai
+      VNC_PASSWD: ${SNOWLUMA_VNC_PASSWD:-}
+      SNOWLUMA_UID: ${SNOWLUMA_UID:-1000}
+      SNOWLUMA_GID: ${SNOWLUMA_GID:-1000}
+      SNOWLUMA_WEBUI_HOST: 0.0.0.0
+      SNOWLUMA_WEBUI_PORT: 5099
+      SNOWLUMA_LOG_LEVEL: info
+      SNOWLUMA_SCREEN: 1920x1080x24
+      SNOWLUMA_HOOK_AUTOLOAD: "1"
+      SNOWLUMA_QQ_FLAGS: "--disable-gpu --disable-software-rasterizer --disable-gpu-compositing"
+    ports:
+      # 只给宿主回环：远程访问走 SSH 隧道
+      - "127.0.0.1:6081:6081"   # noVNC（扫码）
+      - "127.0.0.1:5099:5099"   # SnowLuma WebUI
+    volumes:
+      # 这三个目录必须持久化：配置、QQ 客户端配置、QQ 登录态
+      - ./snowluma/data:/app/data
+      - ./snowluma/config:/app/.config
+      - ./snowluma/share:/app/.local/share
+    networks:
+      - botnet
+
   # --------------------------------------------------------------- napcat
+  # 保留为**回退**：默认不启动（profile=napcat）。要回退时：
+  #   docker compose --profile napcat up -d napcat
   napcat:
+    profiles: ["napcat"]
     image: mlikiowa/napcat-docker:latest
     container_name: napcat
-    restart: always
+    # 回退用，不随 Docker/服务器重启自动拉起（否则会和新协议端抢同一个号）
+    restart: "no"
     depends_on:
       - bot
     environment:

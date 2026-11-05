@@ -125,10 +125,10 @@ def main() -> int:
 
     def _search_navigation():
         window.features_item.setExpanded(False)
-        window.nav_search.setText("人格自动迭代")
+        window.nav_search.setText("人格评估")
         assert window.features_item.isExpanded()
         window._open_search_result()
-        assert "人格自动迭代" in window._current_page().title
+        assert "人格评估" in window._current_page().title
         window.nav_search.setText("no-such-page-4891")
         assert not window.nav_empty.isHidden()
         window.nav_search.clear()
@@ -222,6 +222,84 @@ def main() -> int:
                 + "、".join(expected[:4]) + " …")
 
     step("功能目录（总览同级 + 子菜单在它下面）", _features_nav)
+
+    def _basic_page_fields():  # noqa: ANN202
+        """「基础与身份」必须真的建出控件。
+
+        回归（2026-10-24 用户报「基础身份页无法显示信息」）：`master_qq` 是 10 位数
+        （100000001），超出 Qt 控件的 32 位整数上限，`QSpinBox.setValue()` 抛
+        OverflowError，整个 `_apply` 中断，页面永远停在“正在读取…”。
+        现在这类大整数走文本框，并且默认展开参数组（不再一进来就整片灰掉）。
+        """
+        page = next((p for p in window.pages if p.title == "基础与身份"), None)
+        assert page is not None, "找不到「基础与身份」页"
+        assert window.goto_page(page.title), "跳转「基础与身份」失败"
+        _pump(app, 0.6)
+        assert page.panel.count >= 1, "基础页一个参数控件都没建出来"
+        field = page.panel.view._fields.get("master_qq")
+        assert field is not None, "基础页缺少 master_qq 控件"
+        assert isinstance(field.widget, QtWidgets.QLineEdit), (
+            f"10 位 QQ 号应使用文本框（QSpinBox 会溢出），实际 {type(field.widget).__name__}"
+        )
+        assert field.widget.text() == "100000001", f"QQ 号显示不对：{field.widget.text()!r}"
+        assert page.panel.view._groups and page.panel.view._groups[0].isChecked(), (
+            "参数组应当默认展开，否则所有控件会被 QGroupBox 禁用成灰色"
+        )
+        return f"{page.panel.count} 个字段，master_qq={field.widget.text()}（文本框）"
+
+    step("基础页控件与大整数 QQ 号（回归：溢出导致整页空白）", _basic_page_fields)
+
+    def _image_policy_page():  # noqa: ANN202
+        """图片策略页必须按服务端的四种模式渲染，且不把快照里的占位会话当成真会话。
+
+        回归（2026-10-24）：页面曾写死 `normal/ignore/ask`，服务端却没有 `ask`
+        （选中即 400），而 `only` / `off` 反而选不到；另外 `convs` 的值是对象，
+        页面对它取 `str()` 会把 dict 的 repr 显示在「有效策略」列。
+        """
+        page = next((p for p in window.pages if p.title == "图片策略（会话）"), None)
+        assert page is not None, "找不到「图片策略（会话）」页"
+        assert window.goto_page(page.title), "跳转图片策略页失败"
+        _pump(app, 0.6)
+        modes = [page.mode_combo.itemData(i) for i in range(page.mode_combo.count())]
+        assert set(modes) == {"normal", "ignore", "only", "off"}, f"模式列表不对：{modes}"
+        assert "ask" not in modes, f"仍有服务端不存在的 ask：{modes}"
+        assert page.conv_mode.count() == 4, "新增会话的模式下拉没有四种模式"
+        assert page.conv_input is not None, "缺少手动指定会话 id 的输入框"
+        convs = [page.table.item(row, 0).text() for row in range(page.table.rowCount())]
+        assert "__global__" not in convs, f"占位会话漏进表格：{convs}"
+        assert "g123" in convs, f"已有自定义策略的会话没列出来：{convs}"
+        for row in range(page.table.rowCount()):
+            text = page.table.item(row, 1).text()
+            assert "{" not in text and "mode" not in text, f"有效策略列显示成了 dict：{text}"
+        return f"四种模式 {modes}；表格 {convs}；可手动新增会话"
+
+    step("图片策略页：四种模式 / 过滤 __global__ / 会话对象形状", _image_policy_page)
+
+    def _memory_profile_rows():  # noqa: ANN202
+        """记忆库的「人物画像」要显示画像内容，不能整列都是 `-`。
+
+        回归（2026-10-24 用户报「人物画像没有写入内容」）：页面还在读旧字段
+        `summary/facts/updated/uid`，而服务端现在给的是 `display/love/dislike/habit/note/updated_at`，
+        uid 编码在 key（`uid:<QQ号>`）里 —— 结果每一格都显示 `-`，看起来像一条都没写进去。
+        """
+        page = next((p for p in window.pages if p.title == "记忆库"), None)
+        assert page is not None, "找不到「记忆库」页"
+        assert window.goto_page(page.title), "跳转记忆库失败"
+        _pump(app, 0.6)
+        page.category.setCurrentText("人物画像")
+        _pump(app, 0.3)
+        assert page.table.rowCount() == 1, f"空画像应被过滤掉，实际 {page.table.rowCount()} 行"
+        cells = [page.table.item(0, c).text() for c in range(page.table.columnCount())]
+        assert cells[0] == "小明", f"人物列不对：{cells}"
+        assert cells[1] == "100000001", f"UID 列没从 key 里解出来：{cells}"
+        assert "3D打印" in cells[2], f"喜欢列没有画像内容：{cells}"
+        assert cells[4] and cells[4] != "—", f"习惯/备注列是空的：{cells}"
+        assert cells[5] == "2026-10-22 14:05:30", f"更新时间列不对：{cells}"
+        assert "人物 2" in page.hint.text(), f"统计没读 people 字段：{page.hint.text()}"
+        assert "空画像" in page.hint.text(), f"没有提示空画像数量：{page.hint.text()}"
+        return "；".join(cells)
+
+    step("记忆库人物画像：显示内容而非旧字段（回归：整列 '-'）", _memory_profile_rows)
 
     def _load_all_pages():  # noqa: ANN202
         # 按**标题**跳转（`goto_page`）而不是行号：导航是两层树、还能收起，

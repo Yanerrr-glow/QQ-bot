@@ -1,8 +1,8 @@
 """图片策略页：全局策略（一行按钮）+ 会话级有效策略（一张表）。
 
-服务端的形状很简单（`webui.py:1122-1141`）：
+服务端的形状很简单（`webui.py:438-458`）：
 
-    POST /ai/api/image-policy {"global_mode": "normal|ignore|ask"}
+    POST /ai/api/image-policy {"global_mode": "normal|ignore|only|off"}
     POST /ai/api/image-policy {"conv": "g123", "mode": "…"}    ← mode 空串 = 清除该会话的自定义
 
 "有效策略"≠"全局策略"：会话有自己的设置时以会话为准。所以页面上**同时**显示两者，
@@ -31,11 +31,32 @@ from .widgets import (
     toolbar,
 )
 
+#: 与服务端 `state.VALID_MODES` 一一对应。**不要在这里另造模式**：
+#: 曾经写过一个服务端不存在的 `ask`，选中就 400，而且 `only` / `off` 反而漏掉了。
 MODE_LABELS = {
-    "normal": "正常（按全局）",
-    "ignore": "禁存（不记这类图）",
-    "ask": "询问（问过再决定）",
+    "normal": "正常（会看图、会入库）",
+    "ignore": "不再保存（会看图、不入库）",
+    "only": "只看不存（会看图、不入库）",
+    "off": "完全不看（不下载、不送模型）",
 }
+_FALLBACK_MODES = ("normal", "ignore", "only", "off")
+
+
+def _mode_of(entry: Any) -> str:
+    """取会话条目里的自定义模式。
+
+    `state.snapshot()` 的 `convs` 是 `conv -> {mode, effective, …}`；
+    旧桩/旧版本可能是裸字符串，两种都认，避免把 dict 的 repr 直接显示到表格里。
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("mode") or "")
+    return str(entry or "")
+
+
+def _effective_of(entry: Any, global_mode: str) -> str:
+    if isinstance(entry, dict) and entry.get("effective"):
+        return str(entry["effective"])
+    return _mode_of(entry) or global_mode
 
 
 class ImagePolicyPage(Page):
@@ -90,6 +111,26 @@ class ImagePolicyPage(Page):
         # ---- 会话
         session_box = QtWidgets.QGroupBox("会话级有效策略")
         session_layout = QtWidgets.QVBoxLayout(session_box)
+
+        # 服务端不再下发"已知群列表"（那是主动发言时代的 `status.groups`），
+        # 所以必须能手动指定会话 id，否则只能改那些**已经设过**策略的会话。
+        add_row = QtWidgets.QHBoxLayout()
+        add_row.setSpacing(theme.SPACE["sm"])
+        add_row.addWidget(QtWidgets.QLabel("新增/修改会话："))
+        self.conv_input = QtWidgets.QLineEdit()
+        self.conv_input.setPlaceholderText("会话 id：群 g123456789 / 私聊 u10001")
+        self.conv_input.setToolTip(
+            "群会话是 g + 群号，私聊是 u + QQ 号。设完会出现在下面的表格里。"
+        )
+        self.conv_input.setMinimumWidth(220)
+        add_row.addWidget(self.conv_input, 1)
+        self.conv_mode = QtWidgets.QComboBox()
+        self.conv_mode.setMinimumWidth(180)
+        add_row.addWidget(self.conv_mode)
+        self.btn_add_conv = primary_button("设置", self._add_conv)
+        add_row.addWidget(self.btn_add_conv)
+        session_layout.addLayout(add_row)
+
         self.table = table(["会话", "有效策略", "自定义", "操作"])
         session_layout.addWidget(self.table, 1)
         outer.addWidget(session_box, 1)
@@ -108,7 +149,7 @@ class ImagePolicyPage(Page):
             return
         state: StateSlice = result.value
         self._image = state.image
-        modes = [str(x) for x in (self._image.get("valid_modes") or ["normal", "ignore", "ask"])]
+        modes = [str(x) for x in (self._image.get("valid_modes") or _FALLBACK_MODES)]
         current = str(self._image.get("global_mode") or "normal")
 
         if self.mode_combo.count() != len(modes):
@@ -119,14 +160,28 @@ class ImagePolicyPage(Page):
         if index >= 0:
             self.mode_combo.setCurrentIndex(index)
 
-        convs = dict(self._image.get("convs") or {})
+        if self.conv_mode.count() != len(modes):
+            self.conv_mode.clear()
+            for mode in modes:
+                self.conv_mode.addItem(MODE_LABELS.get(mode, mode), mode)
+        default_index = self.conv_mode.findData("ignore")
+        if default_index >= 0:
+            self.conv_mode.setCurrentIndex(default_index)
+
+        # `__global__` 是服务端给 WebUI 的占位条目（全局非 normal 时出现），不是真会话。
+        convs = {
+            str(conv): item
+            for conv, item in dict(self._image.get("convs") or {}).items()
+            if not str(conv).startswith("__")
+        }
+        # 旧服务端还会给 `status.groups`；有就并进来（现在通常没有）。
         groups = list(state.status.get("groups") or [])
-        # 群列表来自主动发言的已知群；把有自定义策略的会话也并进来，避免"设置了却看不见"。
         all_convs = sorted(set(convs) | set(groups))
         self.table.setRowCount(len(all_convs))
         for row, conv in enumerate(all_convs):
-            custom = convs.get(conv)
-            effective = custom or current
+            entry = convs.get(conv)
+            custom = _mode_of(entry) if entry is not None else ""
+            effective = _effective_of(entry, current) if entry is not None else current
             conv_item = QtWidgets.QTableWidgetItem(str(conv))
             conv_item.setToolTip(str(conv))
             effective_item = QtWidgets.QTableWidgetItem(
@@ -135,7 +190,7 @@ class ImagePolicyPage(Page):
             effective_item.setToolTip(str(effective))
             self.table.setItem(row, 0, conv_item)
             self.table.setItem(row, 1, effective_item)
-            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(MODE_LABELS.get(str(custom), str(custom)) if custom else ""))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(MODE_LABELS.get(custom, custom) if custom else ""))
 
             holder = QtWidgets.QWidget()
             layout = QtWidgets.QHBoxLayout(holder)
@@ -172,13 +227,25 @@ class ImagePolicyPage(Page):
 
         self.hint.setText(
             f"全局：<b>{esc(MODE_LABELS.get(current, current))}</b> · 有自定义策略的会话 "
-            f"{esc(len(convs))} 个 · 已知会话 {esc(len(all_convs))} 个 ｜ "
+            f"{esc(len(convs))} 个 · 表格列出 {esc(len(all_convs))} 个 ｜ "
             "有效策略 = 会话自定义优先，没有则跟全局"
         )
         self.toast("图片策略已载入", level="ok")
         self.refreshed.emit()
 
     # ------------------------------------------------------------ 动作
+    def _add_conv(self) -> None:
+        """手动给一个会话设策略（表格里通常只会出现"已经设过"的会话）。"""
+        conv = self.conv_input.text().strip()
+        if not conv:
+            self.toast("先填会话 id：群 g+群号，私聊 u+QQ号", level="warn")
+            return
+        if not (conv.startswith("g") or conv.startswith("u")):
+            self.toast("会话 id 应以 g（群）或 u（私聊）开头，例如 g123456789 / u10001", level="warn")
+            return
+        mode = str(self.conv_mode.currentData() or "normal")
+        self._set_conv(conv, mode)
+
     def _apply_global(self) -> None:
         self._set_global(str(self.mode_combo.currentData() or "normal"))
 

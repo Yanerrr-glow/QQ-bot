@@ -337,6 +337,39 @@ def spec_default(root: Path, key: str) -> str:
     return token
 
 
+def _pack_wake_words(root: Path, pack: str) -> list[str]:
+    """当前人格包 `_pack.json` 声明的唤醒词；读不到返回空列表（回落 .env / 设置）。"""
+    if not pack:
+        return []
+    path = root / "persona" / "packs" / pack / "_pack.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = data.get("wake_words") if isinstance(data, dict) else None
+    if isinstance(raw, str):
+        raw = [x for x in re.split(r"[,，\s]+", raw) if x]
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _pack_bot_name(root: Path, pack: str) -> str:
+    """当前人格包 `_pack.json` 里声明的 `bot_name`；读不到就返回空串。
+
+    与 `config.bot_name()` 的回落顺序一致（包在 .env 之前）—— 包化之后
+    "名字跟着角色走"，所以 `.env` 留空才是正常状态。
+    """
+    if not pack:
+        return ""
+    path = root / "persona" / "packs" / pack / "_pack.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("bot_name") or "").strip() if isinstance(data, dict) else ""
+
+
 def effective(root: Path, env: dict[str, str], spec_key: str, env_key: str,
               overrides: dict[str, object]) -> tuple[str, str]:
     """算出一个配置项的**生效值**，并说明它从哪来（控制台 / .env / 代码默认）。"""
@@ -509,7 +542,7 @@ def check_persona(root: Path, env: dict[str, str], overrides: dict[str, object],
          shown("AI_CHAT_PERSONA_FILE", "base.txt")),
         ("禁止事项（铁律）", resolve("AI_CHAT_FORBIDDEN_FILE", "forbidden.txt"),
          shown("AI_CHAT_FORBIDDEN_FILE", "forbidden.txt")),
-        ("表层人设（会被自动改写）", resolve("AI_CHAT_SURFACE_FILE", "surface.txt"),
+        ("表层人设（会被自动修订）", resolve("AI_CHAT_SURFACE_FILE", "surface.txt"),
          shown("AI_CHAT_SURFACE_FILE", "surface.txt")),
     ]
     base_text = ""
@@ -543,25 +576,41 @@ def check_persona(root: Path, env: dict[str, str], overrides: dict[str, object],
 
     # `AI_CHAT_BOT_NAME` 与人设里的角色名**必须一致** —— 它决定"聊天记录里哪句话是
     # 机器人自己说的"，写错了它会对着自己接话。这一条最值得在首次自检里报出来。
+    #
+    # 2026-10-02 包化之后 `.env` 里**留空是正常状态**：角色名跟着人格包走
+    # （`_pack.json` 的 `bot_name`），写在 .env 反而会在换包后与包不一致。
+    # 所以这里按 `config.bot_name()` 的同一顺序解析：先看 .env，再看当前包的
+    # `_pack.json` —— 只看 .env 会把正常配置误报成阻塞（2026-10-29 踩过）。
     bot_name = env.get("AI_CHAT_BOT_NAME", "").strip()
+    bot_name_from = ".env" if bot_name else ""
+    if not bot_name and pack:
+        bot_name = _pack_bot_name(root, pack)
+        if bot_name:
+            bot_name_from = f"人格包「{pack}」的 _pack.json"
     if not bot_name and interactive:
-        print("  AI_CHAT_BOT_NAME 没填（它决定聊天记录里哪句话是它自己说的）")
+        print("  AI_CHAT_BOT_NAME 没填，当前包也没声明 bot_name（它决定聊天记录里哪句话是它自己说的）")
         bot_name = ask_until("它叫什么（回车跳过）", "要和底层人设里的角色名一致", _valid_name)
         if bot_name:
             if write_env(env_path, "AI_CHAT_BOT_NAME", bot_name):
                 env["AI_CHAT_BOT_NAME"] = bot_name
+                bot_name_from = ".env"
                 say(OK, f"已写入 .env：AI_CHAT_BOT_NAME={bot_name}")
     if not bot_name:
-        say(BLOCK, "AI_CHAT_BOT_NAME 没填", "它会分不清哪句话是自己说的，改成人设里的角色名")
+        say(BLOCK, "角色名没解析出来",
+            "`.env` 的 AI_CHAT_BOT_NAME 为空、当前包的 _pack.json 也没写 bot_name —— 它会分不清哪句话是自己说的")
     elif base_text and bot_name not in base_text:
-        say(WARN, f"AI_CHAT_BOT_NAME（{bot_name}）没在人设里出现",
+        say(WARN, f"角色名（{bot_name}，来自{bot_name_from}）没在人设里出现",
             "确认角色名一致；不一致时它会对着自己接话")
     else:
-        say(OK, f"角色名与人设一致：{bot_name}")
+        say(OK, f"角色名解析正常：{bot_name}（来自{bot_name_from}）")
 
     # 唤醒词也要认角色名 —— 但它多半不在 .env 里（默认写在 settings.py 的 spec 表里），
-    # 所以要和"生效值"比，而不是只看 .env。
+    # 所以要和"生效值"比，而不是只看 .env。包化之后**当前包的 `_pack.json` 会覆盖**
+    # 这一项（`packs.py` 把 `wake_words` 当设置项注入），所以先看包、再看 .env/设置。
     wake, wake_from = effective(root, env, "wake_words", "AI_CHAT_WAKE_WORDS", overrides)
+    pack_wake = _pack_wake_words(root, pack)
+    if pack_wake:
+        wake, wake_from = "，".join(pack_wake), f"人格包「{pack}」的 _pack.json"
     if not wake or wake in ("[]",):
         say(INFO, "没有唤醒词", "那就只靠 @ 触发")
     elif bot_name and bot_name not in wake:
@@ -826,6 +875,22 @@ def check_online(env: dict[str, str], offline: bool, root: Path) -> None:
             f"{why} —— 在控制台「模型」页改这个档案，或用 /模型 切换")
 
 
+def _find_by_name(root: Path, name: str, hints: tuple[str, ...]) -> Path | None:
+    """按名找工具脚本：先查提示目录，再在项目根下按文件名兜底。
+
+    不写死单一相对路径 —— 脚本在 `_工具链/<组>/` 与 `验证/` 之间搬过家，
+    写死一处就会静默跳过（2026-10-29 踩过：--deep 一直说"找不到 离线验证_桩.py"）。
+    """
+    for rel in hints:
+        candidate = root / rel / name
+        if candidate.is_file():
+            return candidate
+    for candidate in root.rglob(name):
+        if candidate.is_file() and ".work-tmp" not in candidate.parts:
+            return candidate
+    return None
+
+
 def check_code(root: Path, python_cmd: list[str] | None, deep: bool) -> None:
     head("6. 代码完整性")
     if python_cmd is None:
@@ -843,9 +908,9 @@ def check_code(root: Path, python_cmd: list[str] | None, deep: bool) -> None:
     if not deep:
         say(INFO, "桩测试未跑（加 --deep 会跑，约 1~2 分钟）")
         return
-    stub = root / "_工具链" / "离线验证_桩.py"
-    if not stub.is_file():
-        say(WARN, "找不到 离线验证_桩.py")
+    stub = _find_by_name(root, "离线验证_桩.py", ("_工具链", "验证"))
+    if stub is None:
+        say(WARN, "找不到 离线验证_桩.py", "按名在 _工具链\\ 与 验证\\ 下都没找到")
         return
     print("  正在跑桩测试（无依赖、不联网，可能要一两分钟）...")
     code, out = run(python_cmd + [str(stub)], timeout=1800)
@@ -864,11 +929,14 @@ def print_summary(root: Path, env: dict[str, str], overrides: dict[str, object])
     override, override_from = effective(root, env, "model", "DEEPSEEK_MODEL", overrides)
     model_show = (f"{override}（{override_from} 覆盖）" if override
                   else f"{prof['model']}（档案「{active}」）")
+    # 角色名与自检第 3 段同一套回落：.env → 当前人格包的 _pack.json
+    _pack_now = active_persona_pack(root, env)
+    _bot_show = env.get("AI_CHAT_BOT_NAME", "").strip() or _pack_bot_name(root, _pack_now)
     rows = [
         ("模型", f"{model_show} @ {prof['base_url']}"),
         ("接口档案", f"{len(items)} 个（{'／'.join(str(p['id']) for p in items[:5])}）"
                      "，控制台「模型」页可切换"),
-        ("机器人名", env.get("AI_CHAT_BOT_NAME", "") or "（未填）"),
+        ("机器人名", _bot_show or "（未填，且当前包也没声明 bot_name）"),
         ("主人 QQ", (master + f"（{master_from}）") if master else "（未配置：限主人功能全关）"),
         ("触发", "只靠 @ 与唤醒词" if not env.get("AI_CHAT_PREFIX") else f"前缀 {env['AI_CHAT_PREFIX']}"),
         ("会话切分", f"{env.get('AI_CHAT_SESSION_GAP', '300') or '300'} 秒"),

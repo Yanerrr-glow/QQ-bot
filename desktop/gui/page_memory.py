@@ -113,9 +113,14 @@ class MemoryPage(Page):
         only_locked = self.only_locked.isChecked()
 
         if category == "人物画像":
-            source = list(memory.get("profile") or [])
+            all_profiles = list(memory.get("profile") or [])
+            # 旧版写入路径留下过一批"只有 key、没有任何字段"的空画像（`updated_at` 也是空）。
+            # 它们在服务端不会被自动删，但列出来只会让人以为"画像没写进去"。
+            profiles = [x for x in all_profiles if not _is_empty_profile(x)]
+            empty_profiles = len(all_profiles) - len(profiles)
+            source = profiles
             self._rows = [self._profile_row(x) for x in source]
-            headers = ["#", "人物", "UID", "概述", "事实数", "更新时间"]
+            headers = ["人物", "UID", "喜欢", "不喜欢", "习惯 / 备注", "更新时间"]
         elif category == "事实":
             source = list(memory.get("facts") or [])
             self._rows = [self._fact_row(x) for x in source]
@@ -141,11 +146,17 @@ class MemoryPage(Page):
                 self.table.setItem(index, column, QtWidgets.QTableWidgetItem(str(text)))
         fit_table(self.table)
 
+        if category == "人物画像":
+            extra_hint = f"（另有 {esc(empty_profiles)} 条空画像，旧数据，未列出）" if empty_profiles else ""
+        else:
+            extra_hint = ""
+        people = stats.get("profile", stats.get("people", 0))
         self.hint.setText(
             f"事实 {esc(stats.get('facts', 0))} · 群事件 {esc(stats.get('events', 0))} · "
-            f"人物 {esc(stats.get('profile', 0))} · 受保护 {esc(stats.get('protected', 0))} ｜ "
+            f"人物 {esc(people)} · 受保护 {esc(stats.get('protected', 0))} ｜ "
             f"当前显示 {esc(len(filtered))} / {esc(len(self._rows))} 条"
             + ("（本地过滤）" if needle else "")
+            + extra_hint
         )
         self._update_buttons()
 
@@ -187,18 +198,37 @@ class MemoryPage(Page):
 
     @staticmethod
     def _profile_row(item: dict[str, Any]) -> dict[str, Any]:
+        """人物画像一行。
+
+        ⚠ 字段名跟着服务端走过一次重构：旧版给的是 `summary/facts/updated/uid`，
+        现在 `settings` 那边给的是画像快照 `display/love/dislike/habit/note/updated_at`，
+        uid 编码在 key 里（`uid:<QQ号>`）。还用旧字段的话，整张表每格都是 `-` ——
+        看起来就像"画像一条都没写进去"（2026-10-24 用户报的就是这个）。
+        """
+        key = str(item.get("key") or "")
+        uid = key[4:] if key.startswith("uid:") else ""
+        display = str(item.get("display") or key)
+
+        def _join(name: str) -> str:
+            return "、".join(str(x) for x in (item.get(name) or []) if str(x).strip())
+
+        love = _join("love")
+        dislike = _join("dislike")
+        habit = _join("habit")
+        note = str(item.get("note") or "").strip()
+        extra = "；".join(x for x in (habit, note) if x)
         return {
             "id": 0,
             "locked": True,  # 画像条目不支持单独保护/删除（服务端没有这个接口）
             "kind": "profile",
-            "blob": f"{item.get('key')} {item.get('summary')}",
+            "blob": " ".join(x for x in (key, display, love, dislike, habit, note) if x),
             "cells": [
-                "-",
-                item.get("key") or "-",
-                item.get("uid") or "-",
-                one_line(item.get("summary"), 200),
-                item.get("facts") or "-",
-                item.get("updated") or "-",
+                one_line(display, 80) or "-",
+                uid or "-",
+                one_line(love, 160) or "—",
+                one_line(dislike, 160) or "—",
+                one_line(extra, 200) or "—",
+                item.get("updated_at") or "-",
             ],
         }
 
@@ -290,6 +320,15 @@ class MemoryPage(Page):
             self.load(force=True)
         else:
             self.toast(f"{action}未成功：{one_line(payload.get('error') or payload.get('detail') or '', 160)}", level="warn")
+
+
+def _is_empty_profile(item: dict[str, Any]) -> bool:
+    """只有 key、没有任何内容的旧画像（2026-10 之前的占位写入留下的）。"""
+    if str(item.get("display") or "").strip():
+        return False
+    if str(item.get("note") or "").strip():
+        return False
+    return not any(item.get(field) for field in ("love", "dislike", "habit"))
 
 
 def _score(value: Any) -> str:

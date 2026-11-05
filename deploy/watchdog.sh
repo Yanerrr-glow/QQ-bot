@@ -1,4 +1,9 @@
 #!/bin/bash
+# ⚠ 2026-10-26：协议端已换成 SnowLuma，本脚本只适用于 NapCat 回退场景。
+#   `qqbot-watchdog.timer` 已 `systemctl disable --now`。
+#   SnowLuma 的 `awaiting login` 需要人工扫码，自动重启可能反复掉登录，
+#   在写新的看护脚本前不要把它重新启用。
+#
 # NapCat 看护：发现掉线就自动重启容器，让它走 entrypoint 的快速登录。
 #
 # 背景：NapCat 被 QQ 风控踢下线后，走的是【内部 Worker 重启】—— 那条路径不经过
@@ -29,9 +34,11 @@ cd "$DEPLOY_DIR" || { echo "找不到目录：$DEPLOY_DIR"; exit 1; }
 #   请扫描下面的二维码  → 退回了扫码模式
 #   Login Error         → 登录尝试失败
 #   KickedOffLine       → 刚被踢下线
+#   账号状态变更为离线  → QQ 侧已掉线（2026-10-23 补充：之前漏了这一条，
+#                         10:12 掉线后看护一直没动手，空转两小时）
 recent="$(docker compose logs --since "$WINDOW" napcat 2>&1 || true)"
 
-if ! printf '%s' "$recent" | grep -qE '请扫描下面的二维码|Login Error|KickedOffLine'; then
+if ! printf '%s' "$recent" | grep -qE '请扫描下面的二维码|Login Error|KickedOffLine|账号状态变更为离线'; then
     # 一切正常：清掉失败计数，安静退出（不写日志，避免刷屏）
     printf '0' > "$FAIL_COUNT"
     exit 0

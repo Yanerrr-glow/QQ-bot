@@ -84,6 +84,20 @@ except ImportError:
     except ImportError:
         pass
 
+# 让插件模块能 import：`ai_chat.settings` 在**导入期**就会调 `get_driver()`，
+# 不 init 的话「时间」「记忆」这些依赖插件的段落只会报
+# `ValueError: NoneBot has not been initialized`（2026-10-29 在容器里实测）。
+# 这里只做 init（读 .env、注册 driver），**不启动任何服务**；已经 init 过就跳过。
+try:
+    import nonebot as _nb
+
+    try:
+        _nb.get_driver()
+    except Exception:  # noqa: BLE001 - 没 init 过才会走到这里
+        _nb.init()
+except Exception as _init_exc:  # noqa: BLE001 - 初始化失败只降级，不让诊断整体崩
+    print(f"（nonebot 初始化跳过：{type(_init_exc).__name__}: {_init_exc}）")
+
 line = "─" * 68
 
 

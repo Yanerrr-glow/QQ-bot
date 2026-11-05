@@ -1,6 +1,6 @@
-"""总览页：一眼看清机器人现在什么状态，并给三个最常用的快捷动作。
+"""总览页：一眼看清机器人现在什么状态，并给几个最常用的快捷动作。
 
-对应 WebUI 的 `/ai/` 首页：状态徽标 + 主动发言 / 手动问候 / 刷新。
+对应 WebUI 的 `/ai/` 首页：状态徽标 + 手动问候 / 刷新。
 另外多一块"插件状态卡"——那是桌面端独有扩展点（插件只能注册**只读**卡片）。
 """
 
@@ -42,10 +42,6 @@ class OverviewPage(Page):
 
         bar = toolbar("快捷操作")
         self.btn_refresh = primary_button("刷新", lambda: self.load(force=True))
-        self.btn_speak = danger_button(
-            "主动发言一次", self._speak,
-            tip="让机器人在某个活跃群主动说一句（会调用模型，可能产生费用）",
-        )
         self.btn_greet = danger_button(
             "手动问候", self._greet,
             tip="按当前钟点发一次问候（绕开总开关，不消耗当天的自动次数；会调用模型）",
@@ -53,7 +49,6 @@ class OverviewPage(Page):
         self.btn_webui = ghost_button("打开旧 WebUI（回退入口）", self._open_webui)
         bar.addWidget(self.btn_refresh)
         bar.addSpacing(theme.SPACE["lg"])
-        bar.addWidget(self.btn_speak)
         bar.addWidget(self.btn_greet)
         bar.addSpacing(theme.SPACE["lg"])
         bar.addWidget(self.btn_webui)
@@ -113,7 +108,6 @@ class OverviewPage(Page):
         groups = list(status.get("groups") or [])
         search = dict(status.get("search") or {})
         greet = dict(status.get("greet") or {})
-        proactive = dict(status.get("proactive") or {})
         time_info = dict(status.get("time") or {})
 
         online = self.manager.state.api_ok
@@ -124,10 +118,6 @@ class OverviewPage(Page):
             badge(
                 f"重复组 {int(stickers.get('duplicates') or 0)}",
                 level="warn" if int(stickers.get("duplicates") or 0) else "info",
-            ),
-            badge(
-                "主动发言 开" if status.get("proactive_enabled") else "主动发言 关",
-                level="ok" if status.get("proactive_enabled") else "info",
             ),
             badge(
                 "定时问候 开" if greet.get("enabled") else "定时问候 关",
@@ -144,8 +134,6 @@ class OverviewPage(Page):
                 level="info",
             ),
         ]
-        if proactive.get("day_count"):
-            chips.append(badge(f"今日主动发言 {sum(int(v) for v in proactive['day_count'].values())}"))
         return " &nbsp; ".join(chips)
 
     def _fill_table(self, state: StateSlice) -> None:
@@ -158,7 +146,6 @@ class OverviewPage(Page):
         piter = dict(persona.get("iter") or {})
         image = state.image
         models = dict(state.models or {})
-        proactive = dict(status.get("proactive") or {})
         greet = dict(status.get("greet") or {})
 
         rows.append(("当前目标", f"{self.manager.state.target_name} · {self.manager.state.address_summary()}"))
@@ -170,8 +157,6 @@ class OverviewPage(Page):
         rows.append(("人设自动迭代", f"已跑 {piter.get('runs', 0)} 次 · 写入 {piter.get('written', 0)} 条"))
         modes = image.get("valid_modes") or []
         rows.append(("图片策略", f"全局 {image.get('global_mode') or '-'}（可选 {'/'.join(map(str, modes))}）· 会话自定义 {len(image.get('convs') or {})} 个"))
-        last_spoke = proactive.get("last_spoke") or {}
-        rows.append(("最近主动发言", "、".join(f"{k} {v}" for k, v in last_spoke.items()) or "还没有"))
         rows.append(("问候发送记录", f"{len(greet.get('sent') or {})} 个时段有过记录 · 今天 {greet.get('today') or '-'}"))
         rows.append(("时间校准", f"{status.get('time', {}).get('now') or '-'}（宿主 {status.get('time', {}).get('raw') or '-'}，来源 {status.get('time', {}).get('source') or '-'}）"))
 
@@ -203,11 +188,6 @@ class OverviewPage(Page):
         self.cards.setText("<br>".join(lines))
 
     # ------------------------------------------------------------ 动作
-    def _speak(self) -> None:
-        if not self._confirm_cost("主动发言", "会让机器人挑一个活跃群主动说一句。\n这会调用模型，可能产生费用。"):
-            return
-        self.run_task(self.client().speak, on_done=lambda r: self._report_action(r, "主动发言"))
-
     def _greet(self) -> None:
         if not self._confirm_cost("手动问候", "按当前钟点发一次问候（不消耗当天自动问候的次数）。\n这会调用模型，可能产生费用。"):
             return
@@ -224,7 +204,7 @@ class OverviewPage(Page):
         if not result.ok:
             return
         payload: dict[str, Any] = dict(result.value or {})
-        # 这两个接口**没有** `ok` 字段：成功是 `said=True`，失败是 `said=False` + reason。
+        # 问候接口**没有** `ok` 字段：成功是 `said=True`，失败是 `said=False` + reason。
         said = bool(payload.get("said"))
         if said:
             where = payload.get("group_id") or payload.get("slot") or ""

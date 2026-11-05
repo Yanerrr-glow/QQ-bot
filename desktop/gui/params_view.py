@@ -43,6 +43,10 @@ class ParamsGroupsView(QtWidgets.QWidget):
         self._key_order = tuple(key_order)
         self._fields: dict[str, Field] = {}
         self._groups: list[QtWidgets.QGroupBox] = []
+        #: 当前过滤词。折叠/展开后要按它重新算可见性，否则一收一展会漏出不该显示的参数。
+        self._filter = ""
+        #: 程序内部改 `setChecked` 时防止 `toggled` 递归重入。
+        self._syncing = False
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -65,6 +69,7 @@ class ParamsGroupsView(QtWidgets.QWidget):
                 widget.deleteLater()
         self._fields.clear()
         self._groups.clear()
+        self._syncing = False
 
         for group in groups or []:
             items = list(group.get("items") or [])
@@ -73,16 +78,21 @@ class ParamsGroupsView(QtWidgets.QWidget):
             items = self._sorted_items(items)
             box = QtWidgets.QGroupBox(f"{group.get('group')}（{len(items)}）")
             box.setCheckable(True)
-            box.setChecked(False)  # 默认收起：上百个参数全展开没人找得到
+            # 默认展开：勾选框同时是"展开/收起"开关。之前默认 `False` 会让
+            # QGroupBox 把子控件**禁用**（不是隐藏），用户看到的是满屏灰掉的参数，
+            # 还以为设置被重置成了默认值 —— 值其实一直是服务端那份。
+            box.setChecked(True)
             grid = QtWidgets.QGridLayout(box)
             grid.setContentsMargins(2, 4, 2, 2)
             grid.setHorizontalSpacing(theme.SPACE["md"])
             grid.setVerticalSpacing(10)
             for row, spec in enumerate(items):
                 self._add_field(grid, row, spec)
+            box.toggled.connect(lambda _on, b=box: self._on_group_toggled(b))
             self.form.addWidget(box)
             self._groups.append(box)
         self.form.addStretch(1)
+        self._apply_visibility()
         return len(self._fields)
 
     def _sorted_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -170,28 +180,54 @@ class ParamsGroupsView(QtWidgets.QWidget):
 
     def apply_filter(self, text: str) -> None:
         """按参数名/说明过滤；有命中的组自动展开。"""
-        needle = str(text or "").strip().lower()
-        for box in self._groups:
-            grid = box.layout()
-            visible_any = False
-            for row in range(grid.rowCount()):
-                title = grid.itemAtPosition(row, 0)
-                hint = grid.itemAtPosition(row, 2)
-                blob = ""
-                for item in (title, hint):
-                    widget = item.widget() if item else None
-                    if widget is not None:
-                        blob += " " + (widget.text() or "")
-                match = (not needle) or (needle in blob.lower())
-                for column in (0, 1, 2):
-                    entry = grid.itemAtPosition(row, column)
-                    widget = entry.widget() if entry else None
-                    if widget is not None:
-                        widget.setVisible(match)
-                visible_any = visible_any or match
-            box.setVisible(visible_any)
-            if needle and visible_any:
-                box.setChecked(True)
+        self._filter = str(text or "")
+        self._apply_visibility()
+
+    def _on_group_toggled(self, box: QtWidgets.QGroupBox) -> None:
+        if not self._syncing:
+            self._apply_visibility()
+
+    def _apply_visibility(self) -> None:
+        """统一算一次"每个控件该不该显示"。
+
+        折叠**只隐藏内容、不禁用控件**：`QGroupBox` 自带的行为是取消勾选就禁用子控件，
+        那会把参数显示成灰色，看起来像"设置丢了"。这里反过来：勾选 = 展开且可编辑，
+        取消勾选 = 收起（隐藏）。同时把过滤词一起算进去，避免展开时漏出过滤掉的参数。
+        """
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            needle = self._filter.strip().lower()
+            for box in self._groups:
+                grid = box.layout()
+                if not isinstance(grid, QtWidgets.QGridLayout):
+                    continue
+                matches: list[bool] = []
+                for row in range(grid.rowCount()):
+                    blob = ""
+                    for column in (0, 2):
+                        item = grid.itemAtPosition(row, column)
+                        widget = item.widget() if item else None
+                        if widget is not None:
+                            blob += " " + (widget.text() or "")
+                    matches.append((not needle) or (needle in blob.lower()))
+                any_match = any(matches)
+
+                # 过滤命中而组是收起的：自动展开（这是原来的行为，保留）。
+                if needle and any_match and not box.isChecked():
+                    box.setChecked(True)
+                opened = box.isChecked()
+                for row, matched in enumerate(matches):
+                    for column in (0, 1, 2):
+                        item = grid.itemAtPosition(row, column)
+                        widget = item.widget() if item else None
+                        if widget is not None:
+                            widget.setEnabled(True)
+                            widget.setVisible(opened and matched)
+                box.setVisible(any_match or not needle)
+        finally:
+            self._syncing = False
 
     # ------------------------------------------------------------ 提交
     def _commit(self, key: str, value: Any) -> None:
