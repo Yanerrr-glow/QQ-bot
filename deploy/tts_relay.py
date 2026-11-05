@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TTS 中继：把 bot 容器里的请求转给 Windows 上的 GPT-SoVITS（经 SSH 反向隧道）。
 
-拓扑（对应 docs/临时开发文档/TTS_HTTP接口语音输出_可行性验证_2026-10-22.md §8.1）：
+拓扑（设计文档与实测产物只在开发工作区，不随仓库分发）：
 
     bot 容器 --(host.docker.internal:19881)--> 本进程 --(127.0.0.1:19880)--> SSH 隧道 --> Windows 9880
 
