@@ -13,6 +13,7 @@
 | 会话状态与主动任务 | `state.py`、`attention.py`、`proactive.py`、`greetings.py`、`clock.py`、`signals.py`、`task_manager.py` | 可恢复状态、提醒、主动发言、时间与后台任务 |
 | 外部内容与安全 | `search.py`、`fetch.py`、`files.py`、`pdf.py`、`netguard.py`、`render.py` | 搜索、网页/文件读取、出站访问校验和渲染回退 |
 | 媒体与界面 | `stickers.py`、`perceptual.py`、`webui.py`、`web/console.html`、`dsh_bridge.py` | 表情包、图像感知、管理 API、独立 Web 模板和本机桥接 |
+| 语音 | `tts.py`、`voice.py`、`voices.py`、`deploy/tts_relay.py`（服务端） | HTTP 合成与 WAV 校验、`/语音` 指令与白名单、语音包（权重/参考音频）存储；relay 转发与权重切换 |
 
 改动前先找现有职责归属；新模块应有单一职责，并在本表补一行。避免把配置、持久化、网络访问和业务判断集中塞进 `__init__.py`。
 
@@ -71,12 +72,14 @@ persona/
 | 文件 | 内容与权属 | 写入规则 |
 |---|---|---|
 | `persona/packs/<包>/_pack.json` | 身份元数据：显示名、别名、角色名、唤醒词 | 人工维护；`bot_name` 必须与 `base.txt` 里的角色名逐字一致（`chatlog._speaker()` 用它判定归属） |
-| `persona/packs/<包>/base.txt` | 身份与底层原则；人工维护 | 仅由项目所有者直接编辑，不由模型或后台任务写入 |
-| `persona/packs/<包>/forbidden.txt` | 高优先级禁止事项；人工维护 | 仅由项目所有者直接编辑；调整后检查相关特质和闸门是否仍一致 |
+| `persona/packs/<包>/base.txt` | 身份与底层原则；人工维护 | 项目所有者直接编辑；评估驱动的修订**不写这份源文件**，而是写 `data/runtime/persona/<包>/base.txt` 覆盖 |
+| `persona/packs/<包>/forbidden.txt` | 高优先级禁止事项；人工维护 | 项目所有者直接编辑；评估修订写运行时覆盖（`data/runtime/persona/<包>/forbidden.txt`），调整后检查相关特质和闸门是否仍一致 |
 | `persona/packs/<包>/surface.txt` | 表层人格初始模板；人工提供种子 | 首次初始化时复制到运行数据；已有部署的有效表层在 `data/runtime/persona/<包>/surface.txt` |
 | `persona/packs/<包>/traits.json` | 特质、通道、闸门和检查元数据 | 人工维护的结构化登记；不得把聊天原文或真实身份信息加入副本 |
-| `data/runtime/persona/<包>/surface.txt` | 当前运行表层 | 只允许受闸门校验的自动迭代写入；变更写入人格变更记录并可撤回 |
+| `data/runtime/persona/<包>/surface.txt` | 当前运行表层 | 评估修订或旧的候选池写入；变更写入变更记录并可撤回 |
+| `data/runtime/persona/<包>/{base,forbidden}.txt` | 底层 / 禁止事项的运行时覆盖（可选） | 由评估修订写入；存在时优先于包内源文件，删除后回落到源文件 |
 | `data/runtime/persona/<包>/{changelog,candidates,signals,eval}.json` | 审计、候选池、信号账本、评估结果 | **按包分开**：换角色不会把上一个角色的自我学习带过去 |
+| `data/runtime/persona/<包>/{revisions.json,history/}` | 评估修订记录与每版三层备份 | 保留最近 30 版；`/人设 撤回` 整版回滚 |
 
 修改人格源文件后，核对三层优先级、特质登记和实际运行副本。三层都是**每轮现读**（`BASE_PROMPT` / `FORBIDDEN_PROMPT` / `SYSTEM_PROMPT` 是模块级惰性属性），改完不用重启；改的是**哪个包**看 `/人设 状态` 或启动日志的「人格包：…」那一行。不要把源码模板的变动误认为线上运行数据已更新。
 
