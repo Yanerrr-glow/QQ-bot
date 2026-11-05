@@ -65,6 +65,8 @@ PACK_FILES = {
     "forbidden": "forbidden.txt",
     "surface": "surface.txt",
     "traits": "traits.json",
+    "vector": "vector.json",
+    "examples": "examples/examples.jsonl",
 }
 REQUIRED = ("base", "forbidden", "surface")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
@@ -170,7 +172,7 @@ def _forbidden_items(text: str) -> list[str]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("【"):
-            in_section = "禁止" in line
+            in_section = ("禁止" in line) or ("绝对不做" in line)
             continue
         if not in_section:
             continue
@@ -276,7 +278,7 @@ def check_pack(pack_id: str) -> None:
           not mech_hits, "命中：%s" % "、".join(mech_hits), warn_only=True)
 
     # ---- 禁止事项的格式（闸门**逐条**解析它们，格式错了就不生效）----
-    items = _forbidden_items(_section_body(read(files["forbidden"]), "禁止事项"))
+    items = _forbidden_items(read(files["forbidden"]))
     check("forbidden.txt 的禁令能被逐条解析出来（闸门拿它做冲突判定）",
           bool(items), "%d 条" % len(items))
     # `forbidden_items()` 只看**行首无缩进**的 `- * · •`；**缩进的 `- ` 会被当"续行"
@@ -291,12 +293,13 @@ def check_pack(pack_id: str) -> None:
                   if ln.strip().startswith("##")]
     check("禁止事项里没有用 `##` 当标题（只有 `【】` 是标题）",
           not hash_heads, "；".join(x[:28] for x in hash_heads[:3]), warn_only=True)
-    # 只有「禁止事项」那一节里的条目才被收：标题里必须真的带"禁止"两个字
+    # 闸门按「禁止」或 v2 的「绝对不做」小节收条目；v2 还允许
+    # 【可以，但有条件】/【亲密边界】/【敏感话题的许可】/【永远不碰】等说明节。
     heads = [ln.strip() for ln in read(files["forbidden"]).splitlines()
              if ln.strip().startswith("【")]
-    check("forbidden.txt 的每个小节标题都带「禁止」（否则那一节的条目不被收）",
-          all("禁止" in h for h in heads) if heads else True,
-          "；".join(h for h in heads if "禁止" not in h), warn_only=True)
+    check("forbidden.txt 至少有一个「禁止」或「绝对不做」小节（否则闸门收不到条目）",
+          any(("禁止" in h) or ("绝对不做" in h) for h in heads) if heads else False,
+          "；".join(heads[:3]))
 
     # ---- 表层的条目格式（预算与追加都按 `- ` 数）----
     surf_items = [ln.strip() for ln in surface.splitlines() if ln.strip().startswith("- ")]

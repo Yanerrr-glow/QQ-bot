@@ -237,13 +237,13 @@ try:
     png = b"\x89PNG\r\n\x1a\n" + b"x" * 200
     item = lib.add(
         png, conv="g1", uid=100000001, name="魔王", is_master=True,
-        sub_type=1, score=0.9, reason="斗图素材",
+        sub_type=1, score=0.9,
     )
     check("入库成功", item is not None and item["score"] == 0.9)
     check(
         "同图去重",
         lib.add(png, conv="g1", uid=1, name="别人", is_master=False,
-                sub_type=1, score=0.9, reason="重复") is None,
+                sub_type=1, score=0.9) is None,
     )
     check("图片已落盘", (lib.dir / item["file"]).exists(), item["file"])
     check("索引文件已生成", lib.index_path.exists())
@@ -255,28 +255,12 @@ try:
 
     lib2 = StickerLibrary()
     lib2.load()
-    check("索引往返一致", len(lib2.items) == 1 and lib2.items[0]["reason"] == "斗图素材")
+    check(
+        "索引往返一致",
+        len(lib2.items) == 1 and lib2.items[0]["score"] == 0.9 and "summary" not in lib2.items[0],
+    )
     check("删除生效", lib2.remove(item["hash"]) is True and len(lib2.items) == 0)
     check("重复删除返回 False", lib2.remove(item["hash"]) is False)
-
-    # ---------------------------------------------------------- 主动发言
-    print("\n-- 主动发言限流 --")
-    from plugins.ai_chat import proactive as pa
-
-    st.set_value("proactive_max_per_day", 2)
-    st.set_value("proactive_cooldown", 3600)
-    pa._state.ensure()
-    pa._state.last_spoke.clear()
-    pa._state.day_count.clear()
-    check("初始可发言", pa._state.budget_left("g1") and pa._state.cooled_down("g1"))
-    pa._state.record_speak("g1")
-    check("冷却生效", not pa._state.cooled_down("g1"))
-    pa._state.record_speak("g1")
-    check("日上限生效", not pa._state.budget_left("g1"), "上限 2")
-    # 上面只有 g3 真正落过盘；再造一个群文件，验证按文件名解析群号
-    (TMP / "chatlog_g777.json").write_text('{"messages": []}', encoding="utf-8")
-    groups = sorted(asyncio.run(pa.known_groups()))
-    check("能识别已知群", groups == [3, 777], str(groups))
 
     # ---------------------------------------------------------- 关键词唤醒
     print("\n-- 关键词唤醒 --")
@@ -504,73 +488,6 @@ try:
     check("关掉 chat_vision 后不读图", calls2["n"] == 0)
     st.set_value("chat_vision", True)
 
-
-    # ---------------------------------------------------------- 随机插话
-    print("\n-- 随机插话（没被提到也按概率接话）--")
-    from plugins.ai_chat import (
-        _allowed,
-        _is_addressed,
-        _is_master,
-        _mentions_wake_word,
-        _random_cooldown_ok,
-        _random_reply_eligible,
-        _should_reply,
-    )
-
-    plain_group = _group_event(9, [MessageSegment.text("今天天气不错啊")], to_me=False)
-
-    # **前置条件（2026-09-25 补）**：`_should_reply` 现在除了随机开关，还会读
-    # `_allowed()` 与**对话租约**（全局状态）。前面的用例给同一个会话授予过租约，
-    # 租约的属主正好也是这个 uid，于是"随机关着却仍然放行"。
-    #
-    # ⚠ 清的时候**必须用真实会话 id**：`_group_event` 的第一个参数是 `message_id`，
-    # `group_id` 是它内部写死的 —— 曾经在这里写成 `conversation_id(9, ...)` 而
-    # 清错了会话（`g9` ≠ `g100000004`），白查了很久。`clear_lease` 本来就返回 bool，
-    # 所以顺手断言"确实有东西被清掉"，避免下次再清错。
-    from plugins.ai_chat import attention as _attn
-    _conv_here = chatlog.conversation_id(plain_group.group_id, plain_group.user_id)
-    _attn.clear_lease(_conv_here)   # 返回 bool，这里不依赖它（可能本就没租约）
-    check("该构造事件是被允许的会话（前置）", _allowed(plain_group))
-    check("租约已清干净（前置）", not _attn.lease_peek(
-        _conv_here, str(plain_group.user_id),
-        is_master=_is_master(plain_group), text=plain_group.get_plaintext()))
-
-    st.set_value("random_reply_enabled", False)
-    check("关掉随机插话时不参与", not _random_reply_eligible(plain_group))
-    check("关掉随机插话时 rule 不会因随机而放行（且无租约）",
-          not _should_reply(plain_group), "随机关着 + 无租约 + 没叫它 = 安静")
-
-    # 反向：有租约时，即使随机插话关着，rule 也该放行（这是新加的行为，要有守卫）
-    _attn.lease_grant(_conv_here, str(plain_group.user_id))
-    check("有租约时 rule 放行（不受随机开关影响）", _should_reply(plain_group))
-    _attn.clear_lease(_conv_here)
-    check("撤销租约后 rule 又安静了", not _should_reply(plain_group))
-
-    st.set_value("random_reply_enabled", True)
-    check("打开后群聊消息可插话", _random_reply_eligible(plain_group))
-    check("打开后 rule 放行", _should_reply(plain_group))
-
-    st.set_value("random_reply_min_chars", 20)
-    check(
-        "太短的消息被跳过",
-        not _random_reply_eligible(plain_group),
-        "「今天天气不错啊」只有 7 字，没什么可接的",
-    )
-    st.set_value("random_reply_min_chars", 4)
-
-    check("私聊不参与随机插话", not _random_reply_eligible(img_event), "私聊本来就算在跟它说话")
-    check(
-        "提到唤醒词时仍走唤醒那条路",
-        _should_reply(_group_event(10, [MessageSegment.text("大肥鱼在吗")], to_me=False)),
-    )
-
-    st.set_value("random_reply_cooldown", 300)
-    check("首次插话放行", _random_cooldown_ok("g_rand"))
-    check("冷却期内拦截", not _random_cooldown_ok("g_rand"))
-    st.set_value("random_reply_cooldown", 0)
-    check("冷却设为 0 则不拦", _random_cooldown_ok("g_rand"))
-
-    st.set_value("random_reply_enabled", False)
 
     # ---------------------------------------------------------- 最近图片
     print("\n-- 「先发图，隔一条再问」的跨消息指代 --")

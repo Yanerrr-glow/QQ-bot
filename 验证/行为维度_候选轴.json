@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "note": "离线评估用的候选轴定义。只被 persona_scoped 读取；persona_vector._axes() 不读这里的任何键。",
+  "candidates": [
+    {
+      "id": "curiosity",
+      "name": "探索意愿",
+      "scope": "topic",
+      "baseline": 0.0,
+      "half_life_h": 3.0,
+      "max_step": 0.06,
+      "max_daily": 0.3,
+      "refuse_ttl_h": 6.0,
+      "low": "不想深挖，够了",
+      "high": "想接着问下去"
+    },
+    {
+      "id": "stress",
+      "name": "互动负荷",
+      "scope": "person",
+      "baseline": 0.0,
+      "half_life_h": 2.0,
+      "max_step": 0.06,
+      "max_daily": 0.3,
+      "refuse_ttl_h": 6.0,
+      "low": "轻松、有余力",
+      "high": "被追得有点紧"
+    }
+  ],
+  "evidence": {
+    "curiosity": {
+      "up": [
+        {"act": "分享", "tone": "认真", "target": ["none", "third"], "delta": 0.05},
+        {"act": "纠正", "tone": "认真", "target": ["bot"], "delta": 0.03}
+      ],
+      "ignore": [{"intent": "拉近距离"}, {"confidence": "fuzzy"}, {"origin": "other"}]
+    },
+    "stress": {
+      "up": [{"act": ["骂", "亲密"], "target": ["bot"], "delta": 0.05}],
+      "ignore": [{"act": ["求助", "诉苦"]}, {"origin": "other"}]
+    }
+  }
+}

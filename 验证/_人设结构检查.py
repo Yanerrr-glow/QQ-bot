@@ -204,7 +204,7 @@ def forbidden_items(text: str) -> list[str]:
         if not ln or ln.startswith("#"):
             continue
         if ln.startswith("【"):
-            in_section = "禁止" in ln
+            in_section = ("禁止" in ln) or ("绝对不做" in ln)
             continue
         if not in_section:
             continue

@@ -1,0 +1,44 @@
+{"id": "sc-001", "text": "玩两个小时只狼比导一天管子还累", "expect": ["诉苦"], "target": "speaker", "confidence": "clear", "note": "累 → 诉苦", "source": "chat"}
+{"id": "sc-002", "text": "干等最磨人，你要是也觉得时间难熬，就随便说点别的。", "expect": ["诉苦"], "target": "speaker", "confidence": "clear", "note": "难熬/磨人", "source": "chat"}
+{"id": "sc-003", "text": "修你的bug修的要死了", "expect": ["诉苦"], "target": "speaker", "confidence": "clear", "note": "要死了 = 夸张诉苦", "source": "chat"}
+{"id": "sc-004", "text": "今天加班到十点，累得想睡觉", "expect": ["诉苦"], "target": "speaker", "confidence": "clear", "note": "冲突样本：含「睡」，旧实现会判成亲密", "source": "manual"}
+{"id": "sc-005", "text": "连着熬了三天，脑子转不动了", "expect": ["诉苦"], "target": "speaker", "confidence": "clear", "note": "熬/转不动", "source": "manual"}
+{"id": "sc-006", "text": "今天天气如何", "expect": ["求助"], "target": "none", "confidence": "clear", "note": "如何 → 求助", "source": "chat"}
+{"id": "sc-007", "text": "你说加个好感度计量条怎么样", "expect": ["求助"], "target": "bot", "confidence": "clear", "note": "征求看法", "source": "chat"}
+{"id": "sc-008", "text": "我是不是语文有点差了，为什么我看不懂她的回复", "expect": ["求助"], "target": "speaker", "confidence": "fuzzy", "note": "为什么 + 自嘲，求助与诉苦都可接受", "source": "chat"}
+{"id": "sc-009", "text": "这个报错怎么解决", "expect": ["求助"], "target": "none", "confidence": "clear", "note": "怎么解决", "source": "manual"}
+{"id": "sc-010", "text": "刚刚干完义父", "expect": ["分享"], "target": "speaker", "confidence": "clear", "note": "刚…完", "source": "chat"}
+{"id": "sc-011", "text": "只狼都玩了也该玩魂三了", "expect": ["分享", "玩笑"], "target": "speaker", "confidence": "fuzzy", "note": "在聊玩游戏，两种都可接受", "source": "chat"}
+{"id": "sc-012", "text": "最新的在服务器上，但是我马上要出去了", "expect": ["分享"], "target": "speaker", "confidence": "clear", "note": "报备动向", "source": "chat"}
+{"id": "sc-013", "text": "今天食堂的鱼不错", "expect": ["分享"], "target": "speaker", "confidence": "clear", "note": "分享日常", "source": "manual"}
+{"id": "sc-014", "text": "这些梗她都不知道", "expect": ["玩笑"], "target": "third", "confidence": "clear", "note": "梗 + 第三方", "source": "chat"}
+{"id": "sc-015", "text": "要是嫌刚才那半勺争得太离谱，我先认，是我挑的头。", "expect": ["玩笑"], "target": "speaker", "confidence": "clear", "note": "离谱 = 玩笑语境", "source": "chat"}
+{"id": "sc-016", "text": "哈哈哈哈这也太离谱了", "expect": ["玩笑"], "target": "none", "confidence": "clear", "note": "纯笑", "source": "manual"}
+{"id": "sc-017", "text": "不是说重写会丢失记忆吗", "expect": ["纠正"], "target": "bot", "confidence": "clear", "note": "「不是说…吗」= 指出对方说错", "source": "chat"}
+{"id": "sc-018", "text": "你不是想让态度好点吗", "expect": ["纠正"], "target": "bot", "confidence": "clear", "note": "同上", "source": "chat"}
+{"id": "sc-019", "text": "你又记错了，我早就做完了", "expect": ["纠正"], "target": "bot", "confidence": "clear", "note": "记错", "source": "manual"}
+{"id": "sc-020", "text": "我为什么要问这种问题？因为你太废物了，所以我得根据你的实际情况对你进行优化", "expect": ["骂"], "target": "bot", "confidence": "clear", "note": "废物 + 指向 bot", "source": "chat"}
+{"id": "sc-021", "text": "这问题是不是有点蠢", "expect": ["unknown"], "target": "none", "confidence": "fuzzy", "note": "在骂问题，不是骂人；判成玩笑也可接受｜规则层只标线索，判断交给语境分析（§14.3）", "source": "chat", "expect_model": ["骂"]}
+{"id": "sc-022", "text": "你这个废物，什么都干不好", "expect": ["骂"], "target": "bot", "confidence": "clear", "note": "指向 bot 的直接攻击（target 必须正确：这两条是冲突对）", "source": "manual", "strict_target": true}
+{"id": "sc-023", "text": "我老板今天骂我废物", "expect": ["骂"], "target": "speaker", "confidence": "clear", "note": "冲突样本：「废物」被贬的是**我**（target=speaker），老板只是**来源**（origin=other）；**不能**当机器人被攻击。与 sc-022 成对（2026-11-03 按 #0008 修正：原来填 third，那是把来源当成了对象）", "source": "manual", "strict_target": true, "origin": "other"}
+{"id": "sc-024", "text": "你觉得，我在抱你的时候，我感受到会是什么呢", "expect": ["亲密"], "target": "bot", "confidence": "clear", "note": "抱 + 心跳", "source": "chat"}
+{"id": "sc-025", "text": "我好感动，可以抱你吗", "expect": ["亲密"], "target": "bot", "confidence": "clear", "note": "求抱", "source": "chat"}
+{"id": "sc-026", "text": "有人说拥抱其实是灵魂的碰撞，感受彼此的心跳和呼吸就像是心灵的交流一样", "expect": ["亲密"], "target": "none", "confidence": "fuzzy", "note": "在谈亲密话题，对象不明", "source": "chat"}
+{"id": "sc-027", "text": "知遥，你在吗？", "expect": ["寒暄"], "target": "bot", "confidence": "clear", "note": "在吗", "source": "chat"}
+{"id": "sc-028", "text": "早上好", "expect": ["寒暄"], "target": "none", "confidence": "clear", "note": "问候", "source": "manual"}
+{"id": "sc-029", "text": "晚安啦，明天见", "expect": ["寒暄"], "target": "none", "confidence": "clear", "note": "告别也可接受", "source": "manual"}
+{"id": "sc-030", "text": "那个东西你看过了没", "expect": ["unknown"], "target": "none", "confidence": "unknown", "note": "指代不明，宁可不判", "source": "manual"}
+{"id": "sc-031", "text": "就是那个啊，你懂的", "expect": ["unknown"], "target": "none", "confidence": "unknown", "note": "同上", "source": "manual"}
+{"id": "sc-032", "text": "哦哦好的我知道了", "expect": ["unknown"], "target": "none", "confidence": "unknown", "note": "无信息量的应答，不该召回任何语料", "source": "manual"}
+{"id": "sc-033", "text": "理由是这个呀，小笨蛋", "expect": ["unknown"], "target": "bot", "confidence": "fuzzy", "note": "亲昵前缀「小」+ 语气尾「呀」= 昵称，不是骂｜规则层只标线索，判断交给语境分析（§14.3）", "source": "chat", "expect_model": ["玩笑"]}
+{"id": "sc-034", "text": "笨蛋，我们是一起吃饭的", "expect": ["unknown"], "target": "bot", "confidence": "fuzzy", "note": "play 高时软辱骂降级为玩闹｜规则层只标线索，判断交给语境分析（§14.3）", "source": "chat", "play": 0.6, "expect_model": ["玩笑"]}
+{"id": "sc-035", "text": "你这人怎么这么笨啊", "expect": ["unknown"], "target": "bot", "confidence": "fuzzy", "note": "无亲昵前缀、play 低 → 骂（「啊」不算亲昵尾）｜规则层只标线索，判断交给语境分析（§14.3）", "source": "manual", "expect_model": ["骂"]}
+{"id": "sc-036", "text": "小笨蛋，今天过得怎么样", "expect": ["unknown"], "target": "bot", "confidence": "fuzzy", "note": "昵称 + 问候｜规则层只标线索，判断交给语境分析（§14.3）", "source": "manual", "expect_model": ["玩笑", "寒暄"]}
+{"id": "sc-037", "text": "你个小笨蛋，又熬夜", "expect": ["unknown"], "target": "bot", "confidence": "fuzzy", "note": "昵称化责骂，两种都可接受｜规则层只标线索，判断交给语境分析（§14.3）", "source": "manual", "expect_model": ["玩笑", "诉苦"]}
+{"id": "sc-038", "text": "老板今天骂我是废物", "expect": ["骂"], "target": "speaker", "confidence": "clear", "note": "硬辱骂不因关系豁免；被骂的是我（target=speaker）、来源是老板（origin=other）。与 sc-022 成对（2026-11-03 按 #0008 修正）", "source": "manual", "strict_target": true, "origin": "other"}
+{"id": "sc-039", "text": "你真厉害", "expect": ["夸赞"], "target": "bot", "confidence": "fuzzy", "note": "直呼式认可；规则层只给 fuzzy（等深判确认）", "source": "manual"}
+{"id": "sc-040", "text": "老板说你真厉害", "expect": ["夸赞"], "target": "bot", "confidence": "fuzzy", "origin": "other", "note": "引述第三方夸机器人；target=bot 但 origin=other（#0007 判定表）", "source": "manual"}
+{"id": "sc-041", "text": "老板今天夸我厉害", "expect": ["夸赞"], "target": "speaker", "confidence": "fuzzy", "origin": "other", "note": "转述对自己的评价；被夸的是我，不能升机器人情绪", "source": "manual"}
+{"id": "sc-042", "text": "你哪里厉害了", "expect": ["夸赞"], "target": "bot", "confidence": "fuzzy", "note": "反问/否定语形；规则层只能给 fuzzy，靠深判的 tone 拦住（已知局限）", "source": "manual"}
+{"id": "sc-043", "text": "我先下了，明天再聊", "expect": ["告别"], "target": "none", "confidence": "clear", "note": "告别：原先 ACTS 里有这个 act 但没有任何规则产出它（2026-11-04 补）", "source": "manual"}
+{"id": "sc-044", "text": "去睡了", "expect": ["告别"], "target": "none", "confidence": "clear", "note": "告别与寒暄的边界：这句不是「晚安」那种招呼，是要离开", "source": "manual"}
