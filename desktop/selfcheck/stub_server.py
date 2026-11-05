@@ -32,8 +32,8 @@ def sample_state() -> dict[str, Any]:
             {
                 "group": "基础",
                 "items": [
-                    {"key": "master_qq", "kind": "int", "label": "主人的 QQ 号", "value": 10001,
-                     "min": None, "max": None, "hint": "", "default": 10001,
+                    {"key": "master_qq", "kind": "int", "label": "主人的 QQ 号", "value": 100000001,
+                     "min": None, "max": None, "hint": "", "default": 100000001,
                      "env_value": None, "choices": [], "secret": False},
                     {"key": "search_api_key", "kind": "str", "label": "搜索 API Key", "value": "",
                      "min": None, "max": None, "hint": "", "default": "",
@@ -41,13 +41,18 @@ def sample_state() -> dict[str, Any]:
                 ],
             },
             {
-                "group": "主动发言",
+                "group": "联网搜索",
                 "items": [
-                    {"key": "proactive_enabled", "kind": "bool", "label": "启用主动发言",
-                     "value": False, "min": None, "max": None, "hint": "", "default": False,
+                    {"key": "search_enabled", "kind": "bool", "label": "启用联网搜索",
+                     "value": True, "min": None, "max": None, "hint": "", "default": True,
                      "env_value": None, "choices": [], "secret": False},
-                    {"key": "proactive_chance", "kind": "float", "label": "定时掷骰的发言概率",
-                     "value": 0.1, "min": 0.0, "max": 1.0, "hint": "", "default": 0.1,
+                ],
+            },
+            {
+                "group": "唤醒",
+                "items": [
+                    {"key": "wake_chance", "kind": "float", "label": "唤醒词命中概率",
+                     "value": 0.5, "min": 0.0, "max": 1.0, "hint": "", "default": 0.5,
                      "env_value": None, "choices": [], "secret": False},
                 ],
             },
@@ -72,7 +77,14 @@ def sample_state() -> dict[str, Any]:
             "layers": {"base": "底层人设……", "surface": "表层人设……", "forbidden": "禁止事项……"},
             "changelog": [{"ts": "2026-10-02 10:00:00", "action": "reflect", "text": "把口癖收了一点"}],
             "iter": {"runs": 3, "written": 5},
-            "eval": {"enabled": False, "artifacts": 0, "traits": [{"key": "warm", "score": None}]},
+            "eval": {
+                "enabled": False, "judge_model": "deepseek-chat", "rollouts": 3, "questions": 6,
+                "traits": [{"slug": "warm", "trait": "温和", "polarity": "elicit",
+                            "has_artifacts": True, "questions": 10, "score": None,
+                            "at": None, "prev": None}],
+                "with_artifacts": 1, "with_baseline": 0, "last_run": None, "runs": 0,
+                "iter_enabled": True, "daily_hour": 3, "targets": [], "revisions": 0,
+            },
             # 人格包（2026-10 包化）：形状与 `packs.list_packs()` / `packs.stats()` 一致
             "pack": {"id": "whale", "name": "鲸鱼娘", "dir": "persona/packs/whale",
                      "stage": "data/runtime/persona/whale", "description": "示例人格",
@@ -94,18 +106,33 @@ def sample_state() -> dict[str, Any]:
             ],
             "events": [{"id": 9, "text": "群里讨论过表情包", "conv": "g123", "importance": 0.5,
                         "ts": 1780002000.0}],
-            "profile": [{"key": "主人", "uid": 10001, "summary": "喜欢安静的技术交流",
-                         "facts": 12, "updated": "2026-10-01"}],
-            "stats": {"facts": 2, "events": 1, "profile": 1, "protected": 1},
+            "profile": [{
+                "key": "uid:100000001", "display": "小明",
+                "love": ["3D打印"], "dislike": ["被叫胖"], "habit": ["自己切片"],
+                "note": "做网架设计", "updated_at": "2026-10-22 14:05:30",
+            }, {
+                # 旧写入路径留下的空占位：页面不该把它列成一个"人"。
+                "key": "uid:3770085103", "display": "", "love": [], "dislike": [],
+                "habit": [], "note": "", "updated_at": "",
+            }],
+            "stats": {"facts": 2, "events": 1, "people": 2, "protected": 1},
         },
-        "image": {"global_mode": "normal", "convs": {"g123": "ignore"}, "valid_modes": ["normal", "ignore", "ask"]},
+        "image": {
+            "global_mode": "normal",
+            "valid_modes": ["normal", "ignore", "only", "off"],
+            # 形状与 `state.snapshot()` 一致：会话条目是对象，不是裸 mode 字符串。
+            # `__global__` 是服务端在全局非 normal 时补的占位条目，页面必须过滤掉。
+            "convs": {
+                "g123": {"mode": "ignore", "effective": "ignore", "label": "不再保存图片",
+                         "ignored": 0, "note": "", "updated_at": "2026-10-02 12:00:00"},
+                "__global__": {"mode": "", "effective": "normal", "label": "",
+                               "ignored": 0, "note": "", "updated_at": ""},
+            },
+        },
         "status": {
             "stickers": {"count": 12, "total_bytes": 3456789, "used": 30, "no_phash": 0,
                          "file_sent": 2, "duplicates": 1},
             "groups": ["g123", "g456"],
-            "proactive_enabled": False,
-            "proactive": {"day": "2026-10-02", "last_spoke": {"g123": "09:12:00"},
-                          "day_count": {"g123": 1}, "msg_counter": {"g123": 40}},
             "greet": {"enabled": False, "times": {"早安": "08:00", "午安": "12:30", "晚安": "23:00"},
                       "target": "auto", "window_minutes": 90, "due_now": [], "today": "2026-10-02",
                       "sent": {}, "attempts": {}},
@@ -138,7 +165,6 @@ class StubConfig:
     requests: list[tuple[str, str, str, str]] = field(default_factory=list)
     settings_posts: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
-    speaks: int = 0
     greets: list[str] = field(default_factory=list)
 
 
@@ -250,6 +276,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        # 先把请求体读掉再回错误：HTTP/1.1 长连接下，503/401 直接返回会把请求体
+        # 留在管道里，下一次请求会被当成坏报文 —— 表现为偶发 ConnectionAborted。
+        body = self._read_body()
         if not self._guard(path):
             self._json({"ok": False, "error": "未认证"}, 401)
             return
@@ -257,7 +286,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "服务暂时不可用"}, 503)
             return
         prefix = self.cfg.prefix
-        body = self._read_body()
         if path == prefix + "/api/settings":
             if not body:
                 self._json({"error": "请求体必须是 JSON 对象"}, 400)
@@ -317,9 +345,6 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if path == prefix + "/api/image-policy":
             return self._json({"ok": True, "effective": body.get("mode") or body.get("global_mode")})
-        if path == prefix + "/api/speak":
-            self.cfg.speaks += 1
-            return self._json({"said": True, "group_id": "g123"})
         if path == prefix + "/api/greet":
             self.cfg.greets.append(str(body.get("slot") or ""))
             return self._json({"said": True, "slot": body.get("slot") or "morning",

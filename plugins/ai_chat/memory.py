@@ -105,7 +105,7 @@ _STOP = frozenset(
 
 # --------------------------------------------------------------------- 数据
 def _path() -> Path:
-    return config.LOG_DIR / _FILE
+    return config.runtime_root() / _FILE
 
 
 def _now() -> str:
@@ -154,7 +154,7 @@ class _Db:
         if self.store is not None:
             return
         self.store = memstore.open_store(
-            config.LOG_DIR, prefer=str(settings.get("memory_store") or "sqlite")
+            config.runtime_root(), prefer=str(settings.get("memory_store") or "sqlite")
         )
 
     # 属性代理：算法层读到的就是 store 里那份内存副本
@@ -297,7 +297,7 @@ _extract_state_loaded = False
 
 
 def _extract_state_path() -> Path:
-    return config.LOG_DIR / _EXTRACT_STATE
+    return config.runtime_root() / _EXTRACT_STATE
 
 
 def _load_extract_state() -> None:
@@ -1760,21 +1760,45 @@ async def _extract(lines: list[str], *, context: str = "") -> dict[str, Any]:
     prompt = _EXTRACT_PROMPT.replace("{lines}", "\n".join(lines)).replace(
         "{existing}", existing or "（还没有）"
     )
-    try:
-        resp = await asyncio.wait_for(
-            llm.chat(
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                max_tokens=800,
-            ),
-            timeout=config.TIMEOUT,
-        )
-        raw = (resp.choices[0].message.content or "").strip() if resp.choices else ""
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001 - 抽取失败绝不能影响聊天
-        logger.info("记忆抽取失败（不影响聊天）")
-        return {}
+    # **max_tokens 必须给推理模型留足**：2026-11-03 实测 `deepseek-flash`
+    # 在 2371 字的抽取输入上把 800 tokens 全花在推理里，finish_reason=length、
+    # content 为空，于是 `json.loads("")` 抛异常，被 except 吞成一句
+    # 「记忆抽取失败（不影响聊天）」—— 线上从 00:36 起静默失效了 14 小时，
+    # facts 停在 168 条、水位线不动也没人发现。
+    #
+    # 现在：先 1200，正文仍为空就加倍到 3000 再来一次（`persona_eval` 的素材生成
+    # 早就是这么处理的）。抽取是机械活，多花这一点 token 远便宜于"记忆停止生长"。
+    raw = ""
+    for budget in (1200, 3000):
+        try:
+            resp = await asyncio.wait_for(
+                llm.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    max_tokens=budget,
+                ),
+                timeout=config.TIMEOUT,
+            )
+            choice = resp.choices[0] if resp.choices else None
+            raw = (choice.message.content or "").strip() if choice else ""
+            finish = str(getattr(choice, "finish_reason", "") or "") if choice else ""
+            if not raw:
+                logger.info("抽取正文为空（finish=%s，max_tokens=%d），加倍预算重试",
+                            finish or "?", budget)
+                continue
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            logger.info("抽取返回不是 JSON（max_tokens=%d）：%s", budget, raw[:120])
+            continue
+        except Exception:  # noqa: BLE001 - 抽取失败绝不能影响聊天
+            # **必须带堆栈**：原来这里只有一句 info，线上 2026-11-03 00:36 起
+            # 抽取一直失败、原因却查不出来（facts 停在 168 条，水位线不动）。
+            # 「不影响聊天」不等于「不用诊断」—— 它是静默失效最典型的样子。
+            logger.info("记忆抽取失败（不影响聊天）", exc_info=True)
+            return {}
+    logger.info("抽取两轮都没拿到正文，本轮跳过（不影响聊天）")
+    return {}
 
 
 def _budget_ok(n_messages: int = 1) -> bool:

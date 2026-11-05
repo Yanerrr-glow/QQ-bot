@@ -485,6 +485,29 @@ class ApiClient:
     def model_delete(self, profile_id: str) -> dict[str, Any]:
         return self._request("POST", "api/model/delete", body={"id": profile_id})
 
+    def persona_proposals(self) -> dict:
+        """待确认提案列表（摘要级）。"""
+        return self._request("GET", "api/persona/proposals")
+
+    def persona_proposal_detail(self, rev: str) -> dict:
+        """一条提案的完整内容：ops + 每个文件的 before/after。"""
+        key = urllib.parse.quote(str(rev or "").strip())
+        if not key:
+            raise BotApiError("缺 rev", hint="提案编号不能为空")
+        return self._request("GET", f"api/persona/proposal?rev={key}")
+
+    def persona_proposal(self, rev: str, action: str) -> dict:
+        """采纳 / 拒绝。**响应恒 200，成败看 `ok`**（后端失败也是 200）。"""
+        rev = str(rev or "").strip()
+        action = str(action or "").strip()
+        if not rev:
+            raise BotApiError("缺 rev", hint="提案编号不能为空")
+        if action not in ("commit", "reject"):
+            raise BotApiError(f"非法 action：{action}",
+                              hint="只能是 commit 或 reject")
+        return self._request("POST", "api/persona/proposal",
+                             body={"rev": rev, "action": action})
+
     def persona_packs(self) -> dict[str, Any]:
         """可用的人格包 + 当前激活的那个（`GET /api/persona/packs`）。"""
         return self._request("GET", "api/persona/packs")
@@ -505,6 +528,52 @@ class ApiClient:
         return self._request(
             "POST", "api/persona/eval", body={"mode": mode}, timeout=max(self.timeout, 600.0)
         )
+
+    def persona_eval_cases(self) -> dict[str, Any]:
+        """评估案例列表与概况（#0015 M4）。只读，不改人格。"""
+        return self._request("GET", "api/persona/eval/cases")
+
+    def persona_eval_feedback(self, limit: int = 50) -> dict[str, Any]:
+        return self._request("GET", "api/persona/eval/feedback")
+
+    def persona_eval_feedback_add(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """写一条反馈。**入库不等于已学会**；采纳仍在 persona_proposal。"""
+        return self._request("POST", "api/persona/eval/feedback", body=payload)
+
+    def persona_eval_sampling(self) -> dict[str, Any]:
+        return self._request("GET", "api/persona/eval/sampling")
+
+    def persona_boundary(self) -> dict[str, Any]:
+        """跑一次边界检查（v2，只诊断、不改人设）。"""
+        return self._request("POST", "api/persona/boundary", timeout=max(self.timeout, 300.0))
+
+    def persona_likeness(self) -> dict[str, Any]:
+        """跑一次「像人」成对判别（需要 likeness_samples.jsonl）。"""
+        return self._request("POST", "api/persona/likeness", timeout=max(self.timeout, 600.0))
+
+    def persona_likeness_candidates(self) -> dict[str, Any]:
+        """像人样本候选（真实聊天 + 模型生成）与当前已选 id。"""
+        return self._request("GET", "api/persona/likeness/candidates",
+                             timeout=max(self.timeout, 60.0))
+
+    def persona_likeness_generate(self, n: int = 10) -> dict[str, Any]:
+        """让模型补 N 条「普通群友」样本到候选。"""
+        return self._request("POST", "api/persona/likeness/generate",
+                             body={"n": int(n)}, timeout=max(self.timeout, 300.0))
+
+    def persona_likeness_select(self, ids: list[str]) -> dict[str, Any]:
+        """把勾选的候选写进 likeness_samples.jsonl。"""
+        return self._request("POST", "api/persona/likeness/select",
+                             body={"ids": [str(x) for x in ids]},
+                             timeout=max(self.timeout, 120.0))
+
+    def persona_vector_reset(self, axis: str = "") -> dict[str, Any]:
+        return self._request("POST", "api/persona/vector",
+                             body={"action": "reset", "axis": str(axis)})
+
+    def persona_relation_set(self, uid: str, field: str, value: Any) -> dict[str, Any]:
+        return self._request("POST", "api/persona/relation",
+                             body={"uid": str(uid), "field": str(field), "value": value})
 
     def memory_add(self, text: str, *, subject: str = "", importance: float = 0.85) -> dict[str, Any]:
         body: dict[str, Any] = {"text": text}
@@ -528,10 +597,6 @@ class ApiClient:
 
     def sticker_delete(self, digest: str) -> dict[str, Any]:
         return self._request("DELETE", f"api/stickers/{urllib.parse.quote(str(digest), safe='')}")
-
-    def speak(self) -> dict[str, Any]:
-        # 主动发言会调模型且真的发消息，超时给足。
-        return self._request("POST", "api/speak", timeout=max(self.timeout, 120.0))
 
     def greet(self, slot: str = "") -> dict[str, Any]:
         body = {"slot": slot} if slot else {}

@@ -36,12 +36,16 @@ from . import (
     packs,
     persona,
     persona_eval,
+    persona_examples,
     persona_iter,
-    proactive,
+    persona_relation,
+    persona_vector,
     search,
     settings,
     state,
     stickers,
+    tts,
+    voices,
 )
 
 logger = logging.getLogger("ai_chat.webui")
@@ -159,6 +163,19 @@ def _register() -> bool:
                     "iter": persona_iter.stats(),
                     # 评估台现状：开关、素材/基线覆盖、各特质分数（只读）
                     "eval": persona_eval.status(),
+                    "vector": {
+                        "enabled": bool(settings.get("vector_enabled")),
+                        "values": persona_vector.state().get("values") or {},
+                        "axes": config.load_vector().get("axes") or [],
+                        "modes": config.load_vector().get("modes") or [],
+                        # 解释链（#0011）：操作者视角的最近几条 + 每个对象的三层值。
+                        # 聊天注入走的是 explain(uid, conv)，那条路径严格按 uid+conv 过滤；
+                        # 这里给面板看全量是刻意的——面板本来就是操作者的视角。
+                        "recent": persona_vector.recent(5),
+                        "effective_samples": persona_vector.effective_samples(5),
+                    },
+                    "relation": persona_relation.snapshot(),
+                    "examples": persona_examples.stats(),
                     "pack": packs.stats(),
                     "packs": packs.list_packs(),
                 },
@@ -171,11 +188,15 @@ def _register() -> bool:
                     "stats": memory.stats(),
                 },
                 "image": state.snapshot(),
+                # 语音：音色包（权重 + 参考音频）与运行开关。令牌**不回传**，只报是否配置。
+                "voice": dict(
+                    voices.snapshot(),
+                    enabled=bool(settings.get("tts_enabled")),
+                    endpoint=config.TTS_ENDPOINT,
+                    token_configured=bool(config.TTS_TOKEN),
+                ),
                 "status": {
                     "stickers": lib.stats(),
-                    "groups": [f"g{g}" for g in await proactive.known_groups()],
-                    "proactive_enabled": bool(settings.get("proactive_enabled")),
-                    "proactive": proactive.status(),
                     "greet": greetings.status(),
                     "model": llm.model_name(),
                     "model_profile": llm.active_id(),
@@ -258,6 +279,55 @@ def _register() -> bool:
         settings.reset()
         return JSONResponse({"ok": True})
 
+    # ---- 语音包（音色）：列表在 data/runtime/tts_voices.json，和 settings 分开 ----
+    @app.post(prefix + "/api/voice/save")
+    async def _voice_save(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        ok, why, snap = voices.upsert(body.get("profile") if isinstance(body.get("profile"), dict) else body)
+        return JSONResponse({"ok": ok, "detail": why, "voice": snap})
+
+    @app.post(prefix + "/api/voice/delete")
+    async def _voice_delete(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        ok, why, snap = voices.delete(str(body.get("id") or "").strip())
+        return JSONResponse({"ok": ok, "detail": why, "voice": snap})
+
+    @app.post(prefix + "/api/voice/active")
+    async def _voice_active(request: Request):  # noqa: ANN202
+        body = await _body(request)
+        ok, why, snap = voices.set_active(str(body.get("id") or "").strip())
+        return JSONResponse({"ok": ok, "detail": why, "voice": snap})
+
+    @app.post(prefix + "/api/voice/test")
+    async def _voice_test(request: Request):  # noqa: ANN202
+        """合成一句试听，直接回 WAV 字节。**不发送到 QQ**。"""
+        body = await _body(request)
+        text = str(body.get("text") or "你好，这是当前语音包的试听。").strip()[:120]
+        inline = body.get("profile")
+        prof = (voices.normalize(inline) if isinstance(inline, dict)
+                else voices.resolve(str(body.get("id") or "").strip() or None))
+        try:
+            result = await tts.synthesize(
+                text,
+                endpoint=config.TTS_ENDPOINT,
+                token=config.TTS_TOKEN,
+                ref_audio=prof["ref_audio"] or config.TTS_REF_AUDIO,
+                prompt_text=prof["prompt_text"] or config.TTS_PROMPT_TEXT,
+                prompt_lang=prof["prompt_lang"] or config.TTS_PROMPT_LANG,
+                text_lang=prof["text_lang"] or config.TTS_TEXT_LANG,
+                gpt_weights=prof["gpt_weights"],
+                sovits_weights=prof["sovits_weights"],
+                connect_timeout=config.TTS_CONNECT_TIMEOUT,
+                total_timeout=config.TTS_TOTAL_TIMEOUT,
+                max_chars=max(120, int(settings.get("tts_max_chars") or 150)),
+                max_bytes=int(settings.get("tts_max_bytes") or config.TTS_MAX_BYTES),
+                max_seconds=float(settings.get("tts_max_seconds") or config.TTS_MAX_SECONDS),
+            )
+        except tts.TTSError as exc:
+            return JSONResponse({"ok": False, "kind": exc.kind, "detail": exc.detail[:300]},
+                                status_code=502)
+        return Response(content=result.data, media_type="audio/wav")
+
     # -------------------------------------------------------- 人格（三层，只读 + 收尾）
     # 人格分层之后，控制台上的「改人设」入口**整个删掉**。
     # 为什么连控制台也不留：边界要由代码保证 —— 底层人设与禁止事项"只有用户能改"，
@@ -271,7 +341,7 @@ def _register() -> bool:
             {
                 "ok": False,
                 "error": "改人设内容的接口已删除：现在只能直接编辑**当前人格包**里的"
-                         "base.txt / forbidden.txt（表层由自动迭代写）。"
+                         "base.txt / forbidden.txt（表层由评估修订写：先隔离准备、复核通过才提交）。"
                          "**换一个角色**走 /api/persona/switch，不用重启",
             },
             status_code=410,
@@ -283,6 +353,36 @@ def _register() -> bool:
             {"ok": False, "error": "撤销人设要求的接口已删除；自动改动用 /人设 撤回"},
             status_code=410,
         )
+
+    # ---- 修订提案：A+ 之后评估只提案，人确认才落地 ----------------------
+    # 权限与「撤回」同一级（都改线上人格资产），桌面端 permissions 再拦一次。
+    @app.get(prefix + "/api/persona/proposals")
+    async def _proposals() -> JSONResponse:  # noqa: ANN202
+        from . import persona_revision_batch as batch
+        return JSONResponse({"items": batch.list_proposals()})
+
+    @app.get(prefix + "/api/persona/proposal")
+    async def _proposal_detail(rev: str = "") -> JSONResponse:  # noqa: ANN202
+        """一条提案的完整内容（ops + before/after）。审核靠它，不靠摘要。"""
+        from . import persona_revision_batch as batch
+        if not str(rev or "").strip():
+            return JSONResponse({"ok": False, "why": "缺 rev"}, status_code=400)
+        return JSONResponse(batch.proposal_detail(str(rev).strip()))
+
+    @app.post(prefix + "/api/persona/proposal")
+    async def _proposal_act(request: Request) -> JSONResponse:  # noqa: ANN202
+        from . import persona_revision_batch as batch
+        body = await _body(request)
+        rev = str(body.get("rev") or "").strip()
+        action = str(body.get("action") or "").strip()
+        if not rev:
+            return JSONResponse({"ok": False, "why": "缺 rev"}, status_code=400)
+        if action == "commit":
+            return JSONResponse(batch.commit_proposal(rev))
+        if action == "reject":
+            return JSONResponse(batch.reject_proposal(rev))
+        return JSONResponse({"ok": False, "why": "action 只能是 commit / reject"},
+                            status_code=400)
 
     # ---- 人格包：看有哪些、切到哪一个 ------------------------------------
     # 这是控制台上**唯一会改变"它是谁"的动作**，所以单独两个端点、单独一条权限规则
@@ -324,6 +424,17 @@ def _register() -> bool:
                 "changelog": persona.changelog(30),
                 "iter": persona_iter.stats(),
                 "eval": persona_eval.status(),
+                "vector": {
+                    "enabled": bool(settings.get("vector_enabled")),
+                    "values": persona_vector.state().get("values") or {},
+                    "axes": config.load_vector().get("axes") or [],
+                    "modes": config.load_vector().get("modes") or [],
+                    # 与 /api/state 保持同一份体（两处手抄，改一处必须同步另一处）
+                    "recent": persona_vector.recent(5),
+                    "effective_samples": persona_vector.effective_samples(5),
+                },
+                "relation": persona_relation.snapshot(),
+                "examples": persona_examples.stats(),
                 "pack": packs.stats(),
                 "packs": packs.list_packs(),
             },
@@ -331,30 +442,149 @@ def _register() -> bool:
 
     @app.post(prefix + "/api/persona/undo")
     async def _persona_undo() -> JSONResponse:  # noqa: ANN202
-        """撤回最近一次**自动迭代**写入（唯一保留的写动作，且只动表层）。"""
-        got = persona.undo_last()
-        return JSONResponse({"ok": bool(got.get("ok")), "note": got.get("why") or got.get("text", "")})
+        """整版回滚最近一次评估驱动的修订（三层一起）。"""
+        got = persona.undo_revision()
+        if not got.get("ok"):
+            legacy = persona.undo_last()
+            if legacy.get("ok"):
+                return JSONResponse({"ok": True, "note": legacy.get("text", "")})
+        return JSONResponse({"ok": bool(got.get("ok")),
+                             "note": got.get("why") or f"已回滚 {got.get('rev')}",
+                             "rev": got.get("rev")})
 
     @app.post(prefix + "/api/persona/reflect")
     async def _persona_reflect() -> JSONResponse:  # noqa: ANN202
-        """手动触发一次自我反思（后台也会按 `persona_iter_interval` 定期跑）。"""
-        got = await persona_iter.reflect_once(notify=False)
-        return JSONResponse(got)
+        """手动跑一次「语料评估 → 修订」：优先补示例，旧特质分只是兜底。"""
+        from . import persona_revise
+
+        window = await persona_eval.evaluate_window()
+        graded = await persona_eval.run_round()
+        revised = await persona_revise.revise_from_eval(source="手动", force=True)
+        return JSONResponse({"ok": bool(revised.get("ok")), "window": window,
+                             "eval": graded, "revision": revised,
+                             "why": revised.get("why", "")})
 
     @app.post(prefix + "/api/persona/eval")
     async def _persona_eval(request: Request) -> JSONResponse:  # noqa: ANN202
         """人设评估台：`mode=artifacts` 生成测评素材；`mode=round` 跑一轮基线分。
 
         **总闸是 `eval_enabled`**（控制台「参数 → 人设评估」）—— 关着时这里会直接
-        返回 `ok=False` 且一次模型都不调。
-        为什么不自动跑：评估要花 token，而"要不要花"是主人的决定 ——
-        与 `/人设 重跑`（自我反思）同一个取舍。
+        返回 `ok=False` 且一次模型都不调。评估本身只打分；自动修订由定时任务
+        或 `/api/persona/reflect` 触发。
         """
         body = await _body(request)
         mode = str(body.get("mode") or "round")
         if mode == "artifacts":
             return JSONResponse(await persona_eval.generate_artifacts())
         return JSONResponse(await persona_eval.run_round())
+
+    @app.post(prefix + "/api/persona/boundary")
+    async def _persona_boundary() -> JSONResponse:  # noqa: ANN202
+        """手动跑一次边界检查（v2）。只诊断，不改人设。"""
+        return JSONResponse(await persona_eval.check_boundary())
+
+    @app.post(prefix + "/api/persona/likeness")
+    async def _persona_likeness() -> JSONResponse:  # noqa: ANN202
+        """手动跑一次「像人」判别（需要 likeness_samples.jsonl）。"""
+        return JSONResponse(await persona_eval.measure_likeness())
+
+    @app.get(prefix + "/api/persona/likeness/candidates")
+    async def _likeness_candidates() -> JSONResponse:  # noqa: ANN202
+        """候选样本（真实聊天 + 模型生成），供控制台勾选。"""
+        return JSONResponse({
+            "ok": True,
+            "items": persona_eval.likeness_candidates(),
+            "selected": persona_eval.selected_likeness_ids(),
+        })
+
+    @app.post(prefix + "/api/persona/likeness/generate")
+    async def _likeness_generate(request: Request) -> JSONResponse:  # noqa: ANN202
+        """让模型补一批「普通群友」样本，追加到候选。"""
+        body = await _body(request)
+        return JSONResponse(await persona_eval.generate_likeness_samples(int(body.get("n") or 10)))
+
+    @app.post(prefix + "/api/persona/likeness/select")
+    async def _likeness_select(request: Request) -> JSONResponse:  # noqa: ANN202
+        """把勾选的候选写进 likeness_samples.jsonl。"""
+        body = await _body(request)
+        ids = body.get("ids")
+        return JSONResponse(persona_eval.save_likeness_selection(
+            [str(x) for x in ids] if isinstance(ids, list) else []))
+
+    @app.post(prefix + "/api/persona/window")
+    async def _persona_window() -> JSONResponse:  # noqa: ANN202
+        """评估「上次评估 → 现在」的连续语料里 bot 的发言。"""
+        return JSONResponse(await persona_eval.evaluate_window())
+
+    @app.post(prefix + "/api/persona/vector")
+    async def _persona_vector(request: Request) -> JSONResponse:  # noqa: ANN202
+        """重置情绪（body: {"action":"reset","axis":"mood"}）或改一个轴参数。"""
+        body = await _body(request)
+        action = str(body.get("action") or "reset")
+        if action == "set_param":
+            return JSONResponse(persona_vector.set_param(
+                str(body.get("axis") or ""), str(body.get("field") or ""), body.get("value")))
+        return JSONResponse(persona_vector.reset(str(body.get("axis") or "")))
+
+    @app.post(prefix + "/api/persona/relation")
+    async def _persona_relation(request: Request) -> JSONResponse:  # noqa: ANN202
+        """改某人的关系值（play / intimacy / tease_topics / no_go）。"""
+        body = await _body(request)
+        return JSONResponse(persona_relation.set_manual(
+            str(body.get("uid") or ""), str(body.get("field") or ""), body.get("value")))
+
+    @app.post(prefix + "/api/persona/examples")
+    async def _persona_examples(request: Request) -> JSONResponse:  # noqa: ANN202
+        """删一条示例（action=delete + id）或加一条（action=add + item）。"""
+        body = await _body(request)
+        action = str(body.get("action") or "")
+        if action == "delete":
+            return JSONResponse(persona_examples.delete(str(body.get("id") or "")))
+        if action == "add":
+            item = body.get("item")
+            return JSONResponse(persona_examples.append(item if isinstance(item, dict) else {}))
+        return JSONResponse({"ok": False, "why": "action 只能是 delete/add"})
+
+    # -------------------------------------------------------- #0015 评估台（只读 + 反馈）
+    # 这一组**都不改人格**：案例与反馈只进 `data/runtime/persona/<包>/eval/`，
+    # 采纳仍走 `/api/persona/proposal`（唯一提交入口）。
+    @app.get(prefix + "/api/persona/eval/cases")
+    async def _eval_cases() -> JSONResponse:  # noqa: ANN202
+        from . import eval_cases
+
+        items = []
+        for case in eval_cases.load_all():
+            items.append({
+                "case_id": case.get("case_id"),
+                "version": case.get("version"),
+                "failure_type": case.get("failure_type"),
+                "provenance": case.get("provenance"),
+                "split": eval_cases.split_of(case),
+                "split_group": case.get("split_group"),
+            })
+        return JSONResponse({"ok": True, "stats": eval_cases.stats(), "items": items})
+
+    @app.get(prefix + "/api/persona/eval/feedback")
+    async def _eval_feedback_list() -> JSONResponse:  # noqa: ANN202
+        from . import eval_cases
+
+        return JSONResponse({"ok": True, "items": eval_cases.feedback_list(50),
+                             "contract": eval_cases.feedback_contract()})
+
+    @app.post(prefix + "/api/persona/eval/feedback")
+    async def _eval_feedback_add(request: Request) -> JSONResponse:  # noqa: ANN202
+        """写一条反馈。**入库不等于已学会**，也不改任何人格文件。"""
+        from . import eval_cases
+
+        body = await _body(request)
+        return JSONResponse(eval_cases.save_feedback(body if isinstance(body, dict) else {}))
+
+    @app.get(prefix + "/api/persona/eval/sampling")
+    async def _eval_sampling() -> JSONResponse:  # noqa: ANN202
+        from . import eval_sampling
+
+        return JSONResponse({"ok": True, "stats": eval_sampling.stats(),
+                             "due": eval_sampling.due(10)})
 
     # -------------------------------------------------------- 记忆
     @app.post(prefix + "/api/memory")
@@ -435,18 +665,6 @@ def _register() -> bool:
         lib = await stickers.get_library()
         ok = await asyncio.to_thread(lib.remove, digest)
         return JSONResponse({"ok": ok})
-
-    @app.post(prefix + "/api/speak")
-    async def _speak():  # noqa: ANN202
-        groups = await proactive.known_groups()
-        if not groups:
-            return JSONResponse({"said": False, "reason": "还没有任何群聊记录"})
-        for group_id in groups:
-            if await proactive.speak(group_id, "manual", force=True):
-                return JSONResponse({"said": True, "group_id": group_id})
-        return JSONResponse(
-            {"said": False, "reason": "模型选择了不发言、或没有活跃的群（看机器人日志有 [SKIP] 记录）"}
-        )
 
     @app.post(prefix + "/api/greet")
     async def _greet(request: Request) -> JSONResponse:  # noqa: ANN202

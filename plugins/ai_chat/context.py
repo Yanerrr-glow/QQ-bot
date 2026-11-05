@@ -55,8 +55,10 @@ from . import (
     mode,
     msgindex,
     persona,
+    scene,
     settings,
     state,
+    stickers,
     summaries,
 )
 
@@ -208,7 +210,29 @@ def _strip_opener(text: str) -> str:
     return text
 
 
-def system_prompt(*, conv: str, is_master: bool, query: str = "", include_mechanism: bool = True) -> str:
+# 场景判类搬到了 `scene.py`（纯标准库，可离线回放）。这里只做**名字桥接**：
+# `scene.judge()` 用语义名（诉苦 / 求助），而现有示例库的 tags 还是旧名
+# （scene:吐槽 / scene:提问）。桥接放在这一处，等示例库补完新场景后可以删掉。
+_LEGACY_SCENE = {"诉苦": "吐槽", "求助": "提问"}
+
+
+def _scene_of(text: str) -> str:
+    """规则层猜场景。**只做快速否定**，猜不出来返回「闲聊」（等价于不注入）。
+
+    语境解释过的结果不走这里——调用方通过 `system_prompt(scene_hint=…)` 显式传进来。
+    刻意**不再按文本前 N 字去状态里捞旧判断**：那是身份错配（不同消息同开头会串），
+    也正是审阅意见里点出的那条。
+    """
+    act = scene.act_of(text)
+    if act == "unknown":
+        return "闲聊"
+    return _LEGACY_SCENE.get(act, act)
+
+
+def system_prompt(*, conv: str, is_master: bool, query: str = "", include_mechanism: bool = True,
+                  uid: str = "", private: bool | None = None, speaker: str = "", evaluation: bool = False, adult: bool = False,
+                  scene_hint: str = "", message_id: object = None,
+                  examples_record: dict[str, Any] | None = None) -> str:
     """组装 system prompt 的七段中的 1~5 段。"""
     parts: list[str] = []
 
@@ -229,16 +253,86 @@ def system_prompt(*, conv: str, is_master: bool, query: str = "", include_mechan
         # 底层人设文件是空的 → 回落到 .env 里的 AI_CHAT_SYSTEM_PROMPT（旧行为）
         parts.append(config.SYSTEM_PROMPT)
 
+    # 2.5 行为矢量 + 关系偏移 + 示例（v2）
+    #
+    # 放在人格三层之后、时间之前：常驻前缀（base/forbidden/surface）保持稳定，
+    # 这一段每轮会随情绪与对象变化，放后面不会破坏前缀缓存。
+    if settings.get("vector_enabled"):
+        try:
+            from . import persona_examples, persona_vector
+
+            _private = (not str(conv).startswith("g")) if private is None else private
+            state_block = persona_vector.block(
+                conv=conv, is_master=is_master, uid=uid, query=query,
+                private=_private, name=speaker, message_id=message_id)
+            if state_block:
+                parts.append(state_block)
+            # 显式边界：他明确说过别再叫某个词 → 含这个词的示例一条都不注入。
+            # **这是确定性约束**，不依赖模型判断（#0005：reception 来自模型，不能当保护）。
+            banned_words: list[str] = []
+            extra_scenes: list[str] = []
+            try:
+                from . import scene_state as _sst
+
+                _scene_state = _sst.load(conv)
+                banned_words = [str(row.get("word") or "").strip()
+                                for row in (_scene_state.get("boundaries") or [])
+                                if str(row.get("word") or "").strip()]
+                # **冷场不是 act**，规则层永远判不出来，`ACT_TO_SCENE` 里也没有它 ——
+                # 所以只能由 `scene_state.mode` 触发召回（#0003 方案 §三）。
+                # 注意：`mode=冷场` 目前要靠 attention / `<ctx>` 写入，没人写时这条是死路，
+                # 但接在这里不会有害：mode 是别的值时它什么也不加。
+                if str(_scene_state.get("mode") or "") == "冷场":
+                    extra_scenes.append("冷场")
+            except Exception:  # noqa: BLE001 - 拿不到边界就当没有，不能拖垮回复
+                logger.debug("读语境边界失败 conv=%s", conv)
+            example_block = persona_examples.block(
+                tags=persona_vector.tags(uid, is_master=is_master),
+                scenes=[scene_hint or _scene_of(query or "")] + extra_scenes,
+                is_master=is_master, uid=uid, private=_private, adult=adult,
+                budget=int(settings.get("examples_budget_chars") or 420),
+                query=query or "", banned=banned_words,
+                # `fit` 要用当前轴值判适用区间；拿不到就传 None，
+                # 带 fit 的条目会被跳过（保守），无 fit 的不受影响（#0004）
+                axes=persona_vector.effective(uid, is_master=is_master),
+                cur_tags=set(persona_vector.tags(uid, is_master=is_master)),
+                # #0015 M2：回放要能核对「哪些示例真的进了 prompt」；不传时行为不变
+                record=examples_record)
+            if example_block:
+                parts.append(example_block)
+        except Exception:  # noqa: BLE001 - 情绪/示例注入失败不能拖垮回复
+            logger.exception("矢量/示例注入失败 conv=%s", conv)
+
+    # 2.6 短期待办（#0012）—— **故意放在矢量开关之外**：关掉情绪也要记得没答完的事
+    if settings.get("intent_enabled"):
+        try:
+            from . import persona_intents
+
+            _intent_block = persona_intents.render(conv, uid, message_id=message_id, limit=1)
+            if _intent_block:
+                parts.append(_intent_block)
+        except Exception:  # noqa: BLE001 - 待办注入失败不能拖垮回复
+            logger.debug("待办注入失败 conv=%s", conv)
+
     # 3 当前时间
     if settings.get("time_context"):
-        parts.append(config.time_hint())
+        if evaluation:
+            from .persona_workspace import now
+            import datetime
+            parts.append("【当前时间】" + datetime.datetime.fromtimestamp(now()).isoformat(timespec="minutes"))
+        else:
+            parts.append(config.time_hint())
 
     # 3.2 说话模式（按场合调整语气与长度）
     # 放在人设与风格要求**之后**：人设决定"她是谁"，模式决定"这会儿该多用力"，
     # 后者更具体，所以靠后（越靠后的指令对当轮行为影响越直接）。
     if settings.get("mode_enabled") and conv:
         try:
-            name, mode_hint = mode.hint(conv, query or "")
+            if evaluation:
+                name = mode.manual_of(conv) or mode.detect(query or "")
+                mode_hint = str((mode.MODES.get(name) or {}).get("hint") or "")
+            else:
+                name, mode_hint = mode.hint(conv, query or "")
         except Exception:  # noqa: BLE001 - 模式判定失败不能拖垮回复
             logger.exception("模式判定失败 conv=%s", conv)
             name, mode_hint = "日常", ""
@@ -301,6 +395,38 @@ def system_prompt(*, conv: str, is_master: bool, query: str = "", include_mechan
         if block:
             parts.append(block)
 
+    # 5.5 长度上限（最后一段：与发送前的硬截断同源，说明白比让它猜更省 token）
+    #
+    # 放在**最末**而不是人设后面：这段随模式变化（专注/日常），
+    # 插在前面会让「人设 + 时间 + 记忆」这一整段前缀每轮失效。
+    # 判据与 `limit_length()` 共用一个函数，避免"提示说 60、代码按 400 放行"。
+    limit = int(settings.get("reply_max_chars") or 0)
+    if limit > 0:
+        detail = int(settings.get("reply_max_chars_detail") or 0) or limit
+        if _needs_detail(conv=conv, question=query or ""):
+            parts.append(
+                f"【长度】对方在问正事，可以展开，但整段别超过 {detail} 字；"
+                "结论放第一句，后面只补必要的解释。"
+            )
+        else:
+            parts.append(
+                f"【长度】没有必要时一句话说完，整段别超过 {limit} 字；"
+                "对方要细节再展开。"
+            )
+
+    # 5.6 语境标记（方案 §14.2 接入点二）
+    #
+    # 让模型顺手回报「这一轮在聊什么、什么口气」。**程序会剥掉，不会发给对方**；
+    # 它只能供下一轮使用（回复已经在写了，来不及影响本轮检索）。
+    # 与 `<vec mood=-0.04>` 同一个思路，但那个默认关着，这里常开。
+    if not evaluation:
+        parts.append(
+            "【这一轮之后】在你回复的最末尾附一行标记（程序会剥掉，不会发出去）：\n"
+            '<ctx mode="认真讨论|互相调侃|争执|冷场" topic="这段在聊什么，不超过12字" '
+            'conf="clear|fuzzy|unknown"/>\n'
+            "看不清就写 conf=\"unknown\"，别猜。"
+        )
+
     return "\n\n".join(p for p in parts if p)
 
 
@@ -341,6 +467,31 @@ def _stat_line(log: chatlog.ConversationLog) -> str:
     return f"（这个会话记录里共 {st['total']} 条，已读 {st['read']} 条，未读 {st['unread']} 条）"
 
 
+def send_events_block(
+    conv: str,
+    *,
+    quoted_id: str = "",
+    query: str = "",
+    state: dict[str, Any] | None = None,
+) -> str:
+    """取"我发过的表情"事件并渲染成一段提示。**只读**：不改事件、不消耗。
+
+    单独抽出来是为了可测：`build()` 太重（persona / memory / summary 全在里面），
+    而这一段的行为（什么时候注入、注入哪几条、回填哪些 id）需要能离线验证。
+    """
+    try:
+        events = stickers.resolve_sends(conv, quoted_id=quoted_id, query=query)
+    except Exception:  # noqa: BLE001 - 取不到就当没有，不能拖垮回复
+        logger.exception("取发送事件失败 conv=%s", conv)
+        return ""
+    if not events:
+        return ""
+    block = stickers.render_sends(events, conv=conv)
+    if block and state is not None:
+        state["send_events"] = [int(ev.get("id") or 0) for ev in events if ev.get("id")]
+    return block
+
+
 def build(
     *,
     conv: str,
@@ -354,12 +505,25 @@ def build(
     is_master: bool = False,
     instruction_note: str = "",
     bot_uid: str = "",
+    uid: str = "",
+    scene_hint: str = "",
+    quoted_id: str = "",
+    state: dict[str, Any] | None = None,
+    message_id: object = None,
+    private: bool | None = None,
+    examples_record: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """组装一次请求。返回 (messages, 给日志看的 user 文本)。
 
     `trigger` 取值与 `_reply()` 一致：addressed / wake / lease / random / attention /
     greet / proactive。
     `bot_uid` 是机器人自己的 QQ 号 —— 传进来才能把"它说过的话"正确标出来。
+
+    `quoted_id` 是对方引用的那条消息 id：引用的是"它自己发的那张图"时，
+    用它把发送事件精确对上（#0014）。
+    `state` 可选：把本轮注入的发送事件 id 写回 `state["send_events"]`，
+    调用方在正文发送成功后再 `stickers.mark_shown()`。这里是**只读**的，
+    不会因为"渲染过了"就把事件消耗掉 —— 发不出去的请求不该吃掉它的记忆。
     """
     # 把"自己说的话"标出来（bot_uid 优先级最高，跨人设改名也认得出）
     background = log.render_background(bot_uid=bot_uid)
@@ -387,6 +551,13 @@ def build(
             parts.append(block)
     if peers:
         parts.append("【刚才的新发言（还没回应过，供你理解语境）】\n" + peers)
+
+    # 自己发过的表情：对方在问"那张图/刚才那张"、或者引用了它自己发的那条时，
+    # 把当时的挑选判断一起给它（#0014）。普通对话不注入 —— 每轮都提一句
+    # "我发过图"会让她过度关注自己的动作，说出没人问的解释。
+    _send_block = send_events_block(conv, quoted_id=quoted_id, query=question, state=state)
+    if _send_block:
+        parts.append(_send_block)
     if quoted_text:
         parts.append(f"【这条发言引用了下面这条消息】\n{quoted_text}")
 
@@ -460,17 +631,26 @@ def build(
     messages = [
         {
             "role": "system",
-            "content": system_prompt(conv=conv, is_master=is_master, query=question),
+            "content": system_prompt(conv=conv, is_master=is_master, query=question,
+                                     uid=uid,
+                                     # #0015 M2：回放要能按案例指定私聊/群聊；
+                                     # 不传时保持原行为（按会话前缀推断）
+                                     private=(not str(conv).startswith("g")) if private is None else private,
+                                     speaker=speaker, scene_hint=scene_hint,
+                                     message_id=message_id, examples_record=examples_record),
         },
         {"role": "user", "content": user_text},
     ]
     return messages, user_text
 
 
-def build_simple(*, conv: str, is_master: bool, body: str, query: str = "") -> list[dict[str, Any]]:
+def build_simple(*, conv: str, is_master: bool, body: str, query: str = "",
+                 uid: str = "") -> list[dict[str, Any]]:
     """不带聊天记录的一次请求（主动发言、问候、打分等只需要人设语境的场景）。"""
     return [
-        {"role": "system", "content": system_prompt(conv=conv, is_master=is_master, query=query)},
+        {"role": "system", "content": system_prompt(
+            conv=conv, is_master=is_master, query=query, uid=uid,
+            private=not str(conv).startswith("g"))},
         {"role": "user", "content": body},
     ]
 
@@ -631,6 +811,98 @@ def _split_by_paragraph(text: str, limit: int) -> list[str]:
     if buffer:
         chunks.append(buffer)
     return chunks
+
+
+# ------------------------------------------------------------------ 回复长度
+# 为什么要有这一层：人设里写着"一句话说完""别超过四十字"，实测压不住 ——
+# 与 `behavior.py` 开头记的是同一件事（一条 23 字的规则挤在 4600 字的常驻前缀里）。
+# 长度是**可数的**，所以交给代码：超了就在句边界截断，不靠模型自觉。
+#
+# 刻意做成"按句砍"而不是"按字切"：
+# 硬切半句读起来像卡带，而截到最后一个完整句、加个省略号，至少是句人话。
+
+def _needs_detail(*, conv: str, question: str) -> bool:
+    """这一轮是不是"该放开写"：问机制 / 专注模式（问技术、故障、要方案）。
+
+    同一套判据同时被两处用：system 里那句【长度】提示与发送前的硬截断。
+    两边不一致的后果是「提示说别超 60，代码却按 400 放行」，
+    模型永远学不到边界在哪 —— 所以判据只在这里写一份。
+    """
+    if question:
+        try:
+            if ask_about_self(question):
+                return True
+        except Exception:  # noqa: BLE001 - 判据出错按闲聊算，不能因此不截
+            pass
+    if conv:
+        try:
+            return mode.current(conv) == "专注"
+        except Exception:  # noqa: BLE001 - 模式读不出来按闲聊算
+            pass
+    return False
+
+
+def _length_limit(*, conv: str, question: str, text: str) -> int:
+    """这一轮该用哪个上限（0 = 不限）。"""
+    base = int(settings.get("reply_max_chars") or 0)
+    if base <= 0:
+        return 0
+    detail = int(settings.get("reply_max_chars_detail") or 0) or base
+    # 代码块/表格：内容本身就是长句，按闲聊上限砍会把语法砍断
+    wide = ("```" in text or "\n|" in text) or _needs_detail(conv=conv, question=question)
+    return max(base, detail) if wide else base
+
+
+def _hard_cut(text: str, limit: int) -> str:
+    """一句就超限时的退路：优先在逗号/分号处断，再不行才硬切。"""
+    head = text[: max(1, int(limit))]
+    for mark in ("，", "、", "；", "：", ",", ";", ":"):
+        index = head.rfind(mark)
+        if index >= int(limit * 0.6):
+            head = head[:index]
+            break
+    return head.rstrip(_TRIM_TAIL + "，,、；;：: ") + "…"
+
+
+def _cut_at_sentence(text: str, limit: int) -> str:
+    """截到不超过 limit 的最后一个完整句；一句都放不下才硬切。
+
+    `_SENTENCE_END` 是零宽断言，切分**不吃字符**：句末标点留在前一段里。
+    换行要单独补回来 —— `_TRIM_TAIL` 会把它 strip 掉，那样多行列表会被压成一行。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    out = ""
+    for raw in _SENTENCE_END.split(text):
+        piece = _norm_ws(raw.strip(_TRIM_TAIL))
+        if not piece:
+            continue
+        if raw.endswith("\n"):
+            piece = f"{piece}\n"
+        if not out:
+            if len(piece.rstrip()) > limit:
+                return _hard_cut(piece.strip(), limit)
+            out = piece
+            continue
+        if len(out) + len(piece) > limit:
+            break
+        out += piece
+    return f"{out.rstrip()}…" if out.strip() else _hard_cut(text, limit)
+
+
+def limit_length(text: str, *, conv: str = "", question: str = "") -> str:
+    """整轮回复的硬字数上限（`reply_max_chars` / `reply_max_chars_detail`）。
+
+    输入输出都是最终要发出去的那份文本；调用点只有一处（`__init__.py` 的回复主链路），
+    放在 `polish()` 之后、落盘与分段发送之前 —— 这样聊天记录里存的也是**实际发出的内容**。
+
+    **不截断的情况**：上限配成 0；或者这一轮被判成"要细节"（专注模式、问机制、代码表格），
+    于是走更宽的上限。宁可让它多写，也不要在对方真要方案时把后半段砍掉。
+    """
+    body = (text or "").strip()
+    if not body:
+        return body
+    return _cut_at_sentence(body, _length_limit(conv=conv, question=question, text=body))
 
 
 def maybe_sticker_chance() -> bool:

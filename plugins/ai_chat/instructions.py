@@ -177,6 +177,9 @@ async def parse(
     allow_natural: bool = False,
     bot: Any = None,
     image_segments: list[dict] | None = None,
+    uid: str = "",
+    message_id: Any = None,
+    quoted_id: str = "",
 ) -> Action:
     """解析一条消息。
 
@@ -210,6 +213,9 @@ async def parse(
                 conv=conv,
                 executed=_style_action_applied(action),
                 kind_hint=_head,
+                uid=uid,
+                message_id=message_id,
+                quoted_id=quoted_id,
             )
         return action
     if allow_natural and settings.get("image_policy_enabled"):
@@ -219,11 +225,13 @@ async def parse(
         # 这里先执行、再记账（原来写成"先记后执行、executed 用默认 False"，
         # 于是「正经点」这类**确实改了人设**的要求被记成没执行过，实测踩到过）。
         action = await _match_natural(text, conv=conv, is_master=is_master)
-        _record_style_signal(text, conv=conv, executed=_style_action_applied(action))
+        _record_style_signal(text, conv=conv, executed=_style_action_applied(action),
+                             uid=uid, message_id=message_id, quoted_id=quoted_id)
         return action
     # 走到这里说明要么不是在跟它说话（`allow_natural=False`），要么图片策略关着。
     # **仍然记账**：这是他"说过但没被执行"的偏好 —— 正是这一步要收集的东西。
-    _record_style_signal(text, conv=conv)
+    _record_style_signal(text, conv=conv, uid=uid, message_id=message_id,
+                         quoted_id=quoted_id)
     return Action()
 
 
@@ -248,7 +256,8 @@ def _style_action_applied(action: Action) -> bool:
 
 # --------------------------------------------------------------------- 记账
 def _record_style_signal(
-    text: str, *, conv: str, executed: bool = False, kind_hint: str = ""
+    text: str, *, conv: str, executed: bool = False, kind_hint: str = "",
+    uid: str = "", message_id: Any = None, quoted_id: str = "",
 ) -> int:
     """识别并记下「他在纠正我的说话方式」。**不改任何人设，只记账。**
 
@@ -268,10 +277,21 @@ def _record_style_signal(
         found = signals.detect(raw)
         if not found:
             return 0
+        # **身份取自事件，不取配置**（#0015 P1-4）。旧写法一律用 `master_qq`，
+        # 于是任何群友说一句「你能不能短一点」都会被记成主人说的 ——
+        # 这直接决定了反馈能不能用来改主人的全局偏好。缺身份就记 `unconfirmed`
+        # （`uid=0`），**不回落主人**。
+        sender = str(uid or "").strip()
+        try:
+            sender_id = int(sender) if sender.isdigit() else 0
+        except (TypeError, ValueError):
+            sender_id = 0
         return signals.record(
             found,
             conv=conv,
-            uid=int(settings.get("master_qq") or 0),
+            uid=sender_id,
+            message_id=message_id,
+            quoted_id=str(quoted_id or ""),
             executed=executed,
             source=f"指令:{kind_hint}" if kind_hint else "自然语言",
         )
@@ -428,21 +448,20 @@ def mark_current_image_ignored(conv: str) -> None:
 # ---- /风格 与 /人设：**只读 + 撤回** --------------------------------------
 # 人格分层之后，这两个指令**不再能改人设**。
 #
-# 为什么删掉改值的入口：人格分三层之后，"谁能改哪一层"必须由代码保证而不是约定 ——
-# 底层与禁止事项只有用户能改（编辑文件），表层是自动迭代的地盘。
-# 只要留一个"聊天里能直接改"的入口，那条边界就靠不住（任何能说话的人都能试着敲）。
+# 为什么删掉改值的入口：人格分三层之后，改动必须走**有备份、可回滚**的路径 ——
+# 聊天里的临时指令不适合改三层；直接编辑文件与评估驱动的修订是仅有的两个入口。
 #
 # 保留的三种能力都是**只读或收尾**动作：
 #   /风格           看三层现状
-#   /风格 铁律      逐条看禁止事项（也就是自动迭代撞不过去的那几条）
-#   /人设 日志      看自动迭代改了什么、以及**被拦下了什么**
-#   /人设 撤回      撤销最近一次自动写入
-#   /人设 重跑      立刻触发一次自我反思（后台也会定期跑）
+#   /风格 铁律      逐条看禁止事项（评估修订会改它们，改前整版备份）
+#   /人设 日志      看改了什么、以及**被拦下了什么**
+#   /人设 撤回      整版回滚最近一次评估修订
+#   /人设 迭代      立刻跑一次「评估 → 修订」
 def _persona_readonly_hint() -> str:
     return (
-        "（改人格的指令已经删掉了 —— 现在只能直接编辑文件：\n"
-        "  底层人设 / 禁止事项 / 表层人设 三个文件的路径见 /人设 状态。\n"
-        "  生效时机：表层改完即生效；底层人设与禁止事项改完**要重启**）"
+        "（改人格的聊天指令已经删掉了 —— 现在有两个入口：\n"
+        "  ① 直接编辑文件；② 评估驱动的自动修订（每天 03:00，可 /人设 迭代 手动触发）。\n"
+        "  修订会先整份备份三层，/人设 撤回 可整版回滚）"
     )
 
 
@@ -454,20 +473,19 @@ async def _cmd_style(rest: str, *, conv: str, is_master: bool, ctx: Any = None) 
     if sub in ("", "看", "列表", "状态", "status"):
         st = persona.stats()
         head = (
-            f"我的人格分三层（改人格直接编辑文件，改完不用重启）：\n"
-            f"· 底层人设 {st['base_chars']} 字 —— 只有你能改\n"
+            f"我的人格分三层（每天 03:00 按评估结果自动修订，改前整版备份）：\n"
+            f"· 底层人设 {st['base_chars']} 字 —— 可由评估修订改写\n"
             f"  {st['base_file']}\n"
             f"· 禁止事项 {st['forbidden_chars']} 字（{len(persona.forbidden_items())} 条）"
-            f" —— 只有你能改\n"
+            f" —— 可由评估修订改写\n"
             f"  {st['forbidden_file']}\n"
-            f"· 表层人设 {st['surface_chars']} 字 —— **唯一会自动学的部分**，"
-            f"改前过冲突闸门\n"
+            f"· 表层人设 {st['surface_chars']} 字 —— 最常被修订的一层\n"
             f"  {st['surface_file']}"
         )
         if is_master:
             head += (
-                f"\n\n自动迭代至今 {st['changes']} 条记录"
-                "（写入 + 被丢弃都算）：/人设 日志 看明细，/人设 撤回 撤销最近一次。"
+                f"\n\n修订记录 {st['changes']} 条（写入 + 被丢弃都算）："
+                "/人设 日志 看明细，/人设 撤回 整版回滚。"
             )
         return _say("style", head)
 
@@ -476,7 +494,7 @@ async def _cmd_style(rest: str, *, conv: str, is_master: bool, ctx: Any = None) 
             return _deny("style", "禁止事项清单只有主人能看。")
         return _say(
             "style",
-            "【禁止事项】（自动迭代碰到这些会**直接丢弃、不写入**）\n"
+            "【禁止事项】（评估修订可以改写它们，每次改前整版备份、可 /人设 撤回）\n"
             + persona.forbidden_list_text(),
         )
 
@@ -488,22 +506,25 @@ async def _cmd_style(rest: str, *, conv: str, is_master: bool, ctx: Any = None) 
     if sub in ("撤回", "撤销", "undo"):
         if not is_master:
             return _deny("style", "撤回只能主人做。")
-        got = persona.undo_last()
+        got = persona.undo_revision()
         if not got.get("ok"):
-            return _say("style", f"没撤回什么：{got.get('why')}")
-        return _say("style", f"撤掉了上一条自动改动：\n· {got.get('text', '')[:70]}")
+            legacy = persona.undo_last()
+            if not legacy.get("ok"):
+                return _say("style", f"没撤回什么：{got.get('why')}")
+            return _say("style", f"撤掉了上一条表层改动：\n· {legacy.get('text', '')[:70]}")
+        return _say("style", f"已整版回滚评估修订 {got.get('rev')}。")
 
     return Action(
         kind="style", ok=False, handled=True, stop=True,
         reply=(
-            "改人格的指令已经删掉了 —— 现在只能直接编辑那三个文件。\n"
+            "改人格的聊天指令已经删掉了。\n"
             f"{_persona_readonly_hint()}\n\n"
             "还能用的：\n"
             "· /风格 —— 看三层现状\n"
             "· /风格 铁律 —— 逐条看禁止事项\n"
-            "· /人设 日志 —— 看自动迭代改了什么、拦下了什么\n"
-            "· /人设 撤回 —— 撤销最近一次自动改动\n"
-            "· /人设 重跑 —— 立刻触发一次自我反思"
+            "· /人设 日志 —— 看改了什么、拦下了什么\n"
+            "· /人设 撤回 —— 整版回滚最近一次修订\n"
+            "· /人设 迭代 —— 立刻跑一次「评估 → 修订」"
         ),
     )
 
@@ -521,7 +542,7 @@ async def _cmd_persona(rest: str, *, conv: str, is_master: bool, ctx: Any = None
     if sub in ("铁律", "禁止", "禁止事项"):
         return _say(
             "persona",
-            "【禁止事项】（自动迭代碰到这些会**直接丢弃、不写入**）\n"
+            "【禁止事项】（评估修订可以改写它们，每次改前整版备份、可 /人设 撤回）\n"
             + persona.forbidden_list_text(),
         )
 
@@ -529,13 +550,43 @@ async def _cmd_persona(rest: str, *, conv: str, is_master: bool, ctx: Any = None
         return _say("persona", "【人格自动改动日志】\n" + persona.changelog_text())
 
     if sub in ("撤回", "撤销", "undo"):
-        got = persona.undo_last()
+        got = persona.undo_revision()
         if not got.get("ok"):
-            return _say("persona", f"没撤回什么：{got.get('why')}")
-        return _say("persona", f"撤掉了上一条自动改动：\n· {got.get('text', '')[:70]}")
+            # 兼容旧版"单条表层追加"的撤回：没有评估修订时退回原来的路径
+            legacy = persona.undo_last()
+            if not legacy.get("ok"):
+                return _say("persona", f"没撤回什么：{got.get('why')}")
+            return _say("persona", f"撤掉了上一条表层改动：\n· {legacy.get('text', '')[:70]}")
+        detail = "\n".join(
+            f"· {persona._LAYER_LABEL.get(c.get('layer'), c.get('layer'))}："
+            f"{str(c.get('why') or c.get('find') or '')[:60]}"
+            for c in (got.get("changes") or [])[:6]
+        )
+        return _say("persona", f"已整版回滚评估修订 {got.get('rev')}：\n" + detail)
+
+    if sub in ("提案", "待确认", "proposals"):
+        # A+：评估产出的修订先落成提案，人确认才写线上人格。
+        # 与「候选」不是一回事：候选池是旧的手动反思产物，提案是评估台的产物。
+        from . import persona_revision_batch as batch
+        action_word, _, rev = arg.partition(" ")
+        action_word, rev = _norm(action_word), rev.strip()
+        if not arg:
+            return _say("persona", batch.proposals_text())
+        if action_word in ("采纳", "接受", "approve", "commit") and rev:
+            got = batch.commit_proposal(rev)
+            if not got.get("ok"):
+                return _say("persona", f"没提交成：{got.get('why')}")
+            return _say("persona", f"提案 {got.get('rev')} 已提交，改动了：\n· "
+                                   + "、".join(got.get("written") or []))
+        if action_word in ("拒绝", "否决", "reject", "drop") and rev:
+            got = batch.reject_proposal(rev)
+            if not got.get("ok"):
+                return _say("persona", f"没拒绝成：{got.get('why')}")
+            return _say("persona", f"提案 {rev} 已丢弃（线上人格没动）")
+        return _say("persona", "用法：/人设 提案｜/人设 提案 采纳 <rev>｜/人设 提案 拒绝 <rev>")
 
     if sub in ("候选", "待采纳", "池"):
-        # 候选池：自动迭代默认不再直接生效
+        # 候选池：旧的自动迭代已停用，现在只服务手动反思
         return _say("persona", "【待采纳的人格候选】\n" + persona.candidates_text())
 
     if sub in ("采纳", "接受", "approve"):
@@ -593,23 +644,24 @@ async def _cmd_persona(rest: str, *, conv: str, is_master: bool, ctx: Any = None
                         "但运行时标记已经写下了，本次部署不受影响。")
         return _say("persona", "\n".join(rows))
 
-    if sub in ("重跑", "反思", "迭代"):
-        from . import persona_iter
+    if sub in ("重跑", "反思", "迭代", "修订"):
+        from . import persona_eval, persona_revise
 
-        got = await persona_iter.reflect_once(notify=False)
+        graded = await persona_eval.run_round()
+        if not graded.get("ok"):
+            return _say("persona", f"评估没跑成：{graded.get('why')}")
+        got = await persona_revise.revise_from_eval(source="手动", force=True)
         if not got.get("ok"):
-            return _say("persona", f"这次没反思成功：{got.get('why')}")
-        if got.get("auto_apply"):
             return _say(
                 "persona",
-                f"反思完成（自动生效模式）：写入 {got.get('written', 0)} 条、"
-                f"被闸门拦下 {got.get('rejected', 0)} 条。\n用 /人设 日志 看明细。",
+                f"评估跑完 {graded.get('traits', 0)} 个特质，这次没有改人设：{got.get('why')}\n\n"
+                + persona_eval.render_status(),
             )
+        layers = "/".join(persona._LAYER_LABEL.get(x, x) for x in got.get("written") or []) or "无变化"
         return _say(
             "persona",
-            f"反思完成：**{got.get('proposed', 0)} 条进了候选池**、"
-            f"被闸门拦下 {got.get('rejected', 0)} 条。\n"
-            "候选还没生效 —— /人设 候选 看列表，/人设 采纳 <序号> 才写进表层。",
+            f"评估跑完 {graded.get('traits', 0)} 个特质，修订写入 {len(got.get('changes') or [])} 处"
+            f"（{layers}）。撤销用 /人设 撤回（整版回滚）。\n\n" + persona_eval.render_status(),
         )
 
     if sub in ("信号", "账本"):
@@ -1303,7 +1355,7 @@ async def _cmd_help(rest: str, *, conv: str, is_master: bool, ctx: Any = None) -
         "我能听懂的指令：",
         "· /图 忽略|只看|完全不看|正常|撤销|状态 —— 管图片怎么处理",
         "· /风格 —— 看我的人格三层现状（**改人格要直接编辑文件**）",
-        "· /风格 铁律 —— 逐条看禁止事项（自动迭代撞不过去的那几条）",
+        "· /风格 铁律 —— 逐条看禁止事项（评估修订会改它们，改前有备份）",
         "· /人设 [包|切换 <id>|候选|采纳 <序号>|否决 <序号>|日志|撤回|重跑|信号|评估] —— 管我的人格（限主人）",
         "· /记忆 列表|存|找|翻|忘|保护 —— 管我记住的东西",
         "· /机制 [图|记忆|风格|触发|安全|全部] —— 我把自己的机制讲给你听",

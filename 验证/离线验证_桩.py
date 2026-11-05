@@ -520,6 +520,7 @@ for _kw in _TERMS[:8]:
 
 # ---- 守卫表驱动：behavior.py 的判据登记在注册表的 guards 下 ----
 from ai_chat import behavior as _beh  # noqa: E402
+from ai_chat import persona_examples as _pex  # noqa: E402  # #0015 M5
 
 _guard = (_TRAITS.get("time_sleep") or {}).get("guards") or {}
 check_reg("time_sleep 的守卫登记在注册表里（window/threshold/rules）",
@@ -746,6 +747,184 @@ check("预算恢复后又能正常写", persona.apply_candidate("恢复上限之
 persona.undo_last()
 _sp.write_text(_orig_surface, encoding="utf-8")
 
+# ---- 评估驱动的三层修订（2026-10-24）----
+# 允许改底层/禁止事项之后，补偿措施必须可验证：写入、覆盖文件、整版回滚。
+_surface_line = next((ln for ln in persona.surface_text().splitlines()
+                      if len(ln.strip()) >= 12 and persona.surface_text().count(ln) == 1), "")
+_base_line = next((ln for ln in persona.base_text().splitlines()
+                   if len(ln.strip()) >= 12 and persona.base_text().count(ln) == 1), "")
+check("修订前置：能定位表层/底层各一段", bool(_surface_line) and bool(_base_line))
+_rev = persona.apply_revision(
+    [
+        {"layer": "surface", "find": _surface_line,
+         "replace": _surface_line + "（评估修订测试）", "why": "测试表层"},
+        {"layer": "base", "find": _base_line,
+         "replace": _base_line + "（评估修订测试）", "why": "测试底层"},
+    ],
+    reason="离线验证", source="测试", scores={"test": 1},
+)
+check("混入底层修改时整批拒绝", not _rev.get("ok"), str(_rev))
+check("拒绝整批时表层不提前写入", "评估修订测试" not in persona.surface_text())
+_rev = persona.apply_revision([
+    {"layer": "surface", "find": _surface_line,
+     "replace": _surface_line + "（评估修订测试）", "why": "测试表层"},
+], reason="离线验证", source="测试", scores={"test": 1})
+check("表层修订写入成功", bool(_rev.get("ok")), str(_rev))
+check("表层写入生效", "评估修订测试" in persona.surface_text())
+check("底层保持原样", "评估修订测试" not in persona.base_text())
+check("未生成底层覆盖文件", config.layer_is_overridden("base") is False)
+_undo_rev = persona.undo_revision()
+check("整版回滚成功", bool(_undo_rev.get("ok")), str(_undo_rev))
+check("表层回滚干净", "评估修订测试" not in persona.surface_text())
+check("底层回滚干净", "评估修订测试" not in persona.base_text())
+check("底层覆盖文件已移除", config.layer_is_overridden("base") is False)
+
+# ---- 评估 → 修订的整条链路（假模型，验证提示词/解析/落盘）----
+from ai_chat import persona_eval as _pe, persona_revise as _pr  # noqa: E402
+
+check("每日时刻计算落在 0~24h 内", 0 < _pe._seconds_until_daily(3) <= 86400)  # noqa: SLF001
+_old_eval_on = settings.get("eval_enabled")
+_old_iter_on = settings.get("eval_iter_enabled")
+_old_propose_on = settings.get("eval_propose_only")
+settings.set_value("eval_enabled", True)
+settings.set_value("eval_iter_enabled", True)
+# 这一段测的是**提交链路**，所以显式关掉"只提案"（它默认是开的）
+settings.set_value("eval_propose_only", False)
+_eval_data = _pe._load()
+_eval_data.setdefault("artifacts", {})["mechanism_leak"] = {
+    "rubric": "是否泄漏机制或参数", "eval_questions": ["随便聊聊"]}
+_eval_data.setdefault("baseline", {})["mechanism_leak"] = {"score": 90}
+_pe._save(_eval_data)
+_targets = _pe.revision_targets()
+check("高分压制型特质进入待修清单", any(x["slug"] == "mechanism_leak" for x in _targets), str(_targets)[:120])
+# #0015 M5：修订只允许改示例（surface 已从白名单移除），所以链路测试改用 add examples。
+_rev_json = json.dumps({"ops": [{
+    "op": "add", "target": "examples", "id": "rev-chain-example",
+    "polarity": "good", "tags": ["scene:闲聊"], "ctx": ["对方：测试链路"],
+    "say": ["你：收到。"], "why": "测试链路",
+}]}, ensure_ascii=False)
+
+import ai_chat as _pkg  # noqa: E402
+
+_orig_chat_fn = _pkg.llm.chat
+_orig_revision_verify = _pe.verify_revision
+
+async def _fake_revision_verify(plan):
+    return {"passed": True, "why": "仅测试提交链路，复核另有回归"}
+
+_pe.verify_revision = _fake_revision_verify
+
+
+async def _fake_rev_chat(messages, **kwargs):
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=_rev_json))]
+    )
+
+
+_pkg.llm.chat = _fake_rev_chat  # type: ignore[assignment]
+try:
+    _chain = asyncio.run(_pr.revise_from_eval(source="离线", force=True))
+finally:
+    _pkg.llm.chat = _orig_chat_fn  # type: ignore[assignment]
+    _pe.verify_revision = _orig_revision_verify
+check("评估驱动的修订链路写入成功", bool(_chain.get("ok")), str(_chain)[:200])
+check("修订内容进示例库",
+      any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
+persona.undo_revision()
+check("链路修订可整版回滚",
+      not any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
+settings.set_value("eval_enabled", _old_eval_on)
+settings.set_value("eval_iter_enabled", _old_iter_on)
+settings.set_value("eval_propose_only", _old_propose_on)
+
+# ---- A+：提案 / 提交拆开（eval_propose_only）----
+# 这条链路的意义：模型可以继续"会评分、会提案"，但**不直接改写线上人格**。
+# 三个断言缺一不可：只提案不写盘、提案能被列出来、人工确认后才生效。
+from ai_chat import persona_revision_batch as _pbrb  # noqa: E402
+
+_old_propose = settings.get("eval_propose_only")
+settings.set_value("eval_propose_only", True)
+settings.set_value("eval_enabled", True)
+
+
+def _proposal_round(mark: str):
+    """跑一轮"评估 → 提案"，返回结果。`mark` 是写进表层的标记词。"""
+    payload = json.dumps({"ops": [{
+        "op": "add", "target": "examples", "id": f"prop-{mark}",
+        "polarity": "good", "tags": ["scene:闲聊"], "ctx": [f"对方：{mark}"],
+        "say": ["你：收到。"], "why": "提案链路测试",
+    }]}, ensure_ascii=False)
+
+    async def _fake(messages, **kwargs):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=payload))]
+        )
+
+    _orig = _pkg.llm.chat
+    _pkg.llm.chat = _fake  # type: ignore[assignment]
+    _pe.verify_revision = _fake_revision_verify
+    try:
+        return asyncio.run(_pr.revise_from_eval(source="离线提案", force=True))
+    finally:
+        _pkg.llm.chat = _orig  # type: ignore[assignment]
+        _pe.verify_revision = _orig_revision_verify
+
+
+_prop = _proposal_round("提案链路")
+check("只提案时返回 proposed 且不写线上人格",
+      bool(_prop.get("proposed")) and
+      not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()),
+      str(_prop)[:180])
+_props = _pbrb.list_proposals()
+check("提案能被列出（可从磁盘重读）",
+      any(x.get("rev") == _prop.get("rev") for x in _props), str(_props)[:180])
+
+_commit = _pbrb.commit_proposal(str(_prop.get("rev") or ""))
+check("人工确认后提交成功", bool(_commit.get("ok")), str(_commit)[:180])
+check("提交后示例才生效",
+      any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
+persona.undo_revision()
+check("提案提交也能整版回滚",
+      not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
+
+_prop2 = _proposal_round("提案丢弃")
+_rej = _pbrb.reject_proposal(str(_prop2.get("rev") or ""))
+check("拒绝提案不写盘",
+      bool(_rej.get("ok")) and
+      not any(str(x.get("id")) == "prop-提案丢弃" for x in _pex._load()),
+      str(_rej)[:120])
+check("拒绝后的提案不再出现在待确认列表",
+      all(x.get("rev") != _prop2.get("rev") for x in _pbrb.list_proposals()))
+check("同一提案不能重复提交",
+      _pbrb.commit_proposal(str(_prop2.get("rev") or "")).get("ok") is False)
+
+# ---- 过期与状态机（2026-11-03 按 #0006 审阅加）----
+# 原来 `commit_proposal` **完全不看时间**：8 天前的提案只要没被 `expire_old()` 扫到就能提交。
+# 现在 TTL 由后端判并顺手标 expired —— 前端不再自己算，三处入口口径一致。
+_prop3 = _proposal_round("提案过期")
+_rev3 = str(_prop3.get("rev") or "")
+_meta3 = _pbrb._read_batch(_rev3) or {}
+_meta3["at"] = float(_meta3.get("at") or 0) - 8 * 86400      # 假装它是 8 天前生成的
+_pbrb._json(_pbrb._history_root() / _rev3 / "batch.json", _meta3)
+_expired = _pbrb.commit_proposal(_rev3)
+check("超过 7 天的提案不能提交", _expired.get("ok") is False, str(_expired)[:160])
+check("拒绝时顺手把状态标成 expired",
+      str((_pbrb._read_batch(_rev3) or {}).get("status")) == "expired",
+      (_pbrb._read_batch(_rev3) or {}).get("status"))
+check("已过期的提案不能再被拒绝",
+      _pbrb.reject_proposal(_rev3).get("ok") is False)
+
+_detail = _pbrb.proposal_detail(_rev3)
+check("详情接口能给出完整 ops 与逐文件 before/after",
+      isinstance(_detail.get("ops"), list) and isinstance(_detail.get("files"), list)
+      and all({"before", "after"} <= set(row) for row in (_detail.get("files") or [])),
+      str(_detail.get("changed"))[:120])
+check("详情接口自己判过期（前端不重复实现）", _detail.get("expired") is True,
+      f"{_detail.get('expired')} / {_detail.get('age_days')} 天")
+
+settings.set_value("eval_propose_only", _old_propose)
+settings.set_value("eval_enabled", _old_eval_on)
+
 print("\n=== 4.5 禁止事项可逐条解析（闸门的依据） ===")
 _items = persona.forbidden_items()
 check("禁止事项被拆成条目", len(_items) >= 6, f"{len(_items)} 条")
@@ -853,6 +1032,13 @@ check("未单独设置的会话跟随全局", state.image_mode("u9") == "only")
 check("单独设置优先于全局", state.image_mode("u1") == "normal")
 state.clear_global_image_policy()
 check("全局撤销后回落", state.image_mode("u9") == "normal")
+
+_snap = state.snapshot()
+check("快照带四种合法模式", _snap.get("valid_modes") == list(state.VALID_MODES),
+      str(_snap.get("valid_modes")))
+_snap_u1 = (_snap.get("convs") or {}).get("u1")
+check("快照的会话条目是对象且带 effective", isinstance(_snap_u1, dict) and _snap_u1.get("effective") == "normal",
+      type(_snap_u1).__name__)
 
 print("\n=== 8. 斜杠指令解析 ===")
 
@@ -1540,6 +1726,16 @@ class _FakeBotForImage:
 
 
 asyncio.run(stickers.record_sent_image(_FakeBotForImage(), "g783", "123456"))
+
+# ---- 文字表情（颜文字）：与图片表情共用"加不加"的思路，但独立开关（2026-11-04）----
+# 它归到表情包库而不是人格层的那句"你可以用颜文字"：那是能力，不是性格。
+# ⚠ 这里**不传 conv**：传了会再乘一次 `mode.scale_for(conv,"sticker")`，
+# 概率就不是 1 了（那条缩放是给线上用的，不是给断言用的）。
+_kao_on = stickers.pick_text_sticker(chance=1.0)
+check("概率=1 时一定挑出一个，且在池子里", _kao_on in stickers.TEXT_STICKERS, _kao_on)
+check("概率=0 时一定不加", stickers.pick_text_sticker(chance=0.0) == "")
+_seq = {stickers.pick_text_sticker(chance=1.0) for _ in range(20)}
+check("不会连续两次同一个（池子至少两个才会换）", len(_seq) >= 2, str(_seq))
 _sl.load()
 _sent = _sl.messages[-1]
 check("自己发的图被记进了聊天记录", _sent.get("is_bot") is True, str(_sent))
@@ -1793,7 +1989,7 @@ else:
 
         _first = _lib.add(
             png, conv="g1", uid=1, name="阿离", is_master=False, sub_type=1,
-            score=0.9, reason="渐变测试图", phash_value=ph_png, size_wh=(160, 160),
+            score=0.9, phash_value=ph_png, size_wh=(160, 160),
         )
         check("第一张正常入库", _first is not None and _first["phash"] == ph_png)
 
@@ -1842,7 +2038,7 @@ else:
             _img = _png(_distinct(_i))
             _lib.add(
                 _img, conv="g1", uid=1, name="阿离", is_master=False,
-                sub_type=1, score=0.8, reason=f"图{_i}",
+                sub_type=1, score=0.8,
                 phash_value=perceptual.phash(_img), size_wh=(160, 160),
             )
         _sample = _lib.sample(5)
@@ -1928,7 +2124,7 @@ else:
         _pimg = _png(_shapes("circle"))
         _plib.add(
             _pimg, conv="g1", uid=1, name="阿离", is_master=False, sub_type=1,
-            score=0.9, reason="一个圆圈图案",
+            score=0.9,
             phash_value=perceptual.phash(_pimg), size_wh=(160, 160),
         )
         # 让 get_library() 返回我们这份（正常情况下它是模块级单例）
@@ -1954,7 +2150,10 @@ else:
         check("挑图提示里明确禁止发无关图", "宁可这张都不发" in _prompt_text)
         check("挑图时把语境交给了模型", "面试挂了" in _prompt_text, _prompt_text[:120])
         check("挑图时附上了候选图的真实画面", isinstance(_cap.get("prompt"), list), type(_cap.get("prompt")).__name__)
-        check("候选说明带上了入库时写的画面点评", "圆圈" in _prompt_text, _prompt_text[:200])
+        # 2026-11-04：候选清单只留序号 + 类型。入库时写过的任何"这张是什么/适合怎么用"
+        # 都不许再进提示词 —— 那等于替这一次的判断先下结论，且摘要有损。
+        check("候选说明里不出现图片描述", "圆圈" not in _prompt_text, _prompt_text[:200])
+        check("候选清单只标类型", "1. 表情" in _prompt_text, _prompt_text[:200])
 
         # 语境只保留"最近"的部分。注意要造得**真的超过预算** ——
         # 第一版只造了 20 行短句（约 400 字，没到 600 的预算），
@@ -2654,6 +2853,10 @@ settings.set_value("search_backend", "deepseek")
 settings.set_value("search_endpoint", "")
 _saved_api_key = _search.config.API_KEY
 _saved_sk = settings.get("search_api_key")
+# **还要清环境变量**：容器里 `DEEPSEEK_API_KEY` 由 compose 注入，只清 config 与
+# 设置项的话 `available()` 仍会从 os.environ 拿到 key —— 在容器里跑这套回归就会
+# 假失败两条（2026-10-29 实测）。用例要自成环境，不能依赖"本机没设这个变量"。
+_saved_env_key = os.environ.pop("DEEPSEEK_API_KEY", None)
 _search.config.API_KEY = ""
 settings.set_value("search_api_key", "")
 try:
@@ -2665,6 +2868,8 @@ try:
 finally:
     _search.config.API_KEY = _saved_api_key
     settings.set_value("search_api_key", _saved_sk)
+    if _saved_env_key is not None:
+        os.environ["DEEPSEEK_API_KEY"] = _saved_env_key
 settings.set_value("search_enabled", False)
 settings.set_value("search_endpoint", "http://127.0.0.1:1/search")
 check("关掉开关时也不可用", _search.available() is False)
@@ -4694,6 +4899,7 @@ finally:
 # 验的是整条链路：反思 → 候选 → **冲突闸门** → 只写表层 → 日志 → 可撤回。
 # 关键边界：它**碰不到**底层人设与禁止事项（代码里连写路径都不存在）。
 from ai_chat import persona_iter as _piter  # noqa: E402
+_settings.store._runtime["persona_iter_enabled"] = True  # 仅测试旧迭代兼容路径
 
 _old_logdir8 = config.LOG_DIR
 _iterdir = _mkdtemp("ai_chat_iter_")
@@ -4758,7 +4964,7 @@ try:
     _settings.store._runtime["persona_iter_enabled"] = False  # type: ignore[attr-defined]  # noqa: SLF001
     _res2 = asyncio.run(_piter.reflect_once(notify=False))
     check("开关关着时直接退出", _res2.get("ok") is False and "开关" in str(_res2.get("why")), str(_res2))
-    del _settings.store._runtime["persona_iter_enabled"]  # noqa: SLF001
+    _settings.store._runtime["persona_iter_enabled"] = True  # 恢复该组显式前提
 
     # ---- 33.4 底层人设为空时拒绝跑（没有约束就没有闸门依据）----
     _empty_base = _iterdir / "persona_base_empty.txt"
@@ -5635,6 +5841,230 @@ finally:
     config.LOG_DIR = _old_logdir35  # type: ignore[misc]
     shutil.rmtree(_PROBE_DIR, ignore_errors=True)
     shutil.rmtree(_pack35, ignore_errors=True)
+
+print("\n=== 回复长度上限（context.limit_length）===")
+# 这是"人设里写了短、实测压不住"的兜底：长度可数，所以由代码截断。
+# 四条边界必须穷举，否则最容易出的错是"把方案砍掉一半"却没人发现。
+_old_max = settings.get("reply_max_chars")
+_old_detail = settings.get("reply_max_chars_detail")
+try:
+    settings.set_value("reply_max_chars", 40)
+    settings.set_value("reply_max_chars_detail", 200)
+
+    _short = "今天加班到十点，饭还没吃。"
+    check("短回复原样返回", context.limit_length(_short) == _short, _short)
+
+    _long = (
+        "今天下午我把那个网架模型的荷载重新算了一遍，发现之前用的组合系数有问题。"
+        "后来跟结构那边对了一下，确实是他们给的参数偏保守。"
+        "所以我按新的系数又跑了一轮，结果比原来小了将近三成。"
+    )
+    _cut = context.limit_length(_long)
+    check("超长被截断", len(_cut) < len(_long), f"{len(_long)}→{len(_cut)}")
+    check("截断后不超过上限", len(_cut) <= 40, len(_cut))
+    check("截断落在句末（保留第一个完整句）", _cut.startswith("今天下午我把那个网架模型的荷载重新算了一遍，发现之前用的组合系数有问题。"), _cut)
+    check("截断以省略号收尾", _cut.endswith("…"), _cut)
+
+    # 一句就超限：只能硬切，但仍要 ≤ limit，且优先断在逗号
+    _one = "这是一个非常长的句子" * 8
+    _hard = context.limit_length(_one)
+    check("单句超长也能截到上限内", len(_hard) <= 41, len(_hard))
+
+    # 代码块/表格走 detail 上限，不能砍语法
+    _code = "```python\nfor i in range(10):\n    print(i)\n```"
+    check("含代码块时用更宽的上限", context.limit_length(_code) == _code, repr(_code))
+
+    # 多行结构：截断不能把换行吞掉
+    _multi = "第一点。\n第二点。\n第三点。\n第四点。\n第五点。\n"
+    _mcut = context.limit_length(_multi)
+    check("多行截断保留换行", "\n" in _mcut or len(_mcut) <= 40, repr(_mcut))
+
+    # 问机制 → 走 detail 上限
+    _detail = context.limit_length(_long, question="详细说说你的图片机制")
+    check("问机制时放宽到 detail 上限", len(_detail) > 40, len(_detail))
+
+    # 0 = 不限
+    settings.set_value("reply_max_chars", 0)
+    check("上限配 0 时不截断", context.limit_length(_long) == _long)
+finally:
+    settings.set_value("reply_max_chars", _old_max if _old_max is not None else 60)
+    settings.set_value("reply_max_chars_detail", _old_detail if _old_detail is not None else 400)
+
+print("\n=== 示例场景词（context._scene_of）===")
+# 场景词是**示例库的唯一检索入口**：示例的 tags 只有在 `_tags_of(item) & want` 非空时
+# 才会被注入（persona_examples.pick）。词表里没有的场景 = 那条示例存了也永远不生效，
+# 所以这里把每个场景各钉一条真实语料当回归。
+for _text, _want in [
+    ("你看看，又记错了，我早就做完了呀", "纠正"),
+    ("毕竟要加班的嘛", "吐槽"),
+    ("抱一下", "亲密"),
+    ("帮我查一下天气", "指令"),
+    ("为什么会这样呢", "提问"),
+    ("今天天气不错", "分享"),          # 2026-11-03 判类重写后：「今天」= 分享（旧实现无命中）
+]:
+    _got = context._scene_of(_text)
+    check(f"「{_text[:10]}…」→ {_want}", _got == _want, _got)
+# 「闲聊」只留给真的判不出来的句子 —— 它不对应任何语料，等于不注入
+check("判不出来时退回「闲聊」", context._scene_of("哦哦好的我知道了") == "闲聊",
+      context._scene_of("哦哦好的我知道了"))
+
+print("\n=== observe 不再按词表改情绪（P3）===")
+# 原来 `谢谢 → mood+0.04`、`滚 → mood-0.05`：把「他夸我」和「他引述别人骂我」算成同一件事。
+# 现在只消费 scene.judge() 的结论，且只在 confidence=clear 时动手。
+from ai_chat import persona_vector as _pv  # noqa: E402
+
+
+def _obs(text: str) -> dict:
+    return _pv.observe(text, conv="g_obs_test", uid="111")
+
+
+# 硬辱骂在规则层只给 fuzzy（「垃圾分类」也含「垃圾」），所以**不单独触发情绪**：
+# 要等语境确认为「骂且指向本人」——见下一条。这是 2026-11-03 审阅后收紧的。
+_d = _obs("你这个废物，什么都干不好")
+check("硬辱骂不再直接改情绪（等语境确认）", "mood" not in _d, _d)
+_d_ok = _pv.observe("你这个废物，什么都干不好", conv="g_obs_test", uid="111",
+                    verdict={"act": "骂", "target": "bot", "confidence": "clear"})
+check("语境确认为「骂且指向本人」→ 降 mood / 升 defiance",
+      _d_ok.get("mood", 0) < 0 and _d_ok.get("defiance", 0) > 0, _d_ok)
+_d_fuzzy = _pv.observe("你这个废物", conv="g_obs_test", uid="111",
+                       verdict={"act": "骂", "target": "bot", "confidence": "fuzzy"})
+check("置信度不是 clear → 不动情绪", "mood" not in _d_fuzzy, _d_fuzzy)
+
+check("「谢谢你」不再加分（词表已删）", "mood" not in _obs("谢谢你啊"), _obs("谢谢你啊"))
+check("「滚」单独出现不触发（指向不明）", "mood" not in _obs("滚"), _obs("滚"))
+check("「小笨蛋」不更新（规则层判不出语境）", "mood" not in _obs("理由是这个呀，小笨蛋"),
+      _obs("理由是这个呀，小笨蛋"))
+
+_d2 = _obs("可以抱你一下吗")
+check("对本人表达亲密 → 升 mood", _d2.get("mood", 0) > 0, _d2)
+
+_d3 = _obs("我老板今天骂我废物")
+check("骂的是第三方 → 不动她的情绪", "mood" not in _d3, _d3)
+
+# ---- 夸赞（2026-11-03 按 #0007 加）----
+# 规则层对夸赞**只给 fuzzy**：`scene.judge()` 不返回 tone，讽刺与玩笑式夸它判不了。
+# 所以这里要分两段验：原文路径进不来、深判确认后才动情绪。
+_k1 = _obs("你真厉害")
+check("原文「你真厉害」不升情绪（规则层只有 fuzzy，等深判）", "mood" not in _k1, _k1)
+
+_k2 = _obs("老板说你真厉害")
+_s2 = __import__("ai_chat.scene", fromlist=["judge"]).judge("老板说你真厉害")
+check("转述式夸赞不当成自己被夸", _s2.get("target") != "bot" or "mood" not in _k2, _s2)
+
+_k3 = _pv.observe("你真厉害", conv="g_obs_test", uid="111",
+                  verdict={"act": "夸赞", "target": "bot", "confidence": "clear",
+                           "tone": "亲昵"})
+check("深判确认的夸赞 → 升 mood / social",
+      _k3.get("mood", 0) > 0 and _k3.get("social", 0) > 0, _k3)
+
+_k4 = _pv.observe("你可真厉害啊", conv="g_obs_test", uid="111",
+                  verdict={"act": "夸赞", "target": "bot", "confidence": "clear",
+                           "tone": "开玩笑"})
+check("玩笑式夸赞 → 不升情绪（产品选择，见 #0007）", "mood" not in _k4, _k4)
+
+_k5 = _pv.observe("老板说你真厉害", conv="g_obs_test", uid="111",
+                  verdict={"act": "夸赞", "target": "bot", "confidence": "fuzzy",
+                           "tone": "亲昵"})
+check("夸赞不是 clear → 不动情绪", "mood" not in _k5, _k5)
+
+print("\n=== 深判结果与检索共用同一份判断（§13.4）===")
+# 规则层判不出的句子，深判给出 act 后写进 last_turn；检索侧必须**读同一份**，
+# 否则会出现「observe 判被骂、检索判亲昵」那种分裂。
+from ai_chat import scene_state as _sst_deep  # noqa: E402
+
+_deep_conv = "g_deep_test"
+_sst_deep.save(_deep_conv, _sst_deep.empty(_deep_conv))
+# 检索侧**不再按文本前缀去状态里捞旧判断**（会串），而是由调用方把深判结果
+# 显式传成 `scene_hint`。这两条一起钉住「同源」与「不串会话」。
+check("规则层对软词给「闲聊」（不注入）",
+      context._scene_of("小笨蛋，伞又忘拿了吧") == "闲聊",
+      context._scene_of("小笨蛋，伞又忘拿了吧"))
+check("没过深判的句子仍走规则层",
+      context._scene_of("今天加班累死了") == "吐槽",
+      context._scene_of("今天加班累死了"))
+# scene_hint 由 `_reply` 里显式传给 `context.build`，不经 `_scene_of`——
+# 这样检索用的就是**本轮那份解释**，不必按文本去状态里捞（会串会话）。
+import inspect as _insp  # noqa: E402
+check("build 支持 scene_hint 参数", "scene_hint" in _insp.signature(context.build).parameters)
+check("system_prompt 支持 scene_hint 参数",
+      "scene_hint" in _insp.signature(context.system_prompt).parameters)
+
+print("\n=== 示例检索：2-gram 兜底（persona_examples）===")
+# 修的是这个 bug：示例只按标签命中，标签写歪就永远出不来（22 条里 4 条死条目）。
+# 文档 §6.3 写了「2-gram 重叠×2」，代码里一直没有 —— 这里把两种情况都钉住：
+# 标签能命中的照旧走标签；标签命不中的靠上文相似救回来；都不像的不许注入。
+_pex = sys.modules["ai_chat.persona_examples"]
+_orig_pex_path = _pex._path
+_pex._path = lambda: ROOT / "persona" / "packs" / "whale_v2" / "examples" / "examples.jsonl"
+try:
+    def _pick_by(text: str) -> list[str]:
+        """按真实调用方式（query + 场景）挑一次，返回命中的 id。"""
+        got = _pex.pick(is_master=False, uid="", private=False, query=text,
+                        scenes=[context._scene_of(text)])
+        return [x["id"] for x in got["good"]] + [x["id"] for x in got["bad"]]
+
+    _hit = _pick_by("爱死你了大肥鱼")
+    check("「爱死你了大肥鱼」→ ex-name-01（标签命不中，靠 2-gram）",
+          "ex-name-01" in _hit, _hit)
+
+    _hit2 = _pick_by("你看看，又记错了，我早就做完了呀")
+    check("「又记错了」→ ex-misremember-01", "ex-misremember-01" in _hit2, _hit2)
+
+    _none = _pick_by("哦哦好的我知道了")
+    check("无关的话不注入任何示例", not _none, _none)
+
+    _share = _pick_by("今天天气不错")
+    check("分享场景现在能命中示例（旧实现里是死条目）", _share != [], _share)
+
+    _other = _pex.pick(is_master=False, uid="", private=False, query="抱一下",
+                       scenes=[context._scene_of("抱一下")])
+    check("非主人拿不到 audience:master 的示例",
+          all("audience:master" not in (x.get("tags") or []) for x in _other["good"]),
+          [x["id"] for x in _other["good"]])
+finally:
+    _pex._path = _orig_pex_path
+
+print("\n=== 注意力顺带产出语境（scene_state）===")
+# 方案 §14.2：语境增量挂在本来就有的 attention 打分调用上，不新开一条串行链。
+# 关键约束：**拿不到 scene 不能影响 score**，非法字段只丢那一个。
+from ai_chat import scene_state as _sst  # noqa: E402
+from ai_chat import attention as _attn  # noqa: E402
+
+_ctx_conv = "g_ctx_test"
+_sst.save(_ctx_conv, _sst.empty(_ctx_conv))
+_attn._note_scene(_ctx_conv, {"mode": "互相调侃", "topic": "体测跳远",
+                                  "confidence": "clear"},
+                      message_id=901, speaker="群友A", uid="111")
+_ctx = _sst.load(_ctx_conv)
+check("scene 摘要写进语境状态", _ctx["mode"] == "互相调侃" and _ctx["topic"] == "体测跳远",
+      _ctx)
+check("说话者被记进 partners", _ctx["partners"].get("111") == "群友A", _ctx["partners"])
+
+_attn._note_scene(_ctx_conv, {"mode": "胡说八道", "confidence": "maybe"},
+                      message_id=902)
+_ctx2 = _sst.load(_ctx_conv)
+check("非法 mode / confidence 被丢弃", _ctx2["mode"] == "互相调侃" and _ctx2["confidence"] == "clear",
+      _ctx2)
+
+_attn._note_scene(_ctx_conv, {"mode": "争执"}, message_id=None)
+_ctx3 = _sst.load(_ctx_conv)
+check("没有 message_id 时不覆盖上一条的 last_turn",
+      (_ctx3.get("last_turn") or {}).get("message_id") == 901, _ctx3.get("last_turn"))
+check("正常字段仍然更新", _ctx3["mode"] == "争执", _ctx3["mode"])
+
+_attn._note_scene(_ctx_conv, None, message_id=903)
+check("scene 缺失不影响已有状态", _sst.load(_ctx_conv)["mode"] == "争执")
+
+_sst.save("g_ctx_empty", _sst.empty("g_ctx_empty"))
+_attn._note_scene("g_ctx_empty", {"topic": ""}, message_id=904)
+check("空 topic 不写空值", _sst.load("g_ctx_empty")["topic"] == "",
+      _sst.load("g_ctx_empty")["topic"])
+
+# 人格 v2 的隔离回归：不依赖网络或在线运行数据。
+_reg_spec = importlib.util.spec_from_file_location("persona_learning_regression", ROOT / "验证" / "_人格学习回归.py")
+_reg_module = importlib.util.module_from_spec(_reg_spec)
+_reg_spec.loader.exec_module(_reg_module)
+_reg_module.run(check)
 
 # --------------------------------------------------------------------- 收尾
 # **先把还开着的 sqlite 句柄关掉**

@@ -167,6 +167,8 @@ def _spec_override(role: str) -> str:
         "forbidden": "ai_chat_forbidden_file",
         "surface": "ai_chat_surface_file",
         "traits": "ai_chat_traits_file",  # 新增：给"注册表放别处"留的口子
+        "vector": "ai_chat_vector_file",
+        "examples": "ai_chat_examples_file",
     }[role]
     raw = getattr(_cfg, field, None)
     return "" if raw is None else str(raw).strip()
@@ -253,6 +255,10 @@ def _pack_bot_name() -> str:
 
 
 def surface_file_path() -> Path:
+    from .persona_workspace import root as workspace_root
+    if workspace_root() is not None:
+        return workspace_root() / "surface.txt"
+
     """表层人设的**读写路径**。
 
     * **没有显式配 `AI_CHAT_SURFACE_FILE`**（正常情况）：落在当前人格包的运行数据目录
@@ -271,7 +277,41 @@ def surface_file_path() -> Path:
     return packs.stage_dir() / name
 
 
+def layer_override_path(role: str) -> Path:
+    from .persona_workspace import root as workspace_root
+    if workspace_root() is not None:
+        return workspace_root() / (role + ".txt")
+
+    """底层/禁止事项的**运行时覆盖文件**（`data/runtime/persona/<包>/<role>.txt`）。
+
+    为什么需要它：评估驱动的修订允许改这三层，但 `base.txt` / `forbidden.txt`
+    在 `persona/packs/` 里是**打进镜像的源文件**，容器重建就丢。覆盖文件落在卷里，
+    读取时优先用它，源文件只在没有覆盖时兜底 —— 与表层人设同一套形态。
+    """
+    name = {"base": "base.txt", "forbidden": "forbidden.txt", "surface": "surface.txt"}[role]
+    return packs.stage_dir() / name
+
+
+def layer_file_path(role: str) -> Path:
+    """某一层**可写**的落点：表层用 `surface_file_path()`，另外两层用覆盖文件。"""
+    if role == "surface":
+        return surface_file_path()
+    return layer_override_path(role)
+
+
+def layer_is_overridden(role: str) -> bool:
+    if role == "surface":
+        return surface_file_path().exists()
+    if not packs.active_id():
+        return False
+    return layer_override_path(role).exists()
+
+
 def persona_data_dir() -> Path:
+    from .persona_workspace import root as workspace_root
+    if workspace_root() is not None:
+        return workspace_root()
+
     """**当前人格**的运行状态目录；和只读的人格源文件分开，也和别的人格分开。
 
     正常情况就是 `data/runtime/persona/<包>/`。
@@ -401,7 +441,17 @@ def _persona_layer(role: str) -> str:
     三层都用它，所以**不要**在别处再 `path.read_text()` 一次 —— 那条路不会
     跟着换包失效，于是"切了人格但某一层还是旧的"，而且只在切过之后才出现。
     """
+    from .persona_workspace import root as workspace_root
+    if workspace_root() is not None:
+        return _read_text_file(workspace_root() / (role + ".txt"), label=role)
     persona_generation()  # 先对齐代际：换包时这一步会清掉 memo
+    # 底层/禁止事项一旦有运行时覆盖，就**每次现读**（评估驱动的修订会改它）——
+    # 缓存会让改动等到重启才生效，与"立即生效"的承诺冲突。
+    if role in ("base", "forbidden") and packs.active_id():
+        override = layer_override_path(role)
+        if override.exists():
+            label = {"base": "底层人设", "forbidden": "禁止事项"}[role]
+            return _read_text_file(override, label=label)
     if role in _persona_memo:
         return _persona_memo[role]
     configured = _spec_override(role)
@@ -604,8 +654,14 @@ def persona_layers() -> dict[str, str]:
         "base": _base_layer(),
         "forbidden": _forbidden_layer(),
         "surface": load_surface(),
-        "base_file": _rel_to_root(persona_file_path()),
-        "forbidden_file": _rel_to_root(forbidden_file_path()),
+        "base_file": _rel_to_root(
+            layer_override_path("base") if layer_is_overridden("base") else persona_file_path()
+        ),
+        "forbidden_file": _rel_to_root(
+            layer_override_path("forbidden")
+            if layer_is_overridden("forbidden")
+            else forbidden_file_path()
+        ),
         "surface_file": _rel_to_root(surface_file_path()),
         "traits_file": _rel_to_root(traits_file_path()),
     }
@@ -646,7 +702,11 @@ def switch_persona(pack_id: str, *, sync_identity: bool = True) -> dict[str, Any
     got = packs.switch(pack_id)
     got["identity"] = {}
     got["identity_note"] = ""
-    if not got.get("ok") or not sync_identity:
+    if not got.get("ok"):
+        return got
+    # v2 的矢量定义与示例也要先播种到新包的运行目录，否则切过去会"有包没情绪"。
+    got["seeded_v2"] = seed_v2_for(str(got["id"]))
+    if not sync_identity:
         return got
     patch = packs.identity_patch(str(got["id"]))
     if not patch:
@@ -687,6 +747,71 @@ def seed_surface_for(pack_id: str) -> str:
         return "表层人设：已为 %s 播种 %s" % (pid, _rel_to_root(target))
     except OSError as exc:
         return "表层人设：给 %s 播种失败（%s）" % (pid, type(exc).__name__)
+
+
+def seed_v2_for(pack_id: str) -> str:
+    """给 v2 包播种 `vector.json` 与 `examples.jsonl`（幂等）。
+
+    为什么也落在运行数据目录：评估台要改矢量参数、增删示例，而 `persona/packs/`
+    是打进镜像的只读源文件；读写都走 `data/runtime/persona/<id>/` 才不会重建即丢。
+    读路径优先运行副本，没有才回退包内源文件（见 `vector_file_path`）。
+    """
+    pid = packs.resolve_id(pack_id) or str(pack_id or "").strip()
+    if not pid:
+        return "v2：包 id 为空，未播种"
+    done: list[str] = []
+    for role in ("vector", "examples"):
+        seed = packs.pack_file(pid, role)
+        if not seed.is_file():
+            continue
+        target = packs.stage_dir(pid) / Path(packs.PACK_FILES[role]).name
+        if target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp")
+            tmp.write_bytes(seed.read_bytes())
+            tmp.replace(target)
+            done.append(_rel_to_root(target))
+        except OSError as exc:
+            logger.warning("给 %s 播种 %s 失败：%s", pid, role, type(exc).__name__)
+    if not done:
+        return "v2：没有需要播种的文件"
+    return "v2：已播种 " + "、".join(done)
+
+
+def vector_file_path() -> Path:
+    """行为矢量定义：运行副本优先，否则包内 `vector.json`。"""
+    override = persona_data_dir() / Path(packs.PACK_FILES["vector"]).name
+    if override.is_file():
+        return override
+    return persona_source_path("vector")
+
+
+def examples_file_path() -> Path:
+    """示例库：运行副本优先，否则包内 `examples/examples.jsonl`。"""
+    override = persona_data_dir() / Path(packs.PACK_FILES["examples"]).name
+    if override.is_file():
+        return override
+    return persona_source_path("examples")
+
+
+def vector_state_path() -> Path:
+    return persona_data_dir() / "vector_state.json"
+
+
+def relations_path() -> Path:
+    return persona_data_dir() / "relations.json"
+
+
+def load_vector() -> dict[str, Any]:
+    """读矢量定义。读不到或结构不对返回空 dict（调用方用内置默认）。"""
+    path = vector_file_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 # ---------------------------------------------------------------- 当前时间
@@ -899,6 +1024,26 @@ MSG_NO_QUESTION: str = getattr(
 # 运行时数据目录（`_data_dir()` 定义在文件前段：表层人设的路径在导入期就要用它）
 LOG_DIR: Path = _data_dir()
 
+
+def runtime_root() -> Path:
+    """运行时状态根：**回放沙盒内指向 `root()/_runtime`，否则就是 `LOG_DIR`**。
+
+    为什么要这个函数（#0015 P1-1）：`LOG_DIR` 是**导入期常量**，`persona_workspace.use()`
+    管不到它 —— 而会话摘要、场景状态、发送事件、记忆库、检索索引、聊天记录全在它下面。
+    回放时若沿用线上根，就会把「事后发生的摘要/场景/记忆」带进目标轮，
+    这样跑出来的 trace 不是历史回放，而是「拿今天的记忆评昨天的回复」。
+
+    生产路径行为不变：workspace 为空时原样返回 `LOG_DIR`。
+    回放侧只要 `use(root/_runtime)`，这 6 处读写就自动落到沙盒。
+    """
+    from .persona_workspace import root as workspace_root
+
+    frozen = workspace_root()
+    if frozen is not None:
+        return Path(frozen) / "_runtime"
+    return LOG_DIR
+
+
 # 表情包库（与聊天记录同级，一起被归档引擎排除）
 STICKER_DIR: Path = LOG_DIR / "stickers"
 
@@ -918,3 +1063,24 @@ WEBUI_AUTH_TOKEN: str = str(getattr(_cfg, "ai_chat_webui_auth_token", "") or "")
 
 # 写盘时是否缩进美化（true 便于人工查看，但文件更大、写入更慢）。
 LOG_PRETTY: bool = _as_bool(getattr(_cfg, "ai_chat_log_pretty", False), False)
+
+# ---------------------------------------------------------------- 语音（TTS）
+# 只有「显式 /语音 指令」走这条路；不接普通回复，避免每条文字都合成一条语音。
+# endpoint 指向服务器上的 `tts-relay`（见 deploy/tts_relay.py），由它鉴权并转发到
+# Windows 上的 GPT-SoVITS（SSH 反向隧道）。客户端不持有服务端细节。
+TTS_ENABLED: bool = _as_bool(getattr(_cfg, "tts_enabled", False), False)
+TTS_ENDPOINT: str = str(getattr(_cfg, "tts_endpoint", "") or "").strip()
+TTS_TOKEN: str = str(getattr(_cfg, "tts_token", "") or "").strip()
+# 参考音色由**服务端**读取：这是 Windows 上的绝对路径，bot 容器里没有这个文件。
+TTS_REF_AUDIO: str = str(getattr(_cfg, "tts_ref_audio", "") or "").strip()
+TTS_PROMPT_TEXT: str = str(getattr(_cfg, "tts_prompt_text", "") or "").strip()
+TTS_PROMPT_LANG: str = str(getattr(_cfg, "tts_prompt_lang", "zh") or "zh")
+TTS_TEXT_LANG: str = str(getattr(_cfg, "tts_text_lang", "zh") or "zh")
+TTS_MAX_CHARS: int = _as_int(getattr(_cfg, "tts_max_chars", 150), 150)
+TTS_MAX_SECONDS: float = _as_float(getattr(_cfg, "tts_max_seconds", 30), 30.0)
+TTS_MAX_BYTES: int = _as_int(getattr(_cfg, "tts_max_bytes", 3 * 1024 * 1024), 3 * 1024 * 1024)
+TTS_CONNECT_TIMEOUT: float = _as_float(getattr(_cfg, "tts_connect_timeout", 3), 3.0)
+TTS_TOTAL_TIMEOUT: float = _as_float(getattr(_cfg, "tts_total_timeout", 20), 20.0)
+# 首版只放行明确列出的用户/群；空 = 只允许主人。不做"任意人可触发 GPU 合成"。
+TTS_ALLOWED_USERS: list[int] = list(getattr(_cfg, "tts_allowed_users", None) or [])
+TTS_ALLOWED_GROUPS: list[int] = list(getattr(_cfg, "tts_allowed_groups", None) or [])

@@ -51,12 +51,12 @@ def conversation_id(group_id: int | None, user_id: int) -> str:
 
 
 def _path_for(conv: str) -> Path:
-    return config.LOG_DIR / f"chatlog_{conv}.json"
+    return config.runtime_root() / f"chatlog_{conv}.json"
 
 
 def _archive_path_for(conv: str) -> Path:
     """溢出归档文件。用 `.jsonl`：一行一条，追加即可，不需要读回全量再重写。"""
-    return config.LOG_DIR / f"chatlog_{conv}.archive.jsonl"
+    return config.runtime_root() / f"chatlog_{conv}.archive.jsonl"
 
 
 def _lock_for(conv: str) -> asyncio.Lock:

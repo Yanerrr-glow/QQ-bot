@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from nonebot import get_driver
 
@@ -28,6 +30,29 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 # 密钥类参数的掩码。与 `llm.py` 对档案密钥的处理同一套约定：
 # **显示时替换成它，回写时见到它就原样保留**（见 `Spec.secret` 与 `_Store.set`）。
 _MASK = "***"
+
+
+# 任务局部的参数覆盖（#0015 P1-2）。**只给回放/验证用，不进控制台、不落盘。**
+#
+# 为什么不能用「改 `store._runtime` + finally 还原」：那是进程级共享状态，
+# 而聊天是并发的 —— `await` 期间别的请求会读到测试配置（少发或多发一句话都算事故）。
+# ContextVar 的语义正好是「只影响当前任务」，且嵌套时按栈回退。
+_override: ContextVar[dict[str, Any] | None] = ContextVar("settings_override", default=None)
+
+
+@contextmanager
+def override(values: dict[str, Any]) -> Iterator[None]:
+    """在 with 块内让 `get(key)` 返回给定值；出块自动恢复。
+
+    只覆盖**传入的键**，其余照常读运行时/.env/Spec，所以可以只冻住与回放有关的那几项。
+    `set()` 不受影响 —— 覆盖期内写参数仍然写真实存储，这是故意的：
+    把「读」与「写」分成两条路，避免测试代码顺手改坏线上配置。
+    """
+    token = _override.set(dict(values or {}))
+    try:
+        yield
+    finally:
+        _override.reset(token)
 
 
 @dataclass(frozen=True)
@@ -122,6 +147,16 @@ _SPECS: list[Spec] = [
     Spec("sentence_split_delay", float, "ai_chat_sentence_split_delay", 0.9,
          "分条之间的间隔（秒）", "上下文", 0.2, 10.0,
          hint="像真人打字那样停一下。太快会被风控判成刷屏，太慢会显得卡"),
+    # ---- 回复长度上限 ----
+    # **代码保证，不靠提示词**（与 behavior.py 同一个理由：抽象规则压不过长人设）。
+    # 截断按句边界做，宁短一句不断半句；超限记日志，便于观察是不是人设在教它写长。
+    Spec("reply_max_chars", int, "ai_chat_reply_max_chars", 60, "整轮回复字数上限", "上下文", 0, 2000,
+         hint="普通闲聊的硬上限，超了按句截断。0 = 不限。默认 60：群里一条正常回复十几到几十字，"
+              "再长就像在念稿。人设里已经写了「短」，这一项是兜底而不是替代"),
+    Spec("reply_max_chars_detail", int, "ai_chat_reply_max_chars_detail", 400,
+         "问正事时的字数上限", "上下文", 0, 4000,
+         hint="以下任一情况改用这个上限：当前模式=专注（对方在问技术/故障/要方案）、"
+              "对方在问你的设定或机制、回答里有代码块或表格。0 = 沿用上面的闲聊上限"),
     Spec("reply_to_images", bool, "ai_chat_reply_to_images", False,
          "对纯图片消息也回应", "上下文",
          hint="默认关闭：只发图不配字时保持安静（免得一句「在的」把话头打断）。"
@@ -162,29 +197,10 @@ _SPECS: list[Spec] = [
          hint="把「别那么啰嗦」「叫我哥哥」这类**说话方式**的要求记进账本，"
               "**不会改任何人设**。它的用途是积累数据、也是自我迭代最看重的输入。"
               "内容偏好（喜欢什么）走长期记忆，不在这里。用 /人设 信号 看账本"),
-    # ---------------------------------------------------------- 人格自我迭代（路线 C）
-    # 三层结构里**唯一有写权限**的东西，且只能写表层人设、必须先过冲突闸门。
-    # 底层人设与禁止事项连写路径都不存在（见 persona.py 的三层说明）。
-    Spec("persona_iter_enabled", bool, "ai_chat_persona_iter_enabled", True,
-         "启用人格自我迭代", "人设",
-         hint="定期反思最近的聊天，往**表层人设**里加说话方式。"
-              "与底层人设或禁止事项冲突的条目会被**直接丢弃、不写入**；"
-              "合规的条目默认进**候选池**等你采纳（见下面那项），"
-              "每次改动都会通知你，并可用 /人设 撤回 撤销"),
-    Spec("persona_iter_auto_apply", bool, "ai_chat_persona_iter_auto_apply", False,
-         "自动迭代直接生效（跳过人工采纳）", "人设",
-         hint="**默认关**：迭代产出的合规条目先进候选池，你用 /人设 候选 看、"
-              "/人设 采纳 <序号> 才写进表层。开着则退回改造前的行为 —— 过闸门即生效。"
-              "闸门只拦「碰铁律」，拦不住**风格跑偏**（学成话痨、学成另一个语气），"
-              "所以人工采纳这一步默认不省"),
-    Spec("persona_iter_interval", int, "ai_chat_persona_iter_interval", 21600,
-         "自我迭代间隔（秒）", "人设", 1800, 604800,
-         hint="默认 6 小时。太频繁会反复提议同一件事（闸门会去重，但白花 token）"),
-    Spec("persona_iter_max", int, "ai_chat_persona_iter_max", 2, "每次最多写入几条", "人设", 1, 8,
-         hint="一次改太多就没法判断是哪条起了作用。宁可每次一两条"),
-    Spec("persona_iter_min_lines", int, "ai_chat_persona_iter_min_lines", 20,
-         "至少多少行对话才反思", "人设", 5, 500,
-         hint="对话太少时没有判断依据，只会让它瞎猜"),
+    # ---------------------------------------------------------- 人格自我迭代（已停用）
+    # 2026-10-24 起，旧的「定期反思 → 候选池」自动迭代被删除；
+    # 人设修订改由**评估结果**驱动（见下面「人设评估台」与 persona_revise.py）。
+    # 旧参数不再注册，`settings.json` 里残留的同名键会被忽略。
     # ---------------------------------------------------------- 表层预算（闸门）
     # 表层的**条目级**长度早就限了（`persona._MIN_ITEM` / `_MAX_ITEM`），但**总量**没有上限：
     # 6 小时一轮 × 每轮最多 2 条 = 一天最多 8 条，而它是唯一会自己长大的 prompt 段落。
@@ -264,18 +280,6 @@ _SPECS: list[Spec] = [
          hint="1.0 = 每次提到都回；调低可以避免它太吵"),
     Spec("wake_cooldown", int, "ai_chat_wake_cooldown", 60, "两次唤醒的最小间隔（秒）", "唤醒", 0, 3600,
          hint="防止有人刷屏喊它时它跟着一起刷屏"),
-    # ---------------------------------------------------------- 随机插话
-    Spec("random_reply_enabled", bool, "ai_chat_random_reply", False, "随机插话", "随机插话",
-         hint="群里聊天没叫它，也按概率接一句。默认关闭 —— 它比「唤醒」更容易显得吵"),
-    Spec("random_reply_chance", float, "ai_chat_random_reply_chance", 0.05,
-         "每条群消息的接话概率", "随机插话", 0.0, 1.0,
-         hint="注意是【每条消息】都掷一次骰；群越活跃，实际触发越频繁"),
-    Spec("random_reply_cooldown", int, "ai_chat_random_reply_cooldown", 600,
-         "两次随机插话的最小间隔（秒）", "随机插话", 0, 86400,
-         hint="主要用来防刷屏：没有它，活跃群里的实际频率会失控"),
-    Spec("random_reply_min_chars", int, "ai_chat_random_reply_min_chars", 4,
-         "太短的消息不接（字数）", "随机插话", 0, 200,
-         hint="「哈哈」「?」这种没什么可接的，直接跳过"),
     # ---------------------------------------------------------- 表情包
     Spec("sticker_enabled", bool, "ai_chat_sticker_enabled", True, "启用表情包库", "表情包"),
     Spec("sticker_chance", float, "ai_chat_sticker_chance", 0.25, "回复时附表情包的概率", "表情包", 0.0, 1.0),
@@ -549,21 +553,11 @@ _SPECS: list[Spec] = [
          "判定出的模式沿用多久（秒）", "说话模式", 0, 86400,
          hint="模式影响的是整段对话的语气。上一条在问报错、这一条说「谢谢」，"
               "沿用同一个模式才不会突然换个人。设 0 = 每条消息都重新判"),
-    # ---------------------------------------------------------- 主动发言
-    Spec("proactive_enabled", bool, "ai_chat_proactive_enabled", False, "启用主动发言", "主动发言",
-         hint="默认关闭，确认效果后再打开"),
-    Spec("proactive_interval", int, "ai_chat_proactive_interval", 600, "定时掷骰间隔（秒）", "主动发言", 30, 86400),
-    Spec("proactive_chance", float, "ai_chat_proactive_chance", 0.10, "定时掷骰的发言概率", "主动发言", 0.0, 1.0),
-    Spec("proactive_msg_threshold", int, "ai_chat_proactive_msg_threshold", 30, "每累计多少条群消息掷一次骰", "主动发言", 1, 5000),
-    Spec("proactive_msg_chance", float, "ai_chat_proactive_msg_chance", 0.15, "按消息数触发的发言概率", "主动发言", 0.0, 1.0),
-    Spec("proactive_cooldown", int, "ai_chat_proactive_cooldown", 1800, "两次主动发言的最小间隔（秒）", "主动发言", 60, 86400),
-    Spec("proactive_active_window", int, "ai_chat_proactive_active_window", 1800, "群多久没人说话就不再主动发言（秒）", "主动发言", 60, 86400),
-    Spec("proactive_max_per_day", int, "ai_chat_proactive_max_per_day", 20, "每群每天主动发言上限（0=不限）", "主动发言", 0, 1000),
     # ---------------------------------------------------------- 定时问候
-    # 这是唯一「必须说」的通道：到点就对主人问早/中/晚安，不像主动发言那样允许 [SKIP]。
+    # 这是唯一「必须说」的通道：到点就对主人问早/中/晚安。
     # 时间点写 HH:MM，**留空即关闭该时段**（所以不需要每段再加一个开关）。
     Spec("greet_enabled", bool, "ai_chat_greet_enabled", False, "启用定时问候", "定时问候",
-         hint="默认关闭（跟主动发言同理：确认时间点和发送对象没问题再打开）。"
+         hint="默认关闭（确认时间点和发送对象没问题再打开）。"
               "打开后到点对主人说早/午/晚安，每段每天各一次"),
     Spec("greet_morning", str, "ai_chat_greet_morning", "08:00", "早安时间（HH:MM，留空=不发）", "定时问候"),
     Spec("greet_noon", str, "ai_chat_greet_noon", "12:30", "午安时间（HH:MM，留空=不发）", "定时问候"),
@@ -584,9 +578,44 @@ _SPECS: list[Spec] = [
     # ---------------------------------------------------------- 人设评估台
     # 论文（Chen et al. 2025, Persona Vectors）那套「对比素材 + 0-100 打分」的落地。
     # **总闸关着时一次模型都不调** —— 这是这一组开关存在的全部意义。
+    Spec("scene_judge_timeout", float, "ai_chat_scene_judge_timeout", 12.0,
+         "语境深判超时（秒）", "人设评估", 2.0, 30.0,
+         hint="只在规则层标了「需要语境」时才调用（如「小笨蛋」这类判不出褒贬的词）。"
+              "超时就按 unknown 处理，本轮不注入示例、不更新情绪——**不退化成词表猜测**"),
+    Spec("scene_judge_thinking", str, "ai_chat_scene_judge_thinking", "disabled",
+         "深判的思考档", "人设评估",
+         hint="可填 disabled / adaptive / enabled，留空则用接口默认。**默认 disabled 是实测结论**："
+              "9 条多轮样本下关闭思考 act 命中 7/9、中位 2.0 秒；接口默认档 5/9、10.8 秒，"
+              "而且思维链会先吃掉输出预算（900 时实测正文为空）。它只影响深判这一次调用"),
+    Spec("sticker_text_chance", float, "ai_chat_sticker_text_chance", 0.2,
+         "回复末尾缀颜文字的概率", "表情", 0.0, 1.0,
+         hint="0 = 关。与图片表情**分开**：只想要颜文字不想要图，把 `sticker_chance` 设 0 即可。"
+              "还会乘一次模式缩放（专注/安慰时少加）；同一条不会连着出现两次"),
+    Spec("scene_reuse_ttl", float, "ai_chat_scene_reuse_ttl", 0.0,
+         "深判结果复用时长（秒，0=关闭）", "人设评估", 0.0, 600.0,
+         hint="同一句话 + 同一上下文 + 边界未变 + 同人同语气时，复用上次深判、省一次模型调用。"
+              "**默认 0 = 关闭**：它只对「同一条消息被重复处理」（重试、双投递、手动重放）有效，"
+              "「连续三轮小笨蛋只判一次」属于相似消息复用，不在这个开关的范围内"),
+    Spec("scene_judge_max_tokens", int, "ai_chat_scene_judge_max_tokens", 900,
+         "深判输出预算（tokens）", "人设评估", 200, 4000,
+         hint="**含思考过程**：开思考时思维链先花这个预算再出正文，900 在样本上截断过；"
+              "关掉思考后正文约 400-500，900 够用。截断会记「被截断」而不是「按 unknown 处理」"),
     Spec("eval_enabled", bool, "ai_chat_eval_enabled", False, "启用评估台", "人设评估",
-         hint="打开后可以给每个特质生成测评素材、跑基线分、对候选做影子评估。"
-              "关着时一次模型都不调（评估要花 token，所以默认关）"),
+         hint="**同时是评估与自动修订的总闸**。打开后每天定时跑一轮评估，"
+              "并按结果改写人设；关着时一次模型都不调"),
+    Spec("eval_daily_hour", int, "ai_chat_eval_daily_hour", 3, "每天几点跑评估（0-23）", "人设评估", 0, 23,
+         hint="按**校准后的本地时间**。默认 03:00，避开聊天高峰；"
+              "评估 + 修订一轮会调用多次模型，白天跑可能和回复抢带宽"),
+    Spec("eval_propose_only", bool, "ai_chat_eval_propose_only", True,
+         "自动修订只生成提案", "人设评估",
+         hint="打开后定时评估只产出**待确认提案**，不写线上人格；用 /人设 提案 查看、采纳或拒绝。"
+              "关掉则恢复「复核通过即提交」。默认开 —— 让「会评分」和「有权改写」分开验证"),
+    Spec("eval_iter_enabled", bool, "ai_chat_eval_iter_enabled", True, "评估后自动修订人设", "人设评估",
+         hint="打开后，评估跑完会把「分数不达标的特质」整理成问题清单，"
+              "让模型做**段落级替换**并直接写入三层人设。"
+              "每次修订前整份备份，可用 /人设 撤回（或控制台）整版回滚"),
+    Spec("eval_iter_max_changes", int, "ai_chat_eval_iter_max_changes", 5, "每轮最多改几处", "人设评估", 1, 12,
+         hint="一处 = 一次「原文段落 → 新段落」的替换。改太多容易互相冲突，也难判断是哪处起效"),
     Spec("eval_judge_model", str, "ai_chat_eval_judge_model", "deepseek-chat", "裁判模型", "人设评估",
          choices=("deepseek-chat",),
          hint="**只能是 deepseek-chat**：flash / v4-pro 是推理模型，max_tokens=1 时可见内容为空、"
@@ -596,6 +625,181 @@ _SPECS: list[Spec] = [
               "调大更准、更贵"),
     Spec("eval_questions", int, "ai_chat_eval_questions", 6, "每个特质评几题", "人设评估", 1, 20,
          hint="从生成的评估题里取前 N 道。调大更稳、更贵：成本 ≈ 特质数 × 题数 × 采样次数 × 2 次调用"),
+
+    # ---------------------------------------------------------- 行为矢量（v2）
+    # 情绪是**状态**：有当前值、会衰减、有限幅。关掉后人格三层照常，
+    # 只是不再注入「此刻的状态」与关系差异。
+    Spec("vector_enabled", bool, "ai_chat_vector_enabled", True, "启用行为矢量（情绪与关系）", "人设",
+         hint="开启后每轮注入当前显著情绪与对当前对象的关系差异；"
+              "关掉只影响这两段，不改变人格三层"),
+    Spec("vector_llm_enabled", bool, "ai_chat_vector_llm_enabled", False, "允许模型自评情绪", "人设",
+         hint="模型可在回复末尾写 <vec mood=-0.04>；代码解析、限幅、剥离后再发。"
+              "默认关：只靠代码事件（被夸、被冷落、深夜）调整，更可控"),
+    Spec("vector_inject_top_k", int, "ai_chat_vector_inject_top_k", 2, "每轮注入几个轴", "人设", 1, 3,
+         hint="只注入显著偏离基线的轴，按偏离幅度排序；调大会更「有情绪」，也更占 token"),
+    Spec("vector_max_step", float, "ai_chat_vector_max_step", 0.08, "单轮单轴最大变化", "人设", 0.01, 0.2,
+         hint="所有轴的单轮上限的**全局天花板**；轴自己的 max_step 更小时以轴为准"),
+    Spec("vector_daily_limit", float, "ai_chat_vector_daily_limit", 0.5, "单日单轴最大变化", "人设", 0.1, 1.0,
+         hint="单日累计上限，跨日清零。防止连续负面事件把情绪压到底"),
+    Spec("vector_heat_enabled", bool, "ai_chat_vector_heat_enabled", True, "同类事件降温", "人设",
+         hint="同一个人短时间反复夸、反复亲密时，每次的效果按 1/(1+n/k) 递减。"
+              "**只压已确认的正向事件**：辱骂与深夜不降温（#0010 P1-3）"),
+    Spec("vector_heat_window", int, "ai_chat_vector_heat_window", 600, "降温窗口（秒）", "人设", 60, 3600,
+         hint="窗口内同类事件越多、本次效果越小；出窗重新计数。窗口也决定重启后热度是否还在"),
+    Spec("vector_heat_k", float, "ai_chat_vector_heat_k", 12.0, "降温常数 k", "人设", 1.0, 50.0,
+         hint="窗口内累计到 k 次时效果减半：k=12 即第 12 次是第一次的一半。调小更早「听腻」"),
+    Spec("vector_explain_enabled", bool, "ai_chat_vector_explain_enabled", True, "注入「为什么是这样」", "人设",
+         hint="在状态块里补一句原因（因为刚才那句夸赞）。只在能对上证据、方向相容、"
+              "没被后续事件推翻时才出现；没有依据就只说状态（#0011）"),
+    Spec("vector_explain_ttl_h", float, "ai_chat_vector_explain_ttl_h", 6.0, "原因有效期（小时）", "人设", 0.5, 48.0,
+         hint="超过这个时长的历史事件不再用来解释当前状态；面板里仍能看到，只是标成过期"),
+    Spec("vector_budget_chars", int, "ai_chat_vector_budget_chars", 380, "情绪块字数上限", "人设", 100, 800,
+         hint="包含「此刻的状态」与「对这个人」两块；超了按顺序截断"),
+    Spec("examples_budget_chars", int, "ai_chat_examples_budget_chars", 420, "示例块字数上限", "人设", 100, 900,
+         hint="按当前情绪/场景挑 1~2 条「可以怎么说」，外加 0~1 条「不能这么说」；没有命中就整块不注入"),
+    # ---------------------------------------------------------- 短期待办（#0012）
+    Spec("intent_enabled", bool, "ai_chat_intent_enabled", True, "记住没答完的事", "人设",
+         hint="他明确留下的未完成问题会记一小会儿，下一轮回复时提一句。"
+              "只借深判已有输出，不新增模型调用、不主动外发"),
+    Spec("intent_ttl_hours", float, "ai_chat_intent_ttl_hours", 3.0, "待办保留时长（小时）", "人设", 0.5, 12.0,
+         hint="过期的直接标 expired，不复活；沉默只是过期，不扣分、不算拒绝"),
+    Spec("intent_max_items", int, "ai_chat_intent_max_items", 5, "每人每会话上限", "人设", 1, 10,
+         hint="满了按「最先过期」淘汰；淘汰与终态都会留 7 天墓碑，防止重放又把旧的建回来"),
+    Spec("intent_reward_enabled", bool, "ai_chat_intent_reward_enabled", False, "兑现后加一点情绪", "人设",
+         hint="默认关。开也只走事件入口（intent_reward），不在这里算数值"),
+    # ---------------------------------------------------------- 候选轴（#0013，默认关）
+    Spec("vector_candidate_axes_enabled", bool, "ai_chat_vector_candidate_axes_enabled", False,
+         "启用候选轴（curiosity / stress）", "人设",
+         hint="默认关。开启后按「探索意愿 / 互动负荷」两个**实验轴**记状态，"
+              "作用域是话题/个人，不进线上五轴；只用离线回放评估，不做生产接入"),
+    Spec("vector_candidate_axes_file", str, "ai_chat_vector_candidate_axes_file", "",
+         "候选轴定义文件", "人设",
+         hint="留空 = 验证/行为维度_候选轴.json。**只读这一个文件**，不读线上人格包"),
+    Spec("relation_enabled", bool, "ai_chat_relation_enabled", True, "启用关系偏移", "人设",
+         hint="从人物画像与互动量派生「对这个人」的偏移；关掉后所有人一个态度"),
+    Spec("relation_max_offset", float, "ai_chat_relation_max_offset", 0.35, "关系偏移上限", "人设", 0.05, 0.6,
+         hint="单个轴上关系能贡献多少；负向另有硬下限（非主人 -0.15、主人 -0.2）"),
+
+    # ---------------------------------------------------------- 人设评估（v2 指标）
+    # 调度：每天 03:00 一次**小评估**（边界 + 可选少量像人），
+    # 每 `eval_big_every_days` 天一次**大评估**（完整像人 + 旧特质诊断 + 可选修订）。
+    # 「像人」的完整判别只在大评估跑，周期从每天拉长到 3 天。
+    Spec("eval_small_enabled", bool, "ai_chat_eval_small_enabled", True,
+         "每天跑一次小评估", "人设评估",
+         hint="小评估 = 边界检查 + 可计算指标；默认不跑旧特质分，也不跑完整像人判别"),
+    Spec("eval_small_samples", int, "ai_chat_eval_small_samples", 0,
+         "小评估像人样本数（0 = 不跑）", "人设评估", 0, 20,
+         hint="想每天看一个粗略的 L 就设 6~8；默认 0，把小评估留给边界"),
+    Spec("eval_big_every_days", int, "ai_chat_eval_big_every_days", 3,
+         "每几天跑一次大评估", "人设评估", 1, 30,
+         hint="大评估 = 完整像人判别 + 旧特质诊断 + 可选修订；默认 3 天"),
+    Spec("eval_big_samples", int, "ai_chat_eval_big_samples", 20,
+         "大评估像人样本数", "人设评估", 8, 40,
+         hint="低于 16 组只显示分数、不参与判定"),
+    Spec("eval_traits_on_big", bool, "ai_chat_eval_traits_on_big", True,
+         "大评估跑旧特质分", "人设评估",
+         hint="13 个特质 × 6 题 × 3 次采样，约 470 次调用；关掉就只跑边界与像人"),
+    Spec("eval_boundary_samples", int, "ai_chat_eval_boundary_samples", 12,
+         "边界检查看最近几条回复", "人设评估", 1, 30,
+         hint="小评估和大评估都会跑；每条一次裁判调用"),
+    Spec("eval_likeness_enabled", bool, "ai_chat_eval_likeness_enabled", True,
+         "启用「像人」主指标（成对判别）", "人设评估",
+         hint="用真实聊天脱敏样本做 Turing 式判别，L=100×(1-裁判认出真人的比例)。"
+              "只在每 N 天的大评估里跑，不在每天的小评估里跑"),
+    Spec("eval_likeness_samples", int, "ai_chat_eval_likeness_samples", 20,
+         "兼容旧名：像人样本数", "人设评估", 8, 40,
+         hint="新代码优先读 eval_big_samples；这个保留给旧配置"),
+    Spec("eval_boundary_enabled", bool, "ai_chat_eval_boundary_enabled", True, "启用边界检查", "人设评估",
+         hint="检查最近回复有没有贬低对方、或对非主人做身体接触；"
+              "与「像人」并列，但只惩罚真越界，不惩罚话题"),
+    Spec("eval_delete_hard_allow", bool, "ai_chat_eval_delete_hard_allow", False,
+         "允许评估台删除受保护底线", "人设评估",
+         hint="默认关：四条底线（自我指认/机制泄漏/编造/贬低性攻击）需人工确认才能删"),
+    # ---------------------------------------------------------- #0015 M1 案例库
+    # 案例与偏好只写 data 卷（`config.persona_data_dir()/eval/`），不进仓库、不进镜像。
+    # 关着时 `eval_cases` 的所有读写入口返回「关着」，不创建任何目录 —— 这是"默认不产生副作用"。
+    Spec("eval_cases_enabled", bool, "ai_chat_eval_cases_enabled", False,
+         "启用评估案例库（#0015 M1）", "人设评估",
+         hint="案例 = 目标事件 + 上下文快照 + 可接受答案；关着时读写入口全部不动盘"),
+    Spec("eval_cases_max_per_group", int, "ai_chat_eval_cases_max_per_group", 200,
+         "单组最多案例数", "人设评估", 10, 2000,
+         hint="按 split_group 计；超出只报数，不自动删（删案例会让旧报告失效）"),
+    # ---------------------------------------------------------- #0015 M2 同源回放
+    Spec("eval_replay_enabled", bool, "ai_chat_eval_replay_enabled", False,
+         "启用同源回放（#0015 M2）", "人设评估",
+         hint="回放跑在 persona_workspace 沙盒里，不写线上；关着时 replay() 直接拒绝"),
+    Spec("eval_replay_mode", str, "ai_chat_eval_replay_mode", "offline_stub",
+         "回放模式", "人设评估", choices=("offline_stub", "model_eval"),
+         hint="offline_stub 零网络、只比对输入；model_eval 需显式注入 client，且只作诊断"),
+    Spec("eval_replay_max_cases", int, "ai_chat_eval_replay_max_cases", 20,
+         "单次回放最多案例数", "人设评估", 1, 200,
+         hint="防止一次跑太多把 token 打爆；超限的案例记 not_run"),
+    # ---------------------------------------------------------- #0015 M3 三层评估
+    # 这里的数值是**实验起点**，不是统计保证（#0015 §六）。改它们等于改判据，
+    # 历史报告与它们的对照必须在报告里标明用的是哪一组。
+    Spec("eval_grading_enabled", bool, "ai_chat_eval_grading_enabled", False,
+         "启用三层评估（#0015 M3）", "人设评估",
+         hint="硬约束逐例否决 + 情景行为 + 盲偏好；关着时 judge_candidate 不产生结论"),
+    Spec("eval_min_event_groups", int, "ai_chat_eval_min_event_groups", 10,
+         "目标簇最少独立事件组", "人设评估", 1, 200,
+         hint="同一 case 的多次采样先聚合，再数事件组；不足记 inconclusive，不自动采用"),
+    Spec("eval_calibration_min_pairs", int, "ai_chat_eval_calibration_min_pairs", 10,
+         "每个场景最少校准对数", "人设评估", 1, 200,
+         hint="裁判先校准再参与筛查；不足只报 inconclusive"),
+    Spec("eval_agreement_threshold", float, "ai_chat_eval_agreement_threshold", 0.8,
+         "裁判与人工的一致率门槛", "人设评估", 0.0, 1.0,
+         hint="只作候选门槛，不是线上保证；裁判模型或 prompt 变更后必须重新校准"),
+    Spec("eval_grading_samples", int, "ai_chat_eval_grading_samples", 3,
+         "每个案例的采样次数", "人设评估", 1, 10,
+         hint="单次输出不能代表候选；采样结果先聚合成一个 case 结论"),
+    Spec("eval_grading_budget_tokens", int, "ai_chat_eval_grading_budget_tokens", 0,
+         "单轮评分 token 上限（0 = 不限）", "人设评估", 0, 2000000,
+         hint="触顶即停并记 not_run，保留队列；不因为没跑完就少写一条结论"),
+    # ---------------------------------------------------------- #0015 M4 取样
+    Spec("eval_sampling_enabled", bool, "ai_chat_eval_sampling_enabled", False,
+         "启用事件取样（#0015 M4）", "人设评估",
+         hint="以 bot 回复事件为单位入队；关着时 sample()/enqueue() 直接拒绝"),
+    Spec("eval_sampling_per_conv", int, "ai_chat_eval_sampling_per_conv", 5,
+         "每会话每次最多取几条", "人设评估", 1, 50,
+         hint="防反馈爆发吞掉普通对话的预算；超出记 skipped，不丢队列"),
+    Spec("eval_sampling_seed", int, "ai_chat_eval_sampling_seed", 0,
+         "取样随机种子（0 = 不打乱）", "人设评估", 0, 99999,
+         hint="同一 seed 结果可复现；只影响采样顺序，不影响池子"),
+    Spec("eval_sampling_limit", int, "ai_chat_eval_sampling_limit", 20,
+         "单次采样总数上限", "人设评估", 1, 200,
+         hint="与 per_conv 取较小值"),
+    # 取样时效：**上限一周**（D3）。再老的事件不进入评估台 ——
+    # 人格与示例都在变，用一个月前的对话判今天的回复，比没有样本更容易误导。
+    Spec("eval_sampling_window_hours", int, "ai_chat_eval_sampling_window_hours", 168,
+         "取样时效（小时，最大 168）", "人设评估", 1, 168,
+         hint="只取最近这么多小时内的目标事件；168 = 一周，是硬上限"),
+    # 效果衰减：越老的样本对结论的影响越小（D3）。半衰期到了权重剩一半。
+    # 与上面那项分工不同：窗口决定"能不能进来"，半衰期决定"进来后算多重"。
+    Spec("eval_decay_half_life_hours", int, "ai_chat_eval_decay_half_life_hours", 72,
+         "样本权重半衰期（小时）", "人设评估", 1, 720,
+         hint="权重 = 0.5^(年龄/半衰期)；72 = 三天前的样本算半个"),
+    # 提案通知（D4）：评估在凌晨生成提案，**早上八点**再推给主人 —— 夜里不弹消息。
+    Spec("eval_proposal_notify", bool, "ai_chat_eval_proposal_notify", True,
+         "提案生成后私聊通知主人", "人设评估",
+         hint="只在有新的待确认提案时发一条；采纳/拒绝仍走 /人设 提案"),
+    Spec("eval_proposal_notify_hour", int, "ai_chat_eval_proposal_notify_hour", 8,
+         "每天几点推送提案通知（0-23）", "人设评估", 0, 23,
+         hint="默认 8 点：评估 3 点跑完，早上再提醒；错过当天会话会在启动补发一次"),
+
+    # ---------------------------------------------------------- 语音（TTS）
+    # 只有 `/语音` 指令走这条路；音色包（权重/参考音频）在「语音」页单独维护。
+    # 这里放的是「全局开关 + 上限」这类标量，和别的参数一样即时生效。
+    Spec("tts_enabled", bool, "tts_enabled", False, "启用语音（/语音）", "语音",
+         hint="关闭后 /语音 直接回文字；不影响普通回复。"),
+    Spec("tts_max_chars", int, "tts_max_chars", 150, "单次语音文本上限（字）", "语音", 1, 500,
+         hint="超出直接回退文字，不静默截断。按实测 RTF≈1 估算，150 字最坏要等 20 秒以上。"),
+    Spec("tts_max_seconds", float, "tts_max_seconds", 30.0, "合成音频时长上限（秒）", "语音", 1, 120,
+         hint="合成后检查；超限视为失败并回退文字。"),
+    Spec("tts_max_bytes", int, "tts_max_bytes", 3145728, "音频字节上限（bytes）", "语音", 10240, 10485760,
+         hint="编码进 Base64 前检查；QQ 单条消息也有体积限制，不建议超过 3 MiB。"),
+    Spec("voice_reply_chance", float, "voice_reply_chance", 0.2, "普通回复里改用语音的概率", "语音", 0.0, 1.0,
+         hint="每次回复掷一次骰，**所有会话都生效**（含群聊）；命中且文本适合朗读"
+              "（不超字数上限、无代码块/链接/表格）才合成，失败自动回退文字。合成要几秒，调高会让回复变慢。"),
 ]
 
 _SPEC_BY_KEY: dict[str, Spec] = {s.key: s for s in _SPECS}
@@ -689,6 +893,9 @@ class _Store:
         tmp.replace(path)
 
     def get(self, key: str) -> Any:
+        over = _override.get()
+        if over is not None and key in over:
+            return over[key]
         if not self._loaded:
             self.load()
         if key in self._runtime:

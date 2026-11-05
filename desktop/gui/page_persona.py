@@ -20,7 +20,7 @@
 
 `PersonaPage` 是完整版（**没有挂进导航**）。挂进导航的是 `PersonaEvalPage`
 （标题「人格评估台」）：它复用完整版的**三层查看 / 评估台 / 改动日志**，但把四个动作按钮藏起来
-—— 那些动作与「人格自动迭代与评估」参数在同一个「功能」目录下的子菜单里，
+—— 那些动作与「人格评估与自动修订」参数在同一个「功能」目录下的子菜单里，
 两个入口各存一份行为迟早会不一致。
 
 ⚠ **标题不能叫「人格」**：那个标题归「功能」目录下的人格子菜单（`MainWindow.goto_page`
@@ -68,10 +68,10 @@ class PersonaPage(Page):
         bar = toolbar("四个动作会花 token 或改变运行状态，执行前都会确认")
         self.btn_refresh = busy_button("刷新", lambda: self.load(force=True))
         self.btn_undo = busy_button(
-            "撤回最近自动改动", self._undo,
-            tip="只回退自动迭代写入的那一条（表层），并记入改动日志",
+            "回滚最近一次修订", self._undo,
+            tip="用修订前的备份恢复三层人设，并记入改动日志",
         )
-        self.btn_reflect = danger_button("立即反思一次（花 token）", self._reflect)
+        self.btn_reflect = danger_button("立即评估并修订（花 token）", self._reflect)
         self.btn_artifacts = danger_button(
             "生成测评素材（花 token）", lambda: self._eval("artifacts")
         )
@@ -88,8 +88,8 @@ class PersonaPage(Page):
         # （那些动作的设置在功能子菜单里，别有两个各存一份行为的入口）。
         self._action_buttons = {
             "刷新": self.btn_refresh,
-            "撤回最近自动改动": self.btn_undo,
-            "立即反思一次（花 token）": self.btn_reflect,
+            "回滚最近一次修订": self.btn_undo,
+            "立即评估并修订（花 token）": self.btn_reflect,
             "生成测评素材（花 token）": self.btn_artifacts,
             "跑一轮基线分（花 token）": self.btn_round,
         }
@@ -128,9 +128,10 @@ class PersonaPage(Page):
         layers_layout = QtWidgets.QVBoxLayout(layers)
         layers_layout.addWidget(
             description_label(
-                "三层正文在**当前人格包里**，只能**直接编辑文件**才生效（控制台不能改，这是刻意的边界）："
-                "`base.txt`（它是谁）/ `forbidden.txt`（铁律）/ `surface.txt`（表层，只作首次播种，"
-                "实际生效的那份在 `data/runtime/persona/<包>/surface.txt`）",
+                "三层正文都可以被**评估驱动的修订**改写（每次先整份备份，可整版回滚）；"
+                "也可以直接编辑文件：`base.txt`（它是谁）/ `forbidden.txt`（铁律）/ `surface.txt`"
+                "（表层，实际生效的是 `data/runtime/persona/<包>/surface.txt`）。"
+                "底层与禁止事项的运行时改动写在包运行目录的 `base.txt` / `forbidden.txt` 覆盖文件里。",
                 wrap=True,
             )
         )
@@ -153,9 +154,54 @@ class PersonaPage(Page):
         eval_layout = QtWidgets.QVBoxLayout(evaluation)
         self.eval_hint = label("")
         eval_layout.addWidget(self.eval_hint)
-        self.eval_table = table(["特质", "分数", "题数", "备注"])
+        self.eval_summary = label("")
+        self.eval_summary.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.eval_summary.setWordWrap(True)
+        eval_layout.addWidget(self.eval_summary)
+        self.vector_table = table(["轴", "当前", "基线", "状态"])
+        self.vector_table.setMaximumHeight(150)
+        eval_layout.addWidget(self.vector_table)
+        self.relation_table = table(["对象", "play", "亲密度", "能开的玩笑"])
+        self.relation_table.setMaximumHeight(150)
+        eval_layout.addWidget(self.relation_table)
+        # 解释链（#0011）：**只读**。给操作者看"最近为什么这样"，
+        # 与注入给模型的 `explain(uid, conv)` 是两条路径（那条严格按 uid+conv 过滤）。
+        self.vector_explain = description_label("")
+        self.vector_explain.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self.vector_explain.setWordWrap(True)
+        eval_layout.addWidget(self.vector_explain)
+        eval_layout.addWidget(label("诊断项（旧特质，不参与否决）", wrap=True))
+        self.eval_table = table(["特质", "极性", "分数", "状态"])
         eval_layout.addWidget(self.eval_table, 1)
         self.tabs.addTab(evaluation, "评估台")
+
+        # ---- 像人样本库（v2）
+        samples = QtWidgets.QWidget()
+        samples_layout = QtWidgets.QVBoxLayout(samples)
+        samples_layout.addWidget(
+            description_label(
+                "像人判别的对照样本：一半来自真实聊天候选，一半由模型生成。"
+                "勾选后点「保存勾选」，评估只读 `likeness_samples.jsonl`；"
+                "候选存在 `likeness_candidates.jsonl`，不会动人格文件。",
+                wrap=True,
+            )
+        )
+        self.sample_hint = label("正在读取样本…", wrap=True)
+        samples_layout.addWidget(self.sample_hint)
+        sample_bar = QtWidgets.QHBoxLayout()
+        self.btn_sample_refresh = busy_button("刷新样本", self._load_samples)
+        self.btn_sample_generate = danger_button(
+            "生成 10 条模型样本", self._generate_samples)
+        self.btn_sample_save = primary_button("保存勾选", self._save_samples)
+        sample_bar.addWidget(self.btn_sample_refresh)
+        sample_bar.addWidget(self.btn_sample_generate)
+        sample_bar.addWidget(self.btn_sample_save)
+        sample_bar.addStretch(1)
+        samples_layout.addLayout(sample_bar)
+        self.sample_table = table(["选", "来源", "上下文", "真人回复"], stretch_last=True)
+        self.sample_table.setColumnWidth(0, 44)
+        samples_layout.addWidget(self.sample_table, 1)
+        self.tabs.addTab(samples, "样本库")
 
         # ---- 日志
         changelog = QtWidgets.QWidget()
@@ -183,13 +229,14 @@ class PersonaPage(Page):
         self._persona = state.persona
         persona = self._persona
         stats = dict(persona.get("stats") or {})
-        iter_stats = dict(persona.get("iter") or {})
         evaluation = dict(persona.get("eval") or {})
 
         self.hint.setText(
             f"当前人格包 {esc(stats.get('pack_name') or '（无）')} · "
             f"底层 {esc(stats.get('base_chars', 0))} 字 · 表层 {esc(stats.get('surface_chars', 0))} 字 · "
-            f"禁止事项 {esc(stats.get('forbidden', 0))} 条 · 自动迭代已跑 {esc(iter_stats.get('runs', 0))} 次"
+            f"禁止事项 {esc(stats.get('forbidden', 0))} 条 · "
+            f"待修特质 {esc(len(evaluation.get('targets') or []))} 个 · "
+            f"历史修订 {esc(evaluation.get('revisions', 0))} 次"
         )
 
         self._fill_packs(dict(persona.get("pack") or {}), list(persona.get("packs") or []))
@@ -202,9 +249,9 @@ class PersonaPage(Page):
         forbidden_file = str(stats.get("forbidden_file") or "")
         surface_file = str(stats.get("surface_file") or "")
         rows = [
-            ("底层人设", base_file, len(str(layers.get("base") or "")), "只有主人直接编辑文件才能改"),
-            ("表层人设", surface_file, len(str(layers.get("surface") or "")), "自动迭代会写这里，可撤回"),
-            ("禁止事项", forbidden_file, len(forbidden), "只有主人直接编辑文件才能改"),
+            ("底层人设", base_file, len(str(layers.get("base") or "")), "只允许人工修改"),
+            ("表层人设", surface_file, len(str(layers.get("surface") or "")), "评估修订会写这里，可回滚"),
+            ("禁止事项", forbidden_file, len(forbidden), "评估修订可写（备份可回滚）"),
         ]
         self.layer_table.setRowCount(len(rows))
         for row, (name, filename, size, note) in enumerate(rows):
@@ -222,7 +269,8 @@ class PersonaPage(Page):
             self.layer_selector.blockSignals(False)
         self._show_layer(self.layer_selector.currentText())
 
-        self._fill_eval(evaluation)
+        self._fill_eval(evaluation, persona)
+        self._load_samples()
         self._fill_log(list(persona.get("changelog") or []))
         self.toast("人格信息已载入", level="ok")
         self.refreshed.emit()
@@ -286,29 +334,205 @@ class PersonaPage(Page):
             body = "\n".join(f"{index + 1}. {text}" for index, text in enumerate(forbidden))
         self.layer_view.setPlainText(body or "（空）")
 
-    def _fill_eval(self, evaluation: dict[str, Any]) -> None:
+    def _fill_eval(self, evaluation: dict[str, Any], persona: dict[str, Any]) -> None:
         enabled = bool(evaluation.get("enabled"))
         traits = list(evaluation.get("traits") or [])
-        artifacts = evaluation.get("artifacts")
+        targets = {str(x.get("slug")) for x in (evaluation.get("targets") or [])}
+        extra = ""
+        if enabled:
+            extra = (
+                f" · 自动修订 {'开' if evaluation.get('iter_enabled') else '关'}"
+                f" · 每天 {int(evaluation.get('daily_hour') or 3):02d}:00"
+                f" · 待修 {len(targets)} 个 · 历史修订 {evaluation.get('revisions', 0)} 次"
+            )
         self.eval_hint.setText(
-            badge("评估台已启用", level="ok") if enabled else badge("评估台已关闭（参数 → 人设评估 → eval_enabled）", level="warn")
+            (badge("评估台已启用", level="ok") if enabled
+             else badge("评估台已关闭（参数 → 人设评估 → eval_enabled）", level="warn")) + esc(extra)
         )
         self.eval_hint.setTextFormat(QtCore.Qt.TextFormat.RichText)
+
+        # ---- v2 摘要：调度 + 模仿度 + 边界 + 示例 ----
+        lk = dict(evaluation.get("likeness") or {})
+        bd = dict(evaluation.get("boundary") or {})
+        ex = dict(persona.get("examples") or {})
+        school = (
+            f"小评估：每天 {'开' if evaluation.get('small_enabled') else '关'}"
+            f"（边界 + {evaluation.get('small_samples', 0)} 条像人） · "
+            f"大评估：每 {evaluation.get('big_every_days', 3)} 天"
+            f"（{evaluation.get('big_samples', 0)} 条像人"
+            f"{' + 特质分' if evaluation.get('traits_on_big') else ''}） · "
+            f"上次 {evaluation.get('last_big') or '还没跑'} / 下次 {evaluation.get('next_big') or ''}"
+        )
+        win = dict(evaluation.get("window") or {})
+        score_line = (
+            f"<b>语料</b> {win.get('scored', 0)} 段 / 均分 {win.get('avg', '-')} / "
+            f"低分 {len(win.get('low') or [])} 段 · "
+            f"<b>口语偏好 L</b> {lk.get('L', '-')}"
+            f"（n={lk.get('n', 0)}，对照偏好 {round(float(lk.get('acc') or 0) * 100, 1)}%） · "
+            f"<b>边界</b> 检查 {bd.get('checked', 0)} 条，越界 {len(bd.get('violations') or [])}，"
+            f"拿不准 {len(bd.get('borderline') or [])} · "
+            f"<b>示例库</b> {ex.get('total', 0)} 条（good {ex.get('good', 0)} / bad {ex.get('bad', 0)}）"
+        )
+        self.eval_summary.setText(esc(school) + "<br>" + score_line)
+
+        vec = dict(persona.get("vector") or {})
+        axes = list(vec.get("axes") or [])
+        values = dict(vec.get("values") or {})
+        self.vector_table.setRowCount(len(axes))
+        for row_index, axis in enumerate(axes):
+            axis_id = str(axis.get("id") or "")
+            value = values.get(axis_id)
+            base = axis.get("baseline")
+            diff = ((float(value) - float(base))
+                    if isinstance(value, (int, float)) and isinstance(base, (int, float)) else 0.0)
+            state = "正常" if abs(diff) < 0.2 else ("偏高" if diff > 0 else "偏低")
+            cells = [
+                str(axis.get("name") or axis_id),
+                f"{float(value):.2f}" if isinstance(value, (int, float)) else "-",
+                f"{float(base):.2f}" if isinstance(base, (int, float)) else "-",
+                state,
+            ]
+            for column, text in enumerate(cells):
+                self.vector_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(text))
+        fit_table(self.vector_table)
+
+        parts = []
+        samples = list(vec.get("effective_samples") or [])
+        if samples and axes:
+            first = samples[0]
+            who = str(first.get("who") or first.get("uid") or "")
+            eff = dict(first.get("values") or {})
+            cells = []
+            for axis in axes:
+                axis_id = str(axis.get("id") or "")
+                if axis_id in eff:
+                    cells.append(f"{axis.get('name') or axis_id}={float(eff[axis_id]):.2f}")
+            if cells:
+                parts.append(f"有效值（{who}{'·主人' if first.get('is_master') else ''}）：" + " / ".join(cells))
+        recent = list(vec.get("recent") or [])
+        if recent:
+            lines = []
+            for row in recent[:5]:
+                kind = str(row.get("kind") or row.get("source") or "?")
+                applied = dict(row.get("applied") or {})
+                text = "，".join(f"{k}{v:+.2f}" for k, v in applied.items()) or "无变化"
+                stamp = str(row.get("at") or "")[-8:]
+                flag = "（已过期）" if row.get("stale") else ""
+                lines.append(f"{stamp} {kind}：{text}{flag}")
+            parts.append("最近的状态变化：" + chr(10) + chr(10).join(lines))
+        self.vector_explain.setText(chr(10).join(parts) if parts else "最近没有状态变化。")
+
+        rel = dict(persona.get("relation") or {})
+        items = list(rel.get("items") or [])
+        self.relation_table.setRowCount(len(items))
+        for row_index, item in enumerate(items):
+            who = str(item.get("who") or item.get("uid") or "")
+            if item.get("master"):
+                who += "（主人）"
+            cells = [
+                who,
+                f"{float(item.get('play') or 0):.2f}",
+                f"{float(item.get('intimacy') or 0):.2f}",
+                "、".join(str(x) for x in (item.get("tease_topics") or [])) or "-",
+            ]
+            for column, text in enumerate(cells):
+                self.relation_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(text))
+        fit_table(self.relation_table)
+
+        polarity = {"suppress": "压制", "elicit": "保持", "convention": "约定"}
         self.eval_table.setRowCount(len(traits))
         for row, trait in enumerate(traits):
             score = trait.get("score")
-            note = "未评" if score is None else ""
-            if artifacts is not None:
-                note = f"素材 {artifacts}"
+            slug = str(trait.get("slug") or "")
+            status = "待修" if slug in targets else ("未评" if score is None else "")
             cells = [
-                str(trait.get("key") or trait.get("name") or ""),
-                "-" if score is None else f"{float(score):.3f}",
-                str(trait.get("questions") or trait.get("count") or ""),
-                str(trait.get("note") or note),
+                str(trait.get("trait") or trait.get("slug") or ""),
+                polarity.get(str(trait.get("polarity")), str(trait.get("polarity") or "")),
+                "-" if score is None else str(score),
+                status,
             ]
             for column, text in enumerate(cells):
                 self.eval_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
         fit_table(self.eval_table)
+
+    # ------------------------------------------------------------ 样本库
+    def _load_samples(self) -> None:
+        self.run_task(
+            lambda: self.client().persona_likeness_candidates(),
+            on_done=self._fill_samples,
+            busy_text="正在读取样本…",
+        )
+
+    def _fill_samples(self, result) -> None:  # noqa: ANN001
+        if not result.ok:
+            self.sample_hint.setText(
+                badge("读取样本失败", level="warn")
+                + " 服务端可能还没有 likeness 接口（旧版本或桩服务）。"
+            )
+            self.sample_hint.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            return
+        payload = dict(result.value or {})
+        items = list(payload.get("items") or [])
+        selected = {str(x) for x in (payload.get("selected") or [])}
+        self.sample_hint.setText(
+            f"候选 {len(items)} 条，已选 {len(selected)} 条"
+            "（来源列：聊天 / 模型；勾选后保存）"
+        )
+        self.sample_table.setRowCount(len(items))
+        for row_index, item in enumerate(items):
+            sid = str(item.get("id") or "")
+            check = QtWidgets.QTableWidgetItem("")
+            check.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                           | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            check.setCheckState(QtCore.Qt.CheckState.Checked if sid in selected
+                                else QtCore.Qt.CheckState.Unchecked)
+            check.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
+            self.sample_table.setItem(row_index, 0, check)
+            source = "模型" if item.get("source") == "generated" else "聊天"
+            ctx = one_line(" / ".join(str(x) for x in (item.get("ctx") or [])), 90)
+            for column, text in enumerate((source, ctx, str(item.get("human") or ""))):
+                self.sample_table.setItem(
+                    row_index, column + 1, QtWidgets.QTableWidgetItem(text))
+        fit_table(self.sample_table)
+
+    def _checked_sample_ids(self) -> list[str]:
+        ids: list[str] = []
+        for row_index in range(self.sample_table.rowCount()):
+            item = self.sample_table.item(row_index, 0)
+            if item is None or item.checkState() != QtCore.Qt.CheckState.Checked:
+                continue
+            sid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            if sid:
+                ids.append(sid)
+        return ids
+
+    def _save_samples(self) -> None:
+        ids = self._checked_sample_ids()
+        if not ids:
+            self.toast("先勾选几条样本", level="warn")
+            return
+
+        def done(result) -> None:  # noqa: ANN001
+            self._report(result, "保存样本", detail_key="saved")
+
+        self.run_task(
+            lambda: self.client().persona_likeness_select(ids),
+            on_done=done,
+            busy_text=f"正在保存 {len(ids)} 条样本…",
+        )
+
+    def _generate_samples(self) -> None:
+        if not self._confirm_cost("生成像人样本", "让模型补 10 条「普通群友」样本到候选。"):
+            return
+
+        def done(result) -> None:  # noqa: ANN001
+            self._report(result, "生成样本", detail_key="generated")
+
+        self.run_task(
+            lambda: self.client().persona_likeness_generate(10),
+            on_done=done,
+            busy_text="正在生成样本…",
+        )
 
     def _fill_log(self, entries: list[dict[str, Any]]) -> None:
         self.log_table.setRowCount(len(entries))
@@ -361,25 +585,26 @@ class PersonaPage(Page):
 
     def _undo(self) -> None:
         if not QtWidgets.QMessageBox.question(
-            self, "撤回自动改动",
-            "回退最近一次**自动迭代**写入的表层人设？\n\n只会动表层人设文件，底层人设与禁止事项不受影响。",
+            self, "回滚评估修订",
+            "回滚最近一次**评估驱动**的人设修订？\n\n"
+            "会用修订前的备份恢复底层 / 禁止事项 / 表层三层。",
             QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel,
         ) == QtWidgets.QMessageBox.StandardButton.Ok:
             return
         self.run_task(
             self.client().persona_undo,
-            on_done=lambda r: self._report(r, "撤回"),
-            busy_text="正在撤回…",
+            on_done=lambda r: self._report(r, "回滚"),
+            busy_text="正在回滚…",
         )
 
     def _reflect(self) -> None:
-        if not self._confirm_cost("立即反思", "让机器人现在做一次自我反思（可能写入表层人设）。"):
+        if not self._confirm_cost("评估并修订", "现在跑一轮评估，并按结果改写三层人设（会先备份）。"):
             return
         self.run_task(
             self.client().persona_reflect,
-            on_done=lambda r: self._report(r, "反思", detail_key="text"),
-            busy_text="正在反思（可能要几十秒）…",
+            on_done=lambda r: self._report(r, "评估并修订", detail_key="why"),
+            busy_text="正在评估并修订（可能要几分钟）…",
         )
 
     def _eval(self, mode: str) -> None:
@@ -418,27 +643,27 @@ class PersonaEvalPage(PersonaPage):
 
     与完整版的三点差别，都是刻意的：
 
-    1. **不重复放四个花 token 的动作**（撤回 / 反思 / 测评素材 / 跑分）——
-       它们与「功能」目录下「人格自动迭代与评估」子菜单里那几个开关是同一件事，
+    1. **不重复放花 token 的动作**（回滚 / 评估并修订 / 测评素材 / 跑分）——
+       它们与「功能」目录下「人格评估与自动修订」子菜单里那几个开关是同一件事，
        两个入口各存一份行为迟早对不上。要跑就在那边跑（子菜单里有对应参数）。
     2. **标题不同名**（见模块文档）。
     3. 保留「切到这个包」：那是"它是谁"的唯一开关，人气最高，不该埋在参数里。
     """
 
     title = "人格评估台"
-    subtitle = "人格包切换、三层正文（只读）、特质评分与自动改动日志"
+    subtitle = "人格包切换、三层正文（只读）、特质评分与评估修订记录"
 
     def __init__(self, manager, parent=None) -> None:  # noqa: ANN001
         super().__init__(manager, parent)
-        for name in ("撤回最近自动改动", "立即反思一次（花 token）",
+        for name in ("回滚最近一次修订", "立即评估并修订（花 token）",
                      "生成测评素材（花 token）", "跑一轮基线分（花 token）"):
             button = self._action_buttons.get(name)
             if button is not None:
                 button.setVisible(False)
         # 这一条**不能写进 `self.hint`**：那是加载状态行，`_apply` 每次都会覆盖它。
         note = label(
-            "本页只读：跑反思 / 生成素材 / 跑基线分请用左侧「功能」目录下的"
-            "「人格自动迭代与评估」子菜单（那里的开关与这些动作是同一件事）。",
+            "本页只读：回滚 / 评估并修订 / 生成素材 / 跑基线分请用左侧「功能」目录下的"
+            "「人格评估与自动修订」子菜单（那里的开关与这些动作是同一件事）。",
             level="info",
             wrap=True,
         )

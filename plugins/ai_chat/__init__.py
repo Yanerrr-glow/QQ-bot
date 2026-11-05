@@ -17,7 +17,6 @@
 四个 handler / 任务分工：
 1. `recorder`（priority=1, block=False）：记录所有消息；图片顺手丢给表情包库；
 2. `ai_chat`（priority=50, block=True）：只在被 @ / 命中前缀时回复；
-3. `proactive.loop()`：后台常驻，按概率主动冒泡（可在 Web 控制台里调）。
 4. `greetings.loop()`：到点问候。
 
 一次 `_reply()` 的完整路径（改造后）：
@@ -56,6 +55,10 @@ from . import (
     config,
     context,
     dsh_bridge,
+    eval_cases,  # #0015 M1：案例与偏好数据层（默认关，见 eval_cases_enabled）
+    eval_grading,  # #0015 M3：三层评估与裁判校准（默认关）
+    eval_replay,  # #0015 M2：同源回放（默认关，见 eval_replay_enabled）
+    eval_sampling,  # #0015 M4：事件取样（默认关）
     fetch,
     files,
     greetings,
@@ -67,8 +70,7 @@ from . import (
     msgindex,
     packs,
     persona,
-    persona_iter,
-    proactive,
+    persona_eval,
     render,
     search,
     settings,
@@ -77,6 +79,8 @@ from . import (
     stickers,
     summaries,
     task_manager,
+    voice,
+    voices,
 )
 from . import webui  # noqa: F401 —— 导入即注册控制台路由（副作用）
 
@@ -84,6 +88,21 @@ logger = logging.getLogger("ai_chat")
 
 # 未配置 key 时也要能 import 成功，否则插件加载阶段就崩，报错不直观。
 _semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
+
+# 每个会话一把"发送锁"：保证**同一会话里回复按处理的先后顺序发出**。
+# 为什么需要它：语音合成要几秒到十几秒，如果这一轮在合成、下一轮已经生成完文字，
+# 下一轮的文字会先到，形成"后一句先到、前一句语音后到"的错序。
+# 锁只包住"发送阶段"（语音合成 + 文字分片 + 配图），不包模型调用，
+# 所以不同会话之间仍然并行，不会互相拖慢。
+_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def _send_lock(conv: str) -> asyncio.Lock:
+    lock = _send_locks.get(conv)
+    if lock is None:
+        lock = asyncio.Lock()
+        _send_locks[conv] = lock
+    return lock
 
 RESET_WORDS = {"清空对话", "重置对话", "清空记录", "reset", "/reset", "新对话"}
 
@@ -160,19 +179,6 @@ def _wake_cooldown_ok(conv: str) -> bool:
     if now - _last_wake.get(conv, 0.0) < cooldown:
         return False
     _last_wake[conv] = now
-    return True
-
-
-# 会话键 -> 上次随机插话的时间戳
-_last_random: dict[str, float] = {}
-
-
-def _random_cooldown_ok(conv: str) -> bool:
-    cooldown = int(settings.get("random_reply_cooldown"))
-    now = time.time()
-    if now - _last_random.get(conv, 0.0) < cooldown:
-        return False
-    _last_random[conv] = now
     return True
 
 
@@ -524,17 +530,19 @@ def _polish(answer: str, question: str = "") -> str:
     )
 
 
-async def _send(bot: Bot, event: MessageEvent, message) -> None:  # noqa: ANN001
+async def _send(bot: Bot, event: MessageEvent, message):  # noqa: ANN001, ANN201
     """统一的发送出口。
 
     以前只用 matcher.send / matcher.finish，但注意力机制触发时并没有 matcher
     可用（它是在 recorder 里评估出来的），所以把发送抽出来，两条路径共用。
+
+    **返回底层 OneBot 的结果**（含 `message_id`）：语音路径要用它记录回执。
+    原有调用点全部忽略返回值，行为不变。
     """
     group_id = getattr(event, "group_id", None)
     if group_id is not None:
-        await bot.send_group_msg(group_id=int(group_id), message=message)
-    else:
-        await bot.send_private_msg(user_id=int(event.user_id), message=message)
+        return await bot.send_group_msg(group_id=int(group_id), message=message)
+    return await bot.send_private_msg(user_id=int(event.user_id), message=message)
 
 
 async def _push_dsh_result(bot: Bot, event: MessageEvent, task_id: str, timeout: float) -> None:
@@ -595,17 +603,38 @@ async def _maybe_send_sticker(bot: Bot, event: MessageEvent, conv: str = "") -> 
         return
 
     context = await _sticker_context(conv)
-    segment, reason = await stickers.pick_for_context(
+    segment, reason, meta = await stickers.pick_for_context_ex(
         context, conv=conv, is_master=_is_master(event)
     )
     if segment is None:
         logger.info("这次不发表情包 conv=%s（%s）", conv, reason)
         return
     try:
-        await _send(bot, event, segment)
+        sent = await _send(bot, event, segment)
     except Exception:  # noqa: BLE001
         logger.exception("发送表情包失败")
         return
+
+    # **把"当时为什么发"留下来**（#0014）。
+    #
+    # 挑图的判断本来只进日志，发完图聊天记录里只有一句占位符 —— 隔几小时被问
+    # 「你怎么发那种表情」，她手上没有任何依据，只能现编一个最省事的说法。
+    # 这里按「一次成功发送」记一条事件（同一张图连发两次是两条，理由可能不同），
+    # 供 `context.build()` 在对方追问时取用。事件不进聊天记录、不进长期记忆。
+    try:
+        await stickers.record_sent(
+            conv=conv,
+            uid=str(getattr(event, "user_id", "") or ""),
+            message_id=str((sent or {}).get("message_id") or "")
+            if isinstance(sent, dict) else "",
+            image_hash=str(meta.get("hash") or ""),
+            source=str(meta.get("source") or "context"),
+            reason=reason if str(meta.get("source") or "context") == "context" else "",
+            trigger_message_id=str(getattr(event, "message_id", "") or ""),
+            trigger_text=str(getattr(event, "raw_message", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 - 记录失败不能影响已经发出去的图
+        logger.exception("记录发送事件失败 conv=%s", conv)
     # **发出去之后要留一条自己能看见的记录**。
     #
     # 改造前这支路发完就结束：聊天记录里**没有任何"我发过一张图"的痕迹**。
@@ -656,6 +685,25 @@ async def _load_first_image(segments: list[dict]) -> bytes | None:
             continue
         return data
     return None
+
+
+def _event_quoted_id(event: MessageEvent) -> str:
+    """取这条消息**引用**的那条消息 id（没有就空串）。
+
+    只做一件事，所以不放进 `_resolve_reply()`（那是 async、会读 `event.reply` 的全部内容）：
+    这里只需要一个稳定引用，用来给反馈定锚（#0015 M4）。
+    取不到就返回空串 —— 反馈侧会把它当「无引用」处理，走「上下文唯一明确才关联」那条规则。
+    """
+    reply = getattr(event, "reply", None)
+    if reply is None:
+        return ""
+    mid = getattr(reply, "message_id", None)
+    if mid is None:
+        try:  # 某些适配器给的是 dict
+            mid = (reply or {}).get("message_id")
+        except AttributeError:
+            mid = None
+    return str(mid) if mid is not None else ""
 
 
 async def _resolve_reply(
@@ -802,11 +850,10 @@ async def _ingest_image(
         )
         if item is not None:
             logger.info(
-                "表情包入库 hash=%s 分数=%.2f 权重=%.2f 理由=%s%s",
+                "表情包入库 hash=%s 分数=%.2f 权重=%.2f%s",
                 item["hash"],
                 item["score"],
                 float(item.get("weight", 1.0)),
-                item["reason"],
                 "（以文件发送）" if file_sent else "",
             )
     except Exception:  # noqa: BLE001 - 收图失败绝不能影响聊天
@@ -879,32 +926,16 @@ async def record_message(bot: Bot, event: MessageEvent) -> None:
             name="_ingest_image", kind="image", reject_over=6,
         )
 
-    # 群聊消息计入"按消息数触发主动发言"的计数器（异步，不阻塞）
+    # 注意力：若这个会话正处于「被唤醒后的活跃期」，评估这条新消息跟话题的相关度。
+    # 已经在跟它说话的（被 @ / 提到唤醒词）不必再走这条。
     if group_id is not None and text:
-        _spawn(proactive.on_group_message(conv), name="proactive.on_group_message")
-        # 注意力：若这个会话正处于「被唤醒后的活跃期」，评估这条新消息跟话题的相关度。
-        # 已经在跟它说话的（被 @ / 提到唤醒词）不必再走这条。
         if not _is_addressed(event) and not _mentions_wake_word(event):
             _spawn(_attention_check(bot, event, conv, text), name="_attention_check")
 
 
 # ----------------------------------------------------------- handler 2：回复
-def _random_reply_eligible(event: MessageEvent) -> bool:
-    """是否属于「可能随机插话」的消息。纯判断，不掷骰。
-
-    只对**群聊的、有实质正文的**消息开放：私聊本来就算在跟它说话；
-    而「哈哈」「?」这类短句没什么可接的，跳过。
-    """
-    if not settings.get("random_reply_enabled"):
-        return False
-    if getattr(event, "group_id", None) is None:
-        return False
-    text = event.get_plaintext().strip()
-    return len(text) >= int(settings.get("random_reply_min_chars"))
-
-
 def _should_reply(event: MessageEvent) -> bool:
-    """被 @ / 命中前缀 / 提到唤醒词 / **在对话租约内** / 命中随机插话条件。
+    """被 @ / 命中前缀 / 提到唤醒词 / **在对话租约内**。
 
     这里只做**纯判断**：概率与冷却一律放到 handler 里。
     rule 一旦带副作用，被评估几次就会多掷几次骰，概率直接失控 ——
@@ -916,22 +947,31 @@ def _should_reply(event: MessageEvent) -> bool:
         return True
     # 对话租约：刚叫过它，接下来的追问也算在跟它说话
     conv = chatlog.conversation_id(getattr(event, "group_id", None), event.user_id)
-    if attention.lease_peek(
+    return bool(attention.lease_peek(
         conv,
         str(getattr(event, "user_id", "") or ""),
         is_master=_is_master(event),
         text=event.get_plaintext(),
-    ):
-        return True
-    return _random_reply_eligible(event)
+    ))
 
 
 ai_chat = on_message(rule=Rule(_should_reply), priority=50, block=True)
 
 
+# 语音指令排在 ai_chat 之前（priority 更小）、block=True：
+# `/语音 xxx` 不该再进模型，也不该被当成普通聊天。
+voice_cmd = on_message(rule=Rule(lambda event: voice.match(event) is not None),
+                       priority=45, block=True)
+
+
+@voice_cmd.handle()
+async def handle_voice_cmd(bot: Bot, event: MessageEvent) -> None:
+    await voice.handle(bot, event, _send, is_master=_is_master(event))
+
+
 @ai_chat.handle()
 async def handle_ai_chat(bot: Bot, event: MessageEvent) -> None:
-    """判定这次是哪条来路（被 @ / 唤醒词 / 随机插话），再交给 `_reply`。
+    """判定这次是哪条来路（被 @ / 唤醒词 / 对话租约），再交给 `_reply`。
 
     概率与冷却一律在这里做，`_should_reply` 只负责纯判断 ——
     否则 rule 被评估几次就会多掷几次骰。
@@ -960,7 +1000,7 @@ async def handle_ai_chat(bot: Bot, event: MessageEvent) -> None:
 
     # 对话租约：刚叫过它，这个会话接下来的追问不必再 @。
     #
-    # 放在唤醒之后、随机插话之前 —— 它属于"确定在跟它说话"这一类，
+    # 放在唤醒之后 —— 它属于"确定在跟它说话"这一类，
     # 不该和"概率插话"混在一起掷骰子。
     # 判定纯本地（不调模型、不花 token），所以放在这里不增加任何延迟。
     lease_uid = str(getattr(event, "user_id", "") or "")
@@ -971,21 +1011,16 @@ async def handle_ai_chat(bot: Bot, event: MessageEvent) -> None:
         await _reply(bot, event, "lease")
         return
 
-    # 什么都没提：随机插话（默认关）
-    if random.random() > float(settings.get("random_reply_chance")):
-        logger.debug("随机插话未命中，不回应 conv=%s", conv)
-        return
-    if not _random_cooldown_ok(conv):
-        logger.debug("随机插话冷却中，不回应 conv=%s", conv)
-        return
-    logger.info("随机插话命中 conv=%s", conv)
-    await _reply(bot, event, "random")
-
 
 async def _attention_check(bot: Bot, event: MessageEvent, conv: str, text: str) -> None:
     """注意力评估：跟当前话题够相关就不等 @，自己接话。"""
     try:
-        should, value = await attention.should_speak(conv, text)
+        should, value = await attention.should_speak(
+            conv, text,
+            message_id=getattr(event, "message_id", None),
+            speaker=_speaker_label(event) or "",
+            uid=str(getattr(event, "user_id", "") or ""),
+        )
         if not should:
             return
         logger.info("注意力触发主动接话 conv=%s value=%.2f", conv, value)
@@ -1151,7 +1186,7 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
     3. 没命中 → 走长期记忆 + 聊天记录组装 prompt，正常回复。
     4. 回复落地后**异步**抽取记忆，不占群友的等待时间。
 
-    matcher（被 @ / 唤醒词 / 随机插话）与注意力机制**共用这一条路径**，
+    matcher（被 @ / 唤醒词 / 对话租约）与注意力机制**共用这一条路径**，
     区别只在 trigger 决定「现在需要你回应的发言」那段提示语怎么写。
 
     trigger 取值：addressed / wake / random / attention
@@ -1162,6 +1197,8 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
 
     # 引用要用 event.reply：NoneBot2 已经调过 get_msg 并把 reply 段从 message 里删了
     quoted_text, quoted_images, quoted_files, quoted_from_bot = await _resolve_reply(event)
+    # 被引用那条消息的 id：对方引用的是"她自己发的那张图"时，用它精确定位发送事件
+    quoted_msg_id = str(getattr(getattr(event, "reply", None), "message_id", "") or "")
 
     # 图片段在**指令解析之前**就取好：`/头像` 要用"本条消息里的图 + 它引用的图"，
     # 而引用段已经被 NoneBot2 从 `event.message` 里删掉了，只有 `_resolve_reply` 拿得到。
@@ -1209,6 +1246,11 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
                 if stickers.is_image_file(str(seg.get("file") or seg.get("name") or ""))
             ]
         ),
+        # #0015 P1-4：身份三件套从**事件**取，不从配置猜。
+        # 缺 `uid` 时 `signals.record` 记 `unconfirmed`，不再一律算成主人。
+        uid=str(getattr(event, "user_id", "") or ""),
+        message_id=getattr(event, "message_id", None),
+        quoted_id=_event_quoted_id(event),
     )
     if action.handled:
         if action.stop:
@@ -1229,6 +1271,120 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         action = instructions.Action()
 
     question = _question_text(event)
+
+    # 显式停止优先：这是**确定性**边界（句式匹配），所以不放在 `persona_vector.observe()`
+    # 里 —— 那条路会被 `vector_enabled=False` 提前返回跳过（#0012 P1-3）。
+    try:
+        from . import persona_intents
+
+        persona_intents.note_stop(conv, str(getattr(event, "user_id", "") or ""), question)
+    except Exception:  # noqa: BLE001 - 取消失败不能拖垮回复
+        logger.debug("待办取消失败 conv=%s", conv)
+
+    # 语境深判（方案 §14.4 第四条）：**只在规则层标了「需要语境」时才调一次**。
+    #
+    # 结果是**本轮的共享对象**：它同时喂给 ① 示例检索（`scene_hint`）、② 状态更新
+    # （`observe(verdict=…)`）、③ 语境状态（`scene_state.last_turn`）。
+    # 三处必须用同一份判断——否则会出现「检索按模型解释、状态按关键词」的分裂。
+    _verdict: dict = {}
+    try:
+        from . import context_analysis as _cax
+        from . import scene as _scene
+        from . import scene_state as _sst
+
+        _feat = _scene.judge(question)
+        if _cax.needs_deep_judge(_feat):
+            _turns: list[dict[str, object]] = []
+            try:
+                _log = chatlog.get_log_sync(conv)
+                for _m in list(getattr(_log, "messages", []) or [])[-6:]:
+                    _turns.append({
+                        "role": "bot" if _m.get("is_bot") else "user",
+                        "speaker": str(_m.get("name") or "")[:20],
+                        "text": str(_m.get("text") or "")[:80],
+                        # 稳定引用靠它：模型说的「第 N 条」要能翻回具体消息（#0011）
+                        "mid": int(_m.get("id") or 0),
+                    })
+            except Exception:  # noqa: BLE001 - 拿不到历史就只判本轮
+                logger.debug("取上下文失败 conv=%s", conv)
+            _state = _sst.load(conv)
+            _boundary = "；".join(str(_b.get("text")) for _b in (_state.get("boundaries") or [])[:2])
+            # **生产与回放共用同一个决策入口**（`decide()`）：先查能不能复用，
+            # 不行才调模型。复用判据见 `context_analysis.reuse_hit` 的注释。
+            # 待办令牌：**深判与注入用同一份 claim 缓存**，模型看到的 `[P1]` 才能被 settle 解析。
+            _intent_hint = ""
+            try:
+                from . import persona_intents
+
+                _intent_hint = persona_intents.prompt_hint(
+                    conv, str(getattr(event, "user_id", "") or ""),
+                    message_id=getattr(event, "message_id", None))
+            except Exception:  # noqa: BLE001
+                logger.debug("待办提示生成失败 conv=%s", conv)
+            _context_hint = _sst.summary(conv)
+            if _intent_hint:
+                _context_hint = (_context_hint + chr(10) + _intent_hint).strip()
+            _res = await _cax.decide(
+                question, turns=_turns, boundary=_boundary,
+                context=_context_hint,
+                mode=str(_state.get("mode") or ""),
+                uid=str(getattr(event, "user_id", "") or ""),
+                boundaries_rev=int(_state.get("boundaries_rev") or 0),
+                boundaries_hash=_sst.boundary_fingerprint(_state),
+                state=_state,
+                timeout=float(settings.get("scene_judge_timeout") or 12),
+                # 思考档与预算走设置项（默认关思考 / 900）：实测思维链在这个结构化判类上
+                # 既慢又更容易被截断，详见 `context_analysis.analyze` 的说明。
+                thinking=str(settings.get("scene_judge_thinking") or "").strip(),
+                max_tokens=int(settings.get("scene_judge_max_tokens") or 900),
+                ttl=float(settings.get("scene_reuse_ttl") or 0),
+                current_mid=getattr(event, "message_id", None))
+            _verdict = _res.get("verdict") or {}
+            if _res.get("source") == "reuse":
+                # **复用命中不写状态**：写 `last_analysis` 会刷新 `at`，缓存就永不过期了。
+                logger.info("语境复用 act=%s（省一次模型调用）conv=%s", _verdict.get("act"), conv)
+            else:
+                _write = dict(_res.get("write_back") or {})
+                # **完整结果落盘**（不只 act/tone）：target 决定是否算被冒犯，
+                # evidence 用来事后复核，reception 用来判断边界是否被越。
+                _write["last_turn"] = {
+                    "message_id": getattr(event, "message_id", None),
+                    "act": _verdict.get("act"), "target": _verdict.get("target"),
+                    "origin": _verdict.get("origin"),
+                    "confidence": _verdict.get("confidence"), "tone": _verdict.get("tone"),
+                    "reception": _verdict.get("reception"),
+                    "alternatives": _verdict.get("alternatives") or [],
+                    "text": question[:20], "source": "analysis"}
+                _sst.merge(conv, _write)
+                logger.info("语境深判 act=%s target=%s origin=%s conf=%s tone=%s conv=%s",
+                            _verdict.get("act"), _verdict.get("target"), _verdict.get("origin"),
+                            _verdict.get("confidence"), _verdict.get("tone"), conv)
+            # 待办推进：create / keep / resolve。**结构校验在模块里，语义判断归模型**；
+            # 复用判定（reused）的 pending 一律为空，不会凭空建单或结项。
+            _pending = _verdict.get("pending") if isinstance(_verdict, dict) else None
+            if isinstance(_pending, dict) and _pending:
+                try:
+                    from . import persona_intents
+
+                    _puid = str(getattr(event, "user_id", "") or "")
+                    _pmid = getattr(event, "message_id", None)
+                    _op = str(_pending.get("op") or "")
+                    if _op == "create":
+                        persona_intents.propose(conv, _puid, kind=str(_pending.get("kind") or ""),
+                                                message_id=_pmid,
+                                                summary=str(_pending.get("summary") or ""),
+                                                evidence=_pending.get("evidence") or [])
+                    elif _op == "keep":
+                        persona_intents.keep(conv, _puid, ref=str(_pending.get("ref") or ""),
+                                             message_id=_pmid)
+                    elif _op == "resolve":
+                        persona_intents.settle(conv, _puid, ref=str(_pending.get("ref") or ""),
+                                               evidence=_pending.get("evidence") or [],
+                                               message_id=_pmid)
+                except Exception:  # noqa: BLE001 - 待办出问题不能拖垮回复
+                    logger.debug("待办推进失败 conv=%s", conv)
+    except Exception:  # noqa: BLE001 - 深判失败不能拖垮回复
+        logger.debug("语境深判失败 conv=%s", conv, exc_info=True)
     # `image_segments` 上面已经取过（指令要用），这里不再重复调用
     file_segments = files.extract_files(event)
 
@@ -1247,6 +1403,19 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         else:
             logger.debug("纯附件消息，按配置保持安静 conv=%s", conv)
             return
+
+    # 情绪事件：用**本轮同一份语境判断**（`_verdict`），不再让 observe 自己再判一遍。
+    # 这是 §13.4 的硬要求：检索与状态更新必须消费同一个结论。
+    try:
+        from . import persona_vector
+
+        persona_vector.observe(question, conv=conv,
+                               uid=str(getattr(event, "user_id", "") or ""),
+                               is_master=is_master,
+                               message_id=getattr(event, "message_id", None),
+                               verdict=_verdict or None)
+    except Exception:  # noqa: BLE001
+        logger.exception("情绪事件处理失败 conv=%s", conv)
 
     # 被叫出来的时候，把这次的问题记成「话题」，启动注意力机制：
     # 之后一段时间的发言会按跟这个话题的相关度累积注意力，够了就不用再 @ 它。
@@ -1311,6 +1480,14 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
                 logger.info("用上了最近发过的图 conv=%s", conv)
 
     # 组装 prompt：人设 → 风格要求 → 记录读法 → 时间 → 长期记忆 → 机制事实 → 聊天记录 → 本次发言
+    # 深判结果同时决定示例检索用哪个场景（`scene_hint`）——不再让检索自己再猜一次
+    _scene_hint = ""
+    if _verdict.get("act") and _verdict["act"] != "unknown":
+        _scene_hint = context._LEGACY_SCENE.get(_verdict["act"], _verdict["act"])
+
+    # `state` 回收本轮注入过的发送事件 id：正文真的发出去之后才确认"展示过"（#0014）。
+    # 读取本身无副作用 —— 发不出去也不会把这些事件消耗掉。
+    send_state: dict[str, Any] = {}
     messages, user_text = context.build(
         conv=conv,
         log=log,
@@ -1323,6 +1500,11 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         is_master=is_master,
         instruction_note=action.prompt_note,
         bot_uid=str(getattr(bot, "self_id", "") or ""),
+        uid=str(getattr(event, "user_id", "") or ""),
+        scene_hint=_scene_hint,
+        quoted_id=quoted_msg_id,
+        state=send_state,
+        message_id=getattr(event, "message_id", None),
     )
     # 有图时最后一条 user 消息换成多模态数组
     messages[-1]["content"] = stickers.content_with_images(user_text, vision_images)
@@ -1375,7 +1557,45 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
                 await _send(bot, event, config.MSG_ERROR)
                 return
 
+    # 模型自评的情绪标记：**先剥离再发**（开关关着也剥，避免标记漏到群里）；
+    # 开关打开时才应用，且幅度由 persona_vector 再裁一次。
+    try:
+        from . import persona_vector
+
+        answer, _vec = persona_vector.record_llm(answer)
+        if _vec:
+            # 自评走**后置**阶段：同一条用户消息的 pre/post 各记一次，互不吞（#0010 §0.2）
+            persona_vector.apply_event(
+                persona_vector.build_event(_vec, kind="llm_vec", item="llm_vec",
+                                           message_id=getattr(event, "message_id", None)),
+                source="llm", conv=conv, uid=str(getattr(event, "user_id", "") or ""),
+                phase="post", message_id=getattr(event, "message_id", None))
+    except Exception:  # noqa: BLE001 - 情绪标记出错不能拖垮回复
+        logger.exception("矢量标记处理失败 conv=%s", conv)
+
+    # 语境标记：同样是**先剥离再发**。它的作用是给「下一轮」留一份对话性质摘要
+    # （方案 §14.2 接入点二：这条路覆盖面比注意力大——每次回复都能补一笔）。
+    # 注意顺序：必须在 `_polish` 与落盘之前剥掉，否则标记会进聊天记录、也会漏到群里。
+    try:
+        from . import scene_state
+
+        answer, _ctx = scene_state.record_llm(
+            answer, conv=conv, message_id=getattr(event, "message_id", None))
+        if _ctx:
+            logger.debug("语境标记已应用 conv=%s %s", conv, _ctx)
+    except Exception:  # noqa: BLE001 - 语境标记出错不能拖垮回复
+        logger.debug("语境标记处理失败 conv=%s", conv, exc_info=True)
+
     answer = _polish(answer, question=question)
+
+    # 长度上限：放在 polish 之后、落盘与分段发送之前 ——
+    # 聊天记录里存的必须是**实际发出去的那一份**，否则翻旧账会看到从没发过的内容。
+    # 为什么是截断而不是让模型重写：重写多一次调用、结果还不确定；
+    # 而长度是可数的，代码截断是确定性的（与 behavior.py 的分工一致）。
+    _before_len = len(answer)
+    answer = context.limit_length(answer, conv=conv, question=question)
+    if len(answer) < _before_len:
+        logger.info("回复超长已截断 %d→%d 字 conv=%s", _before_len, len(answer), conv)
     if not answer:
         # 【判定】空回复是**故障**：要在群里**报错**，但报的必须是"错误通报"、
         # 不是人设化的俏皮话。
@@ -1402,6 +1622,15 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
             answer = f"{prefix}{answer}"
         logger.info("本轮回答基于联网结果 conv=%s 搜索词=%s", conv, searched)
 
+    # 表情：按概率在末尾缀一个颜文字（文字类表情，与图片表情分开的开关）。
+    # **放在落盘之前** —— 聊天记录里必须就是实际发出去的那段文字，
+    # 否则下一轮它读到的自己跟群里看到的不一致。
+    # 与 60 字预算的关系：颜文字是表情不是正文，**不计入** `reply_max_chars`。
+    _kao = stickers.pick_text_sticker(conv=conv, is_master=_is_master(event))
+    if _kao:
+        answer = f"{answer} {_kao}"
+        logger.debug("回复缀颜文字 conv=%s", conv)
+
     # 机器人的回复标为已读落盘；再把本次处理到的消息标记已读。
     # 注意先 append 再 mark_read_until：mark 用 id 上界，不会误伤刚写入的回复。
     _msg, _rolled = await chatlog.append_message(
@@ -1419,23 +1648,75 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         marked = await chatlog.mark_read_until(conv, current_id)
         logger.info("conv=%s 已标记 %d 条为已读", conv, marked)
 
-    chunks = _split_for_qq(answer)
-    for idx, chunk in enumerate(chunks):
-        await _send(bot, event, Message(chunk))
-        if idx < len(chunks) - 1:
-            # 间隔：只有一条时不需要等；分多条时停得久一点，像真人打字。
-            # 间隔太大显得卡，太小会被风控判成刷屏 —— 默认 0.9 秒。
-            delay = (
-                float(settings.get("sentence_split_delay"))
-                if len(chunks) > 1
-                else 0.4
-            )
-            await asyncio.sleep(delay)
-    if len(chunks) > 1:
-        logger.info("回答分 %d 条发送 conv=%s", len(chunks), conv)
+    # 发送阶段按会话串行：语音合成可能十几秒，若不排它，下一轮文字会先到，
+    # 造成"后一句先到、前一句语音后到"。锁只包发送，不包模型调用。
+    # 待办计数：**必须在发送块内提交**（`finally`），不能放到整块之后 ——
+    # 分片第 2 片抛错时，块后面的代码根本走不到（#0012 P1-7）。
+    # 只认"正文首片或语音成功"，错误提示与贴图都不算。
+    try:
+        from . import persona_intents as _intents
+    except Exception:  # noqa: BLE001
+        _intents = None
+    send_lock = _send_lock(conv)
+    # 如果这个会话上一条还在发（很可能在合成语音），本轮就别再排一段语音：
+    # 既避免"等完上一条再等自己这条"的叠加延迟，也避免连续语音刷屏。
+    # 注意只是**放弃语音介质**，正文照样按文字发，不丢内容。
+    queued_behind = send_lock.locked()
+    async with send_lock:
+        # 随机语音：每次回复掷一次骰；命中且文本适合朗读才合成。
+        # 合成失败、GPU 忙（别的会话在合成）、文本含代码/链接/表格 → 一律回退文字，
+        # **本轮内容一条都不会少**，只是换个介质发。
+        voice_msg = None
+        voice_sent = False
+        text_sent = False
+        voice_chance = float(settings.get("voice_reply_chance") or 0.0)
+        if not queued_behind and voice_chance > 0 and random.random() < voice_chance:
+            voice_msg = await voice.as_reply(answer, event)
+        if voice_msg is not None:
+            try:
+                sent = await _send(bot, event, voice_msg)
+                voice_sent = True
+                logger.info("语音回复已发送 conv=%s message_id=%s", conv, voice._message_id(sent))
+            except Exception:  # noqa: BLE001 - 发送失败退回文字，避免整轮没回
+                logger.exception("语音回复发送失败，回退文字 conv=%s", conv)
+                voice_msg = None
 
-    # 主观性的一环：有时候不回文字就够了，配张图更像群里的人
-    await _maybe_send_sticker(bot, event, conv)
+        if voice_msg is None:
+            chunks = _split_for_qq(answer)
+            for idx, chunk in enumerate(chunks):
+                # 每片成功后置位：第 2 片抛错时，`finally` 里仍要能算"这一轮发出去了"
+                await _send(bot, event, Message(chunk))
+                text_sent = True
+                if idx < len(chunks) - 1:
+                    # 间隔：只有一条时不需要等；分多条时停得久一点，像真人打字。
+                    # 间隔太大显得卡，太小会被风控判成刷屏 —— 默认 0.9 秒。
+                    delay = (
+                        float(settings.get("sentence_split_delay"))
+                        if len(chunks) > 1
+                        else 0.4
+                    )
+                    await asyncio.sleep(delay)
+            if len(chunks) > 1:
+                logger.info("回答分 %d 条发送 conv=%s", len(chunks), conv)
+
+            # 主观性的一环：有时候不回文字就够了，配张图更像群里的人。
+            # 语音模式跳过配图，避免一轮两条消息。
+            await _maybe_send_sticker(bot, event, conv)
+
+        if _intents is not None and (voice_sent or text_sent):
+            try:
+                _intents.note_attempt(conv, str(getattr(event, "user_id", "") or ""),
+                                      message_id=getattr(event, "message_id", None))
+            except Exception:  # noqa: BLE001 - 计数失败不能影响已发出的消息
+                logger.debug("待办计数失败 conv=%s", conv)
+
+        # 正文真的发出去了，才把本轮注入过的发送事件记成"展示过"。
+        # 只用于观测，不影响下一轮能否再读到 —— 见 stickers 里的说明。
+        if voice_sent or voice_msg is None:
+            try:
+                await stickers.mark_shown(list(send_state.get("send_events") or []))
+            except Exception:  # noqa: BLE001 - 统计失败不能影响这一轮
+                logger.exception("记录发送事件展示失败 conv=%s", conv)
 
     # 注意力：接过一次话就减半 —— 后面相关度高还能接着聊，但不会没完没了
     attention.relax(conv)
@@ -1456,12 +1737,12 @@ async def _reply(bot: Bot, event: MessageEvent, trigger: str) -> None:
         _spawn(memory.extract_and_store(conv), name="memory.extract_and_store", kind="extract")
 
 
-# ----------------------------------------------------------- 后台：主动发言与定时问候
+# ----------------------------------------------------------- 后台：定时问候与记忆
 _driver = get_driver()
 
 
 @_driver.on_startup
-async def _start_proactive() -> None:
+async def _startup_tasks() -> None:
     settings.store.load()
     # 记忆、会话图片策略、时钟偏移都是懒加载的，启动时先读一次：
     # 一是不用等第一条消息才碰盘，二是出问题时能在启动日志里看见。
@@ -1475,7 +1756,6 @@ async def _start_proactive() -> None:
     # 不恢复的话那几条消息会退回未校准的系统时钟），再起后台同步任务。
     clock._state.ensure()  # noqa: SLF001
     _spawn(clock.loop(), name="clock.loop", kind="loop")
-    _spawn(proactive.loop(), name="proactive.loop", kind="loop")
     _spawn(greetings.loop(), name="greetings.loop", kind="loop")
     # 后台补抽：把「有人聊过但没人 @ 它、或当时额度用完了」的记录补进记忆库。
     # 这是水位线的配套 —— 没有它，水位线只会被回复路径推着慢慢走。
@@ -1485,13 +1765,14 @@ async def _start_proactive() -> None:
     _spawn(msgindex.index_loop(), name="msgindex.index_loop", kind="loop")
     # 使用计数落盘：`used` 每一轮回复都在涨，攒着批量写（不调模型、不花 token）。
     _spawn(memory.usage_loop(), name="memory.usage_loop", kind="loop")
-    # 人格自我迭代（路线 C）：定期反思 → 候选 → 过冲突闸门 → 只写表层人设。
-    # 它是三层结构里唯一有写权限的东西，且底层/铁律连写路径都不存在。
-    _spawn(persona_iter.reflect_loop(), name="persona_iter.reflect_loop", kind="loop")
+    # 人格自我迭代（旧版「定期反思 → 候选池」）已停用；
+    # 现在由**评估结果**驱动修订，每天固定时刻跑一轮评估 + 修订。
+    _spawn(persona_eval.daily_loop(), name="persona_eval.daily_loop", kind="loop")
+    # #0015 D4：提案通知单独一条循环 —— 评估 03:00 跑，通知等到 08:00（`eval_proposal_notify_hour`）。
+    _spawn(persona_eval.proposal_notice_loop(), name="persona_eval.proposal_notice_loop", kind="loop")
     logger.info(
-        "后台任务已启动（主动发言：%s；定时问候：%s；长期记忆：%s/%s 条；"
-        "会话摘要：%s/%s 轮；聊天记录索引：%s/%s 条；人格自我迭代：%s；当前时间：%s）",
-        "开" if settings.get("proactive_enabled") else "关",
+        "后台任务已启动（定时问候：%s；长期记忆：%s/%s 条；"
+        "会话摘要：%s/%s 轮；聊天记录索引：%s/%s 条；评估与自动修订：%s（每天 %02d:00）；当前时间：%s）",
         "开" if settings.get("greet_enabled") else "关",
         "开" if settings.get("memory_enabled") else "关",
         memory.stats()["facts"],
@@ -1499,7 +1780,8 @@ async def _start_proactive() -> None:
         summaries.stats()["items"],
         "开" if settings.get("msgindex_enabled") else "关",
         msgindex.stats()["messages"],
-        "开" if settings.get("persona_iter_enabled") else "关",
+        "开" if persona_eval.enabled() else "关",
+        int(settings.get("eval_daily_hour") or 3),
         config.now_stamp(),
     )
     # 记忆库后端与只读状态一并报出来：**后端换了**是排查时第一个要知道的事
@@ -1562,6 +1844,19 @@ async def _start_proactive() -> None:
         for _c in _mig["conflicts"]:
             logger.error("人格运行数据迁移冲突：%s", _c)
     logger.info(config.seed_surface())
+    logger.info(config.seed_v2_for(config.active_persona_id()))
+    # 语音：**开没开、连的是哪儿**是排查"发了 /语音 没反应"的第一问，所以启动就说清楚。
+    # 不打印令牌；参考音频是服务端路径，这里只说有没有配。
+    _vp = voices.resolve()
+    logger.info(
+        "语音：%s（endpoint=%s，当前音色=%s，上限 %d 字 / %.0f 秒）｜额外白名单 用户=%s 群=%s",
+        "开" if settings.get("tts_enabled") else "关",
+        config.TTS_ENDPOINT or "未配置",
+        _vp.get("name") or _vp.get("id"),
+        int(settings.get("tts_max_chars") or config.TTS_MAX_CHARS),
+        float(settings.get("tts_max_seconds") or config.TTS_MAX_SECONDS),
+        config.TTS_ALLOWED_USERS or "仅主人", config.TTS_ALLOWED_GROUPS or "无",
+    )
     # 人格包：**当前读的是哪一个**是排查人格问题的第一问，所以单独打一条，
     # 并把可用包数列出来 —— "切过去没生效"通常是切错了包或包不合法。
     _pk = packs.stats()
@@ -1597,11 +1892,14 @@ async def _start_proactive() -> None:
             "聊天记录里的归属判定会退化。用 /昵称 %s 或清掉设置里的 bot_name 覆盖。",
             _bot, view["bot_name"], view["bot_name"],
         )
-    _pit = persona_iter.stats()
+    _ev = persona_eval.status()
     logger.info(
-        "人格自我迭代：%s（每 %d 秒一次，最多 %d 条/次）｜至今写入 %d 条、被闸门拦下 %d 条",
-        "开" if _pit["enabled"] else "关",
-        _pit["interval"], _pit["max"], _pit["written_total"], _pit["rejected_total"],
+        "人格评估与自动修订：%s（每天 %02d:00）｜基线 %d/%d、待修 %d 个特质、历史修订 %d 次",
+        "开" if _ev["enabled"] else "关",
+        _ev.get("daily_hour", 3),
+        _ev["with_baseline"], len(_ev["traits"]),
+        len(_ev.get("targets") or []),
+        _ev.get("revisions", 0),
     )
     if not _pst["base_chars"]:
         logger.warning(

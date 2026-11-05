@@ -80,7 +80,7 @@ _inflight: set[str] = set()
 
 
 def _path() -> Path:
-    return config.LOG_DIR / _FILE
+    return config.runtime_root() / _FILE
 
 
 def _now() -> str:

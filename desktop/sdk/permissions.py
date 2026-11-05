@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-# 方案 5.3 列出的 15 个权限，一个不多一个不少。
+# 方案 5.3 列出的权限（去掉已下线的主动发言后为 14 个；#0015 加 2 个评估权限 = 16）。
 PERMISSIONS: dict[str, str] = {
     "api.read.status": "读运行状态与总览数据",
     "api.read.settings": "读全部参数",
@@ -29,13 +29,14 @@ PERMISSIONS: dict[str, str] = {
     "api.write.models": "改模型档案（切换 / 保存 / 删除）",
     "api.read.persona": "读人格三层与改动日志",
     "api.action.persona": "触发行人设动作（撤回 / 反思 / 评估）",
+    "api.read.eval": "读评估案例、反馈链、采样队列与 trace（只读）",
+    "api.action.eval": "触发回放/评审（会花 token）；仍不得直接采纳提案",
     "api.read.memory": "读记忆画像、事实与群事件",
     "api.write.memory": "写记忆（新增 / 保护 / 删除）",
     "api.read.images": "读图片策略",
     "api.write.images": "改图片策略",
     "api.read.stickers": "读表情包列表与图片",
     "api.write.stickers": "删表情包",
-    "api.action.speak": "触发主动发言",
     "api.action.greet": "触发手动问候",
 }
 
@@ -78,11 +79,32 @@ ROUTES: tuple[RouteRule, ...] = (
     RouteRule("POST", "/api/model/test", "api.write.models", "探活（会花 token）"),
     RouteRule("POST", "/api/model/save", "api.write.models", "保存档案 JSON"),
     RouteRule("POST", "/api/model/delete", "api.write.models", "删除档案"),
+    RouteRule("GET", "/api/persona/proposals", "api.read.persona", "待确认提案列表"),
+    RouteRule("GET", "/api/persona/proposal", "api.read.persona", "提案详情（before/after）"),
+    RouteRule("POST", "/api/persona/proposal", "api.action.persona", "采纳/拒绝提案"),
     RouteRule("GET", "/api/persona/packs", "api.read.persona", "人格包列表"),
     RouteRule("POST", "/api/persona/switch", "api.action.persona", "切换人格包"),
     RouteRule("POST", "/api/persona/undo", "api.action.persona", "撤回自动改动"),
     RouteRule("POST", "/api/persona/reflect", "api.action.persona", "手动反思"),
     RouteRule("POST", "/api/persona/eval", "api.action.persona", "评估素材/基线"),
+    # #0015：评估台读写。**案例/反馈只入库，不改人格**；采纳仍要 api.action.persona。
+    RouteRule("GET", "/api/persona/eval/cases", "api.read.eval", "评估案例列表与概况"),
+    RouteRule("GET", "/api/persona/eval/feedback", "api.read.eval", "反馈链与字段契约"),
+    RouteRule("POST", "/api/persona/eval/feedback", "api.action.eval", "写一条反馈（入库不采纳）"),
+    RouteRule("GET", "/api/persona/eval/sampling", "api.read.eval", "采样队列与待处理"),
+    # 补登既有但漏登记的 11 条（codex P1 指出的漂移）：服务端有、白名单没有，
+    # 插件调用会被判「未登记路径」。它们都只读或只改运行状态，按原语义归到 persona 两档。
+    # 注意：`POST /api/persona` 与 `/api/persona/clear` 是**故意不登记**的 ——
+    # 它们是恒 410 的墓碑，登记等于给一个已废弃的入口发权限（自检里也断言了这条）。
+    RouteRule("POST", "/api/persona/boundary", "api.action.persona", "边界检查（只诊断）"),
+    RouteRule("POST", "/api/persona/likeness", "api.action.persona", "像人判别（花 token）"),
+    RouteRule("GET", "/api/persona/likeness/candidates", "api.read.persona", "候选样本列表"),
+    RouteRule("POST", "/api/persona/likeness/generate", "api.action.persona", "生成候选（花 token）"),
+    RouteRule("POST", "/api/persona/likeness/select", "api.action.persona", "勾选候选"),
+    RouteRule("POST", "/api/persona/window", "api.action.persona", "语料窗口评估"),
+    RouteRule("POST", "/api/persona/vector", "api.action.persona", "重置行为矢量"),
+    RouteRule("POST", "/api/persona/relation", "api.action.persona", "改关系参数"),
+    RouteRule("POST", "/api/persona/examples", "api.action.persona", "增删示例"),
     RouteRule("POST", "/api/memory", "api.write.memory", "新增记忆"),
     RouteRule("DELETE", "/api/memory/{item_id}", "api.write.memory", "删除记忆"),
     RouteRule("POST", "/api/memory/{item_id}/protect", "api.write.memory", "保护/解除"),
@@ -90,7 +112,6 @@ ROUTES: tuple[RouteRule, ...] = (
     RouteRule("GET", "/api/stickers", "api.read.stickers", "表情包列表与统计"),
     RouteRule("GET", "/api/stickers/{digest}", "api.read.stickers", "缩略图/原图"),
     RouteRule("DELETE", "/api/stickers/{digest}", "api.write.stickers", "删除表情包"),
-    RouteRule("POST", "/api/speak", "api.action.speak", "主动发言（会花 token）"),
     RouteRule("POST", "/api/greet", "api.action.greet", "手动问候（会花 token）"),
     # `GET /api/capabilities` 是只读探测，归到"读状态"，让插件能自己判能力。
     RouteRule("GET", "/api/capabilities", "api.read.status", "后端能力探测（服务端暂未提供）"),

@@ -276,7 +276,7 @@ def check_write_not_retried(server: StubServer, token: str) -> str:
     try:
         before = len(server.cfg.settings_posts)
         client = ApiClient(server.base_url, prefix="/ai", token=token, timeout=5.0, max_retries=3)
-        _expect_error(lambda: client.set_settings(proactive_enabled=True), 503)
+        _expect_error(lambda: client.set_settings(search_enabled=False), 503)
         # 写请求只允许发一次：重试写可能造成重复入库/重复发言。
         posts = [r for r in server.cfg.requests if r[0] == "POST" and r[1].endswith("/api/settings")]
         assert len(posts) - before <= 1, f"写请求被重试了 {len(posts) - before} 次"
@@ -460,7 +460,6 @@ def check_permission_table() -> str:
         ("POST", "/api/memory/12/protect", "api.write.memory"),
         ("GET", "/api/stickers/abc", "api.read.stickers"),
         ("DELETE", "/api/stickers/abc", "api.write.stickers"),
-        ("POST", "/api/speak", "api.action.speak"),
         ("POST", "/api/greet", "api.action.greet"),
     ]
     for method, path, want in cases:
@@ -474,9 +473,9 @@ def check_permission_table() -> str:
     # 放行的依据是"插件确实声明了某个 api.read.*"，返回值是它实际用到的那条声明。
     assert used == "api.read.stickers", f"只读权限应能借 state 取数，实际：{used}"
     try:
-        permissions.check("demo", declared, "POST", "/api/speak", prefix="/ai")
+        permissions.check("demo", declared, "POST", "/api/greet", prefix="/ai")
     except PermissionDenied as exc:
-        assert exc.permission == "api.action.speak", exc
+        assert exc.permission == "api.action.greet", exc
     else:
         raise AssertionError("越权调用没有被拒绝")
     try:
@@ -734,8 +733,14 @@ def check_webui_paths_match_scheme() -> str:
         '/api/model/test', '/api/model/save', '/api/model/delete',
         '/api/persona/packs', '/api/persona/switch',
         '/api/persona/undo',
-        '/api/persona/reflect', '/api/persona/eval', '/api/memory', '/api/image-policy',
-        '/api/stickers', '/api/speak', '/api/greet',
+        '/api/persona/reflect', '/api/persona/eval',
+        # 2026-11-03（#0006）：提案的列表 / 详情 / 采纳拒绝三个入口
+        '/api/persona/proposals', '/api/persona/proposal',
+        # 2026-11-05（#0015 M4）：评估案例 / 反馈 / 采样三条只读 + 一条写入
+        '/api/persona/eval/cases', '/api/persona/eval/feedback',
+        '/api/persona/eval/sampling',
+        '/api/memory', '/api/image-policy',
+        '/api/stickers', '/api/greet',
     ]
     missing = [item for item in expected if f'prefix + "{item}"' not in webui]
     assert not missing, f"这些路由在 webui.py 里找不到了：{missing}"

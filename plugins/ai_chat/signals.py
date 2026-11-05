@@ -325,6 +325,8 @@ def record(
     uid: int = 0,
     executed: bool = False,
     source: str = "自然语言",
+    message_id: Any = None,
+    quoted_id: str = "",
 ) -> int:
     """把识别到的信号落账。返回真正记下的条数（去重后）。
 
@@ -357,6 +359,12 @@ def record(
                     "propose": sig.get("propose") or _PROPOSALS.get(kind, {}),
                     "executed": bool(executed),
                     "source": str(source)[:20],
+                    # #0015 P1-4：身份与定锚。`uid=0` 表示**没能确定是谁说的**
+                    # （旧写法一律写成 master_qq，等于把群友的意见算成主人的）。
+                    # 这种条目标 `unconfirmed`，只能当召回候选，不能当主人偏好。
+                    "message_id": message_id,
+                    "quoted_id": str(quoted_id or ""),
+                    "status": "confirmed" if int(uid or 0) > 0 else "unconfirmed",
                 }
             )
             added += 1

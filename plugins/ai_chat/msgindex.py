@@ -75,7 +75,7 @@ _MAX_TEXT = 500
 
 # --------------------------------------------------------------------- 连接
 def _db_path() -> Path:
-    return config.LOG_DIR / "memory.db"
+    return config.runtime_root() / "memory.db"
 
 
 def _connect() -> sqlite3.Connection:
@@ -211,7 +211,7 @@ def index_conv(conv: str, *, batch: int = 400, include_archived: bool = True) ->
 
 def _index_archive(conv: str) -> int:
     """把归档文件（超上限被挪走的旧消息）也纳入索引。幂等（按 conv+msg_id 覆盖）。"""
-    path = config.LOG_DIR / f"chatlog_{conv}.archive.jsonl"
+    path = config.runtime_root() / f"chatlog_{conv}.archive.jsonl"
     if not path.exists():
         return 0
     try:
@@ -268,7 +268,7 @@ def backfill_from_disk(*, max_convs: int = 0, batch: int = 2000) -> dict[str, in
     实测单群 170 KB、4 个会话毫秒级完成。
     """
     changed: dict[str, int] = {}
-    files = sorted(config.LOG_DIR.glob("chatlog_*.json"))
+    files = sorted(config.runtime_root().glob("chatlog_*.json"))
     done = 0
     for path in files:
         if max_convs > 0 and done >= max_convs:
