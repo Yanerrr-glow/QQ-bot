@@ -306,6 +306,38 @@ class _AsyncOpenAI:
 _openai.AsyncOpenAI = _AsyncOpenAI
 
 
+# ---- 假 httpx：`tts.py` 用它发合成请求，而 CI 只装标准库 ----
+# 为什么不把 tts.py 改成 urllib：那要重写两处 `async with AsyncClient(...)`，
+# 而它在容器里跑得好（httpx 由 openai 间接带入，requirements 里没有单列）。
+# 桩里挡一层更小、也不动线上链路。**只做形状**：桩不发起真实请求。
+_httpx = types.ModuleType("httpx")
+
+
+class _HttpxTimeout:
+    def __init__(self, *a, **k):
+        pass
+
+
+class _HttpxTimeoutException(Exception):
+    pass
+
+
+class _HttpxAsyncClient:
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        raise RuntimeError("桩环境不发起真实请求")
+
+    async def __aexit__(self, *exc):  # noqa: ANN002
+        return False
+
+
+_httpx.Timeout = _HttpxTimeout
+_httpx.TimeoutException = _HttpxTimeoutException
+_httpx.AsyncClient = _HttpxAsyncClient
+
+
 # ---- 假模型：打桩点收敛成了一处 ----
 # 改造前十个模块各自建 `_client`，桩得逐个替换；现在调用统一走 `llm.chat`，
 # 所以只替换这一个函数就够了（`pkg.llm` 是包内 `from . import llm` 暴露的属性）。
@@ -344,6 +376,8 @@ for _mod_name, _mod in [
     ("nonebot.adapters.onebot", _adapters.onebot),
     ("nonebot.adapters.onebot.v11", _ob11),
     ("openai", _openai),
+    ("httpx", _httpx),   # tts.py 的依赖；CI 只装标准库
+    ("httpx2", _httpx),  # 容器里的另一个名字（tts.py 的 import 兜底分支）
     ("fastapi", _fastapi),
     ("fastapi.responses", _fastapi.responses),
 ]:
