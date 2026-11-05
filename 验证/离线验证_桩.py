@@ -783,147 +783,154 @@ check("底层覆盖文件已移除", config.layer_is_overridden("base") is False
 from ai_chat import persona_eval as _pe, persona_revise as _pr  # noqa: E402
 
 check("每日时刻计算落在 0~24h 内", 0 < _pe._seconds_until_daily(3) <= 86400)  # noqa: SLF001
-_old_eval_on = settings.get("eval_enabled")
-_old_iter_on = settings.get("eval_iter_enabled")
-_old_propose_on = settings.get("eval_propose_only")
-settings.set_value("eval_enabled", True)
-settings.set_value("eval_iter_enabled", True)
-# 这一段测的是**提交链路**，所以显式关掉"只提案"（它默认是开的）
-settings.set_value("eval_propose_only", False)
-_eval_data = _pe._load()
-_eval_data.setdefault("artifacts", {})["mechanism_leak"] = {
-    "rubric": "是否泄漏机制或参数", "eval_questions": ["随便聊聊"]}
-_eval_data.setdefault("baseline", {})["mechanism_leak"] = {"score": 90}
-_pe._save(_eval_data)
-_targets = _pe.revision_targets()
-check("高分压制型特质进入待修清单", any(x["slug"] == "mechanism_leak" for x in _targets), str(_targets)[:120])
-# #0015 M5：修订只允许改示例（surface 已从白名单移除），所以链路测试改用 add examples。
-_rev_json = json.dumps({"ops": [{
-    "op": "add", "target": "examples", "id": "rev-chain-example",
-    "polarity": "good", "tags": ["scene:闲聊"], "ctx": ["对方：测试链路"],
-    "say": ["你：收到。"], "why": "测试链路",
-}]}, ensure_ascii=False)
-
-import ai_chat as _pkg  # noqa: E402
-
-_orig_chat_fn = _pkg.llm.chat
-_orig_revision_verify = _pe.verify_revision
-
-async def _fake_revision_verify(plan):
-    return {"passed": True, "why": "仅测试提交链路，复核另有回归"}
-
-_pe.verify_revision = _fake_revision_verify
-
-
-async def _fake_rev_chat(messages, **kwargs):
-    return types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=_rev_json))]
-    )
-
-
-_pkg.llm.chat = _fake_rev_chat  # type: ignore[assignment]
-try:
-    _chain = asyncio.run(_pr.revise_from_eval(source="离线", force=True))
-finally:
-    _pkg.llm.chat = _orig_chat_fn  # type: ignore[assignment]
-    _pe.verify_revision = _orig_revision_verify
-check("评估驱动的修订链路写入成功", bool(_chain.get("ok")), str(_chain)[:200])
-check("修订内容进示例库",
-      any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
-persona.undo_revision()
-check("链路修订可整版回滚",
-      not any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
-settings.set_value("eval_enabled", _old_eval_on)
-settings.set_value("eval_iter_enabled", _old_iter_on)
-settings.set_value("eval_propose_only", _old_propose_on)
-
-# ---- A+：提案 / 提交拆开（eval_propose_only）----
-# 这条链路的意义：模型可以继续"会评分、会提案"，但**不直接改写线上人格**。
-# 三个断言缺一不可：只提案不写盘、提案能被列出来、人工确认后才生效。
-from ai_chat import persona_revision_batch as _pbrb  # noqa: E402
-
-_old_propose = settings.get("eval_propose_only")
-settings.set_value("eval_propose_only", True)
-settings.set_value("eval_enabled", True)
-
-
-def _proposal_round(mark: str):
-    """跑一轮"评估 → 提案"，返回结果。`mark` 是写进表层的标记词。"""
-    payload = json.dumps({"ops": [{
-        "op": "add", "target": "examples", "id": f"prop-{mark}",
-        "polarity": "good", "tags": ["scene:闲聊"], "ctx": [f"对方：{mark}"],
-        "say": ["你：收到。"], "why": "提案链路测试",
+if REGISTRY_ABSENT:
+    # 注册表（`persona/packs/whale_v2/traits.json`）不随公开副本分发，
+    # 而这条链路的第一步就是「从注册表挑特质」—— 没有它整段无从谈起。
+    # 跳过而不是改断言：让 CI 保持绿，同时把「没跑」写进汇总。
+    skip_group("评估驱动修订链路（依赖 traits.json 注册表）",
+               "副本不分发 persona/packs/whale_v2/traits.json")
+else:
+    _old_eval_on = settings.get("eval_enabled")
+    _old_iter_on = settings.get("eval_iter_enabled")
+    _old_propose_on = settings.get("eval_propose_only")
+    settings.set_value("eval_enabled", True)
+    settings.set_value("eval_iter_enabled", True)
+    # 这一段测的是**提交链路**，所以显式关掉"只提案"（它默认是开的）
+    settings.set_value("eval_propose_only", False)
+    _eval_data = _pe._load()
+    _eval_data.setdefault("artifacts", {})["mechanism_leak"] = {
+        "rubric": "是否泄漏机制或参数", "eval_questions": ["随便聊聊"]}
+    _eval_data.setdefault("baseline", {})["mechanism_leak"] = {"score": 90}
+    _pe._save(_eval_data)
+    _targets = _pe.revision_targets()
+    check("高分压制型特质进入待修清单", any(x["slug"] == "mechanism_leak" for x in _targets), str(_targets)[:120])
+    # #0015 M5：修订只允许改示例（surface 已从白名单移除），所以链路测试改用 add examples。
+    _rev_json = json.dumps({"ops": [{
+        "op": "add", "target": "examples", "id": "rev-chain-example",
+        "polarity": "good", "tags": ["scene:闲聊"], "ctx": ["对方：测试链路"],
+        "say": ["你：收到。"], "why": "测试链路",
     }]}, ensure_ascii=False)
 
-    async def _fake(messages, **kwargs):
+    import ai_chat as _pkg  # noqa: E402
+
+    _orig_chat_fn = _pkg.llm.chat
+    _orig_revision_verify = _pe.verify_revision
+
+    async def _fake_revision_verify(plan):
+        return {"passed": True, "why": "仅测试提交链路，复核另有回归"}
+
+    _pe.verify_revision = _fake_revision_verify
+
+
+    async def _fake_rev_chat(messages, **kwargs):
         return types.SimpleNamespace(
-            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=payload))]
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=_rev_json))]
         )
 
-    _orig = _pkg.llm.chat
-    _pkg.llm.chat = _fake  # type: ignore[assignment]
-    _pe.verify_revision = _fake_revision_verify
+
+    _pkg.llm.chat = _fake_rev_chat  # type: ignore[assignment]
     try:
-        return asyncio.run(_pr.revise_from_eval(source="离线提案", force=True))
+        _chain = asyncio.run(_pr.revise_from_eval(source="离线", force=True))
     finally:
-        _pkg.llm.chat = _orig  # type: ignore[assignment]
+        _pkg.llm.chat = _orig_chat_fn  # type: ignore[assignment]
         _pe.verify_revision = _orig_revision_verify
+    check("评估驱动的修订链路写入成功", bool(_chain.get("ok")), str(_chain)[:200])
+    check("修订内容进示例库",
+          any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
+    persona.undo_revision()
+    check("链路修订可整版回滚",
+          not any(str(x.get("id")) == "rev-chain-example" for x in _pex._load()))
+    settings.set_value("eval_enabled", _old_eval_on)
+    settings.set_value("eval_iter_enabled", _old_iter_on)
+    settings.set_value("eval_propose_only", _old_propose_on)
+
+    # ---- A+：提案 / 提交拆开（eval_propose_only）----
+    # 这条链路的意义：模型可以继续"会评分、会提案"，但**不直接改写线上人格**。
+    # 三个断言缺一不可：只提案不写盘、提案能被列出来、人工确认后才生效。
+    from ai_chat import persona_revision_batch as _pbrb  # noqa: E402
+
+    _old_propose = settings.get("eval_propose_only")
+    settings.set_value("eval_propose_only", True)
+    settings.set_value("eval_enabled", True)
 
 
-_prop = _proposal_round("提案链路")
-check("只提案时返回 proposed 且不写线上人格",
-      bool(_prop.get("proposed")) and
-      not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()),
-      str(_prop)[:180])
-_props = _pbrb.list_proposals()
-check("提案能被列出（可从磁盘重读）",
-      any(x.get("rev") == _prop.get("rev") for x in _props), str(_props)[:180])
+    def _proposal_round(mark: str):
+        """跑一轮"评估 → 提案"，返回结果。`mark` 是写进表层的标记词。"""
+        payload = json.dumps({"ops": [{
+            "op": "add", "target": "examples", "id": f"prop-{mark}",
+            "polarity": "good", "tags": ["scene:闲聊"], "ctx": [f"对方：{mark}"],
+            "say": ["你：收到。"], "why": "提案链路测试",
+        }]}, ensure_ascii=False)
 
-_commit = _pbrb.commit_proposal(str(_prop.get("rev") or ""))
-check("人工确认后提交成功", bool(_commit.get("ok")), str(_commit)[:180])
-check("提交后示例才生效",
-      any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
-persona.undo_revision()
-check("提案提交也能整版回滚",
-      not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
+        async def _fake(messages, **kwargs):
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=payload))]
+            )
 
-_prop2 = _proposal_round("提案丢弃")
-_rej = _pbrb.reject_proposal(str(_prop2.get("rev") or ""))
-check("拒绝提案不写盘",
-      bool(_rej.get("ok")) and
-      not any(str(x.get("id")) == "prop-提案丢弃" for x in _pex._load()),
-      str(_rej)[:120])
-check("拒绝后的提案不再出现在待确认列表",
-      all(x.get("rev") != _prop2.get("rev") for x in _pbrb.list_proposals()))
-check("同一提案不能重复提交",
-      _pbrb.commit_proposal(str(_prop2.get("rev") or "")).get("ok") is False)
+        _orig = _pkg.llm.chat
+        _pkg.llm.chat = _fake  # type: ignore[assignment]
+        _pe.verify_revision = _fake_revision_verify
+        try:
+            return asyncio.run(_pr.revise_from_eval(source="离线提案", force=True))
+        finally:
+            _pkg.llm.chat = _orig  # type: ignore[assignment]
+            _pe.verify_revision = _orig_revision_verify
 
-# ---- 过期与状态机（2026-11-03 按 #0006 审阅加）----
-# 原来 `commit_proposal` **完全不看时间**：8 天前的提案只要没被 `expire_old()` 扫到就能提交。
-# 现在 TTL 由后端判并顺手标 expired —— 前端不再自己算，三处入口口径一致。
-_prop3 = _proposal_round("提案过期")
-_rev3 = str(_prop3.get("rev") or "")
-_meta3 = _pbrb._read_batch(_rev3) or {}
-_meta3["at"] = float(_meta3.get("at") or 0) - 8 * 86400      # 假装它是 8 天前生成的
-_pbrb._json(_pbrb._history_root() / _rev3 / "batch.json", _meta3)
-_expired = _pbrb.commit_proposal(_rev3)
-check("超过 7 天的提案不能提交", _expired.get("ok") is False, str(_expired)[:160])
-check("拒绝时顺手把状态标成 expired",
-      str((_pbrb._read_batch(_rev3) or {}).get("status")) == "expired",
-      (_pbrb._read_batch(_rev3) or {}).get("status"))
-check("已过期的提案不能再被拒绝",
-      _pbrb.reject_proposal(_rev3).get("ok") is False)
 
-_detail = _pbrb.proposal_detail(_rev3)
-check("详情接口能给出完整 ops 与逐文件 before/after",
-      isinstance(_detail.get("ops"), list) and isinstance(_detail.get("files"), list)
-      and all({"before", "after"} <= set(row) for row in (_detail.get("files") or [])),
-      str(_detail.get("changed"))[:120])
-check("详情接口自己判过期（前端不重复实现）", _detail.get("expired") is True,
-      f"{_detail.get('expired')} / {_detail.get('age_days')} 天")
+    _prop = _proposal_round("提案链路")
+    check("只提案时返回 proposed 且不写线上人格",
+          bool(_prop.get("proposed")) and
+          not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()),
+          str(_prop)[:180])
+    _props = _pbrb.list_proposals()
+    check("提案能被列出（可从磁盘重读）",
+          any(x.get("rev") == _prop.get("rev") for x in _props), str(_props)[:180])
 
-settings.set_value("eval_propose_only", _old_propose)
-settings.set_value("eval_enabled", _old_eval_on)
+    _commit = _pbrb.commit_proposal(str(_prop.get("rev") or ""))
+    check("人工确认后提交成功", bool(_commit.get("ok")), str(_commit)[:180])
+    check("提交后示例才生效",
+          any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
+    persona.undo_revision()
+    check("提案提交也能整版回滚",
+          not any(str(x.get("id")) == "prop-提案链路" for x in _pex._load()))
+
+    _prop2 = _proposal_round("提案丢弃")
+    _rej = _pbrb.reject_proposal(str(_prop2.get("rev") or ""))
+    check("拒绝提案不写盘",
+          bool(_rej.get("ok")) and
+          not any(str(x.get("id")) == "prop-提案丢弃" for x in _pex._load()),
+          str(_rej)[:120])
+    check("拒绝后的提案不再出现在待确认列表",
+          all(x.get("rev") != _prop2.get("rev") for x in _pbrb.list_proposals()))
+    check("同一提案不能重复提交",
+          _pbrb.commit_proposal(str(_prop2.get("rev") or "")).get("ok") is False)
+
+    # ---- 过期与状态机（2026-11-03 按 #0006 审阅加）----
+    # 原来 `commit_proposal` **完全不看时间**：8 天前的提案只要没被 `expire_old()` 扫到就能提交。
+    # 现在 TTL 由后端判并顺手标 expired —— 前端不再自己算，三处入口口径一致。
+    _prop3 = _proposal_round("提案过期")
+    _rev3 = str(_prop3.get("rev") or "")
+    _meta3 = _pbrb._read_batch(_rev3) or {}
+    _meta3["at"] = float(_meta3.get("at") or 0) - 8 * 86400      # 假装它是 8 天前生成的
+    _pbrb._json(_pbrb._history_root() / _rev3 / "batch.json", _meta3)
+    _expired = _pbrb.commit_proposal(_rev3)
+    check("超过 7 天的提案不能提交", _expired.get("ok") is False, str(_expired)[:160])
+    check("拒绝时顺手把状态标成 expired",
+          str((_pbrb._read_batch(_rev3) or {}).get("status")) == "expired",
+          (_pbrb._read_batch(_rev3) or {}).get("status"))
+    check("已过期的提案不能再被拒绝",
+          _pbrb.reject_proposal(_rev3).get("ok") is False)
+
+    _detail = _pbrb.proposal_detail(_rev3)
+    check("详情接口能给出完整 ops 与逐文件 before/after",
+          isinstance(_detail.get("ops"), list) and isinstance(_detail.get("files"), list)
+          and all({"before", "after"} <= set(row) for row in (_detail.get("files") or [])),
+          str(_detail.get("changed"))[:120])
+    check("详情接口自己判过期（前端不重复实现）", _detail.get("expired") is True,
+          f"{_detail.get('expired')} / {_detail.get('age_days')} 天")
+
+    settings.set_value("eval_propose_only", _old_propose)
+    settings.set_value("eval_enabled", _old_eval_on)
 
 print("\n=== 4.5 禁止事项可逐条解析（闸门的依据） ===")
 _items = persona.forbidden_items()
@@ -5995,34 +6002,40 @@ print("\n=== 示例检索：2-gram 兜底（persona_examples）===")
 # 标签能命中的照旧走标签；标签命不中的靠上文相似救回来；都不像的不许注入。
 _pex = sys.modules["ai_chat.persona_examples"]
 _orig_pex_path = _pex._path
-_pex._path = lambda: ROOT / "persona" / "packs" / "whale_v2" / "examples" / "examples.jsonl"
-try:
-    def _pick_by(text: str) -> list[str]:
-        """按真实调用方式（query + 场景）挑一次，返回命中的 id。"""
-        got = _pex.pick(is_master=False, uid="", private=False, query=text,
-                        scenes=[context._scene_of(text)])
-        return [x["id"] for x in got["good"]] + [x["id"] for x in got["bad"]]
+_SEED_EXAMPLES = ROOT / "persona" / "packs" / "whale_v2" / "examples" / "examples.jsonl"
+if not _SEED_EXAMPLES.exists():
+    # 公开副本不分发 whale_v2（导出脚本 `$SkipPrefix` 整包排除），示例库是空的。
+    # 不能拿空库跑这组断言 —— 那会把「仓库里没有示例」判成「示例检索坏了」。
+    skip_group("示例检索与场景命中", "副本不含 persona/packs/whale_v2 的示例库")
+else:
+    _pex._path = lambda: _SEED_EXAMPLES
+    try:
+        def _pick_by(text: str) -> list[str]:
+            """按真实调用方式（query + 场景）挑一次，返回命中的 id。"""
+            got = _pex.pick(is_master=False, uid="", private=False, query=text,
+                            scenes=[context._scene_of(text)])
+            return [x["id"] for x in got["good"]] + [x["id"] for x in got["bad"]]
 
-    _hit = _pick_by("爱死你了大肥鱼")
-    check("「爱死你了大肥鱼」→ ex-name-01（标签命不中，靠 2-gram）",
-          "ex-name-01" in _hit, _hit)
+        _hit = _pick_by("爱死你了大肥鱼")
+        check("「爱死你了大肥鱼」→ ex-name-01（标签命不中，靠 2-gram）",
+              "ex-name-01" in _hit, _hit)
 
-    _hit2 = _pick_by("你看看，又记错了，我早就做完了呀")
-    check("「又记错了」→ ex-misremember-01", "ex-misremember-01" in _hit2, _hit2)
+        _hit2 = _pick_by("你看看，又记错了，我早就做完了呀")
+        check("「又记错了」→ ex-misremember-01", "ex-misremember-01" in _hit2, _hit2)
 
-    _none = _pick_by("哦哦好的我知道了")
-    check("无关的话不注入任何示例", not _none, _none)
+        _none = _pick_by("哦哦好的我知道了")
+        check("无关的话不注入任何示例", not _none, _none)
 
-    _share = _pick_by("今天天气不错")
-    check("分享场景现在能命中示例（旧实现里是死条目）", _share != [], _share)
+        _share = _pick_by("今天天气不错")
+        check("分享场景现在能命中示例（旧实现里是死条目）", _share != [], _share)
 
-    _other = _pex.pick(is_master=False, uid="", private=False, query="抱一下",
-                       scenes=[context._scene_of("抱一下")])
-    check("非主人拿不到 audience:master 的示例",
-          all("audience:master" not in (x.get("tags") or []) for x in _other["good"]),
-          [x["id"] for x in _other["good"]])
-finally:
-    _pex._path = _orig_pex_path
+        _other = _pex.pick(is_master=False, uid="", private=False, query="抱一下",
+                           scenes=[context._scene_of("抱一下")])
+        check("非主人拿不到 audience:master 的示例",
+              all("audience:master" not in (x.get("tags") or []) for x in _other["good"]),
+              [x["id"] for x in _other["good"]])
+    finally:
+        _pex._path = _orig_pex_path
 
 print("\n=== 注意力顺带产出语境（scene_state）===")
 # 方案 §14.2：语境增量挂在本来就有的 attention 打分调用上，不新开一条串行链。
@@ -6064,7 +6077,7 @@ check("空 topic 不写空值", _sst.load("g_ctx_empty")["topic"] == "",
 _reg_spec = importlib.util.spec_from_file_location("persona_learning_regression", ROOT / "验证" / "_人格学习回归.py")
 _reg_module = importlib.util.module_from_spec(_reg_spec)
 _reg_spec.loader.exec_module(_reg_module)
-_reg_module.run(check)
+_reg_module.run(check, skip_group)
 
 # --------------------------------------------------------------------- 收尾
 # **先把还开着的 sqlite 句柄关掉**

@@ -10,7 +10,15 @@ from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
 
-def run(check):
+def run(check, skip=None):
+    # 公开副本不分发 `persona/packs/whale_v2`（导出脚本 `$SkipPrefix` 整包排除）——
+    # 缺 seed 时**整组跳过并说明原因**，不能崩在读取那一行：CI 会红，而且掩盖别的问题。
+    _seed = Path(__file__).resolve().parent.parent / "persona/packs/whale_v2"
+    if not (_seed / "base.txt").exists() or not (_seed / "examples/examples.jsonl").exists():
+        if skip is not None:
+            skip("人格学习回归（v2 隔离回归）", "副本不分发 persona/packs/whale_v2")
+        return
+
     from ai_chat import config, persona, persona_eval as ev, persona_examples as ex
     from ai_chat import persona_relation as rel, persona_vector as vec
     from ai_chat import persona_revision_batch as batch, context
