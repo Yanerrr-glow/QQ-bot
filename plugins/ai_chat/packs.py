@@ -109,13 +109,16 @@ PACK_FILES: dict[str, str] = {
     "forbidden": "forbidden.txt",
     "surface": "surface.txt",
     "traits": "traits.json",
+    "vector": "vector.json",
+    "examples": "examples/examples.jsonl",
 }
 
 # 必需项：缺了就不该被当成一个能用的包。
 _REQUIRED = ("base", "forbidden", "surface")
 # traits.json 允许缺失 —— `persona.py` / `behavior.py` 都有内置回退
 # （公开副本按设计就不带它：里面含线上真实对话原话）。
-_OPTIONAL = ("traits",)
+# vector / examples 是 v2 包（`_pack.json` 的 `schema: 2`）才要求，v1 包可以没有。
+_OPTIONAL = ("traits", "vector", "examples")
 
 # 一份宽松的包 id 白名单：**只允许 ASCII**。
 # 为什么不用中文目录名：这条 id 会成为外部接口的取值（`/人设 切换 <id>`、
@@ -397,9 +400,18 @@ def validate(pack_id: str) -> dict[str, Any]:
     for role in _REQUIRED:
         if not files[role].is_file():
             errors.append(f"缺 {PACK_FILES[role]}")
+    schema = 0
+    try:
+        schema = int(raw.get("schema") or 0)
+    except (TypeError, ValueError):
+        schema = 0
     for role in _OPTIONAL:
         if not files[role].is_file():
-            warnings.append(f"缺 {PACK_FILES[role]}：闸门会回退到内置默认表")
+            if role in ("vector", "examples") and schema >= 2:
+                # v2 包缺这两样就等于没有情绪/示例，不能悄悄降级成 v1。
+                errors.append(f"v2 包缺 {PACK_FILES[role]}")
+            else:
+                warnings.append(f"缺 {PACK_FILES[role]}：闸门会回退到内置默认表")
 
     base_text = ""
     if files["base"].is_file():
@@ -610,7 +622,11 @@ def identity_patch(pack_id: str) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------- 运行数据
-_RUNTIME_FILES = ("surface.txt", "changelog.json", "candidates.json", "signals.json", "eval.json")
+_RUNTIME_FILES = (
+    "surface.txt", "changelog.json", "candidates.json", "signals.json", "eval.json",
+    # v2：矢量定义覆盖、当前情绪、关系偏移、示例副本
+    "vector.json", "vector_state.json", "relations.json", "examples.jsonl",
+)
 
 
 def stage_dir(pack_id: str | None = None) -> Path:

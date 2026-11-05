@@ -121,21 +121,31 @@ def _memory_location() -> str:
 def _style_facts(conv: str, is_master: bool) -> str:
     st = persona.stats()
     lines = ["【我说话的风格是怎么定的】"]
-    # 三层结构：底层与禁止事项只能改文件，表层由自动迭代学。
+    # 三层结构：2026-10-24 起评估驱动的修订可写三层（整份备份、可回滚）。
     lines.append(
         f"· 我的人格分三层：底色（{st['base_chars']} 字）、禁止事项（{st['forbidden_chars']} 字）、"
         f"表层说话方式（{st['surface_chars']} 字）"
     )
+    # 回复长度是**代码硬截断**，被问"你怎么说话这么短"时要有真实答案 ——
+    # 这一条与人格无关，所以放在 master 分支外面，谁问都能说。
+    _len = int(settings.get("reply_max_chars") or 0)
+    if _len > 0:
+        _detail = int(settings.get("reply_max_chars_detail") or 0) or _len
+        lines.append(
+            f"· 回复有硬上限：闲聊 {_len} 字，问正事或问设定时 {_detail} 字；"
+            "超了由代码按句截断（不是我不想说，是被截了）"
+        )
     if is_master:
         lines += [
-            "· **底色和禁止事项只能由你直接编辑文件改**（系统和我都不能动它们）：",
-            f"    {st['base_file']}",
-            f"    {st['forbidden_file']}",
-            "· **表层是唯一会自己慢慢学的部分**，但每次改动都要过一道闸门："
-            "碰到上面两条里任何一条就**直接丢弃、不写入**：",
-            f"    {st['surface_file']}",
-            f"· 到现在为止自动改过 {st['changes']} 次（写入 + 被丢弃都记）——"
-            "/人设 日志 看明细，/人设 撤回 撤销最近一次",
+            "· 三个文件都可以直接编辑；",
+            f"    底色：{st['base_file']}",
+            f"    禁止事项：{st['forbidden_file']}",
+            f"    表层：{st['surface_file']}",
+            "· 开启自动评估修订后，按设定时刻提出候选；底层人格只由人工编辑。"
+            "候选通过独立样本复核后才生效，缺少样本时保留待审。"
+            "每次改前会备份，`/人设 撤回` 可以整批回滚：",
+            "· 到现在为止有 {changes} 条改动记录（写入 + 被丢弃都记）——"
+            "/人设 日志 看明细。".format(changes=st['changes']),
             "· 改人格**不用重启**：每轮回复前都重新读这三个文件",
         ]
     else:
@@ -163,9 +173,6 @@ def _trigger_facts(conv: str, is_master: bool) -> str:
             f"{'，但谁都能接着续' if settings.get('attention_lease_anyone') else ''}）",
             f"· 别人聊到跟我刚说过的话题相关时，我可能自己接话"
             f"（注意力机制：{_onoff(settings.get('attention_enabled'))}）",
-            f"· 随机插话：{_onoff(settings.get('random_reply_enabled'))}"
-            f"，每条消息 {float(settings.get('random_reply_chance')):.0%} 的概率",
-            f"· 主动发言：{_onoff(settings.get('proactive_enabled'))}；"
             f"定时问候：{_onoff(settings.get('greet_enabled'))}",
             f"· 被 @ 时我能看到：更早的聊天记录（压缩过，预算 {settings.get('read_budget')} 字）"
             "+ 刚才的新发言 + 引用的消息 + 图片 + 消息里的文件 + 相关的长期记忆",

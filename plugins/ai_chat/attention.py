@@ -54,6 +54,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 from . import config, llm, settings
@@ -184,41 +185,91 @@ def _effective_threshold(item: _Focus) -> float:
 
 
 # ------------------------------------------------------------------ 相关性打分
-async def score_relevance(topic: str, text: str) -> float:
-    """让模型给「这条发言跟当前话题的相关度」打分 0~1。失败按无关处理。"""
+async def score_relevance(topic: str, text: str, *, conv: str = "", message_id: Any = None,
+                          speaker: str = "", uid: str = "") -> float:
+    """让模型给「这条发言跟当前话题的相关度」打分 0~1。失败按无关处理。
+
+    **顺带产出语境增量**（方案 §14.2 的接入点之一）：同一次调用里多要三个字段，
+    写进 `scene_state`。拿不到 `scene` 就只用 `score`——**打分本身不受影响**。
+    """
     if not llm.api_key():
         return 0.0
     prompt = (
         "下面是群里正在聊的话题，以及随后出现的一条新发言。\n"
-        "判断这条新发言跟话题的相关程度。\n\n"
+        "判断这条新发言跟话题的相关程度，并顺便概括这段对话的口气。\n\n"
         f"【话题】\n{topic}\n\n"
         f"【新发言】\n{text}\n\n"
         "评分标准：\n"
         "- 1.0 = 明显还在聊同一件事，甚至是在接着这个话题问或答\n"
         "- 0.5 = 沾点边，同一个大话题下的分支\n"
         "- 0.0 = 无关（换话题了、纯闲聊、纯表情）\n"
-        '只输出 JSON，不要任何多余文字：{"score": 0.0}'
+        '只输出 JSON，不要任何多余文字：\n'
+        '{"score": 0.0, "scene": {"mode": "认真讨论|互相调侃|争执|冷场|不明确", '
+        '"confidence": "clear|fuzzy|unknown", "topic": "这段在聊什么，不超过 12 字"}}\n'
+        "`scene` 是给另一个模块用的摘要；**看不准就填 unknown**，不要为了填而猜。"
     )
     try:
         resp = await asyncio.wait_for(
             llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                # 推理模型会先思考，max_tokens 给小了 content 会是空的
-                max_tokens=800,
+                # 推理模型会先思考，max_tokens 给小了 content 会是空的。
+                # 1200 是给「多输出 scene 三个字段」留的余量。
+                max_tokens=1200,
             ),
             timeout=config.TIMEOUT,
         )
         raw = (resp.choices[0].message.content or "").strip() if resp.choices else ""
         data = json.loads(raw)
-        return max(0.0, min(1.0, float(data.get("score", 0.0))))
     except Exception:  # noqa: BLE001 - 打分失败不该影响群聊
         logger.info("相关性打分失败，按无关处理")
         return 0.0
 
+    score = max(0.0, min(1.0, float(data.get("score", 0.0) or 0.0)))
+    # 语境增量是**附带产物**：任何问题都只记日志，绝不影响返回值
+    try:
+        _note_scene(conv, data.get("scene"), message_id=message_id, speaker=speaker, uid=uid)
+    except Exception:  # noqa: BLE001
+        logger.debug("语境增量处理失败 conv=%s", conv, exc_info=True)
+    return score
 
-async def should_speak(conv: str, text: str) -> tuple[bool, float]:
-    """评估一条新消息，返回 (是否该主动接话, 当前注意力值)。"""
+
+def _note_scene(conv: str, scene: Any, *, message_id: Any = None,
+                speaker: str = "", uid: str = "") -> None:
+    """把模型给的 `scene` 摘要并进会话语境状态。**字段非法就丢那一个，不丢整份**。"""
+    if not conv or not isinstance(scene, dict):
+        return
+    from . import scene_state
+
+    delta: dict[str, Any] = {}
+    mode = str(scene.get("mode") or "").strip()
+    if mode in scene_state.MODES and mode != "不明确":
+        delta["mode"] = mode
+    topic = str(scene.get("topic") or "").strip()[:12]
+    if topic:
+        delta["topic"] = topic
+    conf = str(scene.get("confidence") or "").strip()
+    if conf in ("clear", "fuzzy", "unknown"):
+        delta["confidence"] = conf
+    if uid and speaker:
+        delta["partners"] = {str(uid): str(speaker)[:20]}
+    # 没有 message_id 就不写 last_turn：去重全靠它，空值会让「重试不累计」失效
+    if message_id is not None and delta:
+        delta["last_turn"] = {"message_id": message_id, "source": "attention"}
+    if not delta:
+        return
+    got = scene_state.merge(conv, delta)
+    if not got.get("ok"):
+        logger.debug("语境状态写入失败 conv=%s", conv)
+
+
+async def should_speak(conv: str, text: str, *, message_id: Any = None,
+                       speaker: str = "", uid: str = "") -> tuple[bool, float]:
+    """评估一条新消息，返回 (是否该主动接话, 当前注意力值)。
+
+    `message_id / speaker / uid` 只用于顺带更新语境状态（`scene_state`），
+    不影响注意力本身的判定。
+    """
     if not settings.get("attention_enabled"):
         return False, 0.0
 
@@ -258,7 +309,8 @@ async def should_speak(conv: str, text: str) -> tuple[bool, float]:
 
     item.last_eval = time.time()
     item.evaluated += 1
-    score = await score_relevance(item.topic, text)
+    score = await score_relevance(item.topic, text, conv=conv, message_id=message_id,
+                                  speaker=speaker, uid=uid)
     item.value = min(1.0, item.value * _DECAY + score * _GAIN)  # 封顶 1.0
     threshold = _effective_threshold(item)
     _push_focus()   # 值变了就落盘（评估本身至少隔 attention_interval 秒，写盘很便宜）

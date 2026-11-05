@@ -290,6 +290,9 @@ def snapshot() -> dict[str, Any]:
         _state.convs.setdefault("__global__", {"mode": "", "ignore": [], "note": "", "updated_at": ""})
     return {
         "global_mode": _state.global_mode,
+        # 桌面端按这份列表渲染下拉框；不返回的话它会退回硬编码的旧列表，
+        # 出现 `ask` 这种服务端并不存在的模式（2026-10-24 实测 400）。
+        "valid_modes": list(VALID_MODES),
         "convs": {
             conv: {
                 "mode": item.get("mode") or "",

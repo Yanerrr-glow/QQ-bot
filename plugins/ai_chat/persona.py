@@ -11,13 +11,19 @@
 
 | 层 | 文件（当前人格包内） | 谁能写 | 进 prompt 的顺序 |
 |---|---|---|---|
-| 底层人设 | `base.txt` | **只有用户**（直接编辑） | 第 1 位（最硬） |
-| 禁止事项 | `forbidden.txt` | **只有用户**（直接编辑） | 第 2 位 |
-| 表层人设 | 包内 `surface.txt` 模板 → 运行数据 `data/runtime/persona/<包>/surface.txt` | **只有自动迭代**（经冲突闸门） | 第 3 位 |
+| 底层人设 | `base.txt` | 用户直接编辑；**评估修订**（运行时覆盖文件） | 第 1 位（最硬） |
+| 禁止事项 | `forbidden.txt` | 用户直接编辑；**评估修订**（运行时覆盖文件） | 第 2 位 |
+| 表层人设 | 包内 `surface.txt` 模板 → 运行数据 `data/runtime/persona/<包>/surface.txt` | 评估修订 / 旧的候选池（经冲突闸门） | 第 3 位 |
 
-**「只有用户能写」不是靠提示词约束，是靠代码**：本模块里只有 `surface_*` 系列函数，
-底层与禁止事项**连写函数都不存在**（`BASE_PROMPT` / `FORBIDDEN_PROMPT` 是只读的惰性属性）。
-自动迭代哪怕被 prompt 注入攻击劫持，也没有可调用的写入口。
+> **2026-10-24 起权限变了**：用户要求允许评估驱动的修订改**三层**。
+> 原来"底层与禁止事项连写函数都没有"的结构性保证被有意推翻，取而代之的是：
+> 每次修订**先整份备份三层**到 `history/<rev>/`，先校验再落地，失败整批回滚；
+> 可用 `/人设 撤回` **整版回滚**。`apply_revision()` 是唯一的整层写入口。
+> 底层/禁止事项写的是 `data/runtime/persona/<包>/` 下的**覆盖文件**（卷内持久化），
+> 不改镜像里的 `persona/packs/` 源文件。
+
+旧的「候选池」仍然保留（`propose_candidate` / `approve_candidate`），
+但它只服务手动反思，默认不再自动触发；定时修订走 `persona_revise.py`。
 
 **包化之后多了一条保证**：这三层现在属于**某个包**（`persona/packs/<id>/`），
 换角色 = 换目录，而不是覆盖同一批文件；各自的自我学习成果也按包分开
@@ -47,7 +53,7 @@
 不再手工维护；注册表读不到时回退内置表，闸门绝不裸奔。
 ⚠ 派生发生在 **import 期**：改了注册表、或给某条铁律加注释，闸门要**重启**才跟着变。
 
-## 候选池：默认不直接生效
+## 候选池：旧流程，保留但不再自动触发
 
 闸门只拦"碰铁律"，**拦不住风格跑偏**（学成话痨、学成另一个语气）——
 那种改动照过闸门，人在群里只觉得"它今天怪怪的"。所以合规候选
@@ -55,12 +61,13 @@
 `/人设 候选` 看池子、`/人设 采纳 <序号>` 才写表层、`/人设 否决 <序号>` 丢弃
 （对应 `propose_candidate` / `approve_candidate` / `reject_candidate`）。
 采纳时会**再过一次闸门** —— 池子里的条目在等待期间可能已经因为底层人设被改而变得不合规。
-把 `persona_iter_auto_apply` 打开才退回"过闸门即生效"的旧行为（默认**关**）。
+2026-10-24 停用的是**定期自动反思**；候选池本身留着，供手动反思使用。
 
 ## 变更日志
 
-每次写入/丢弃都进 `data/runtime/persona/<包>/changelog.json`（上限 200 条），`/人设 撤回` 撤销最近一次**写入**。
-这是路线 C 能被信任的前提：**每次自动改动都可查、可撤**。
+每次写入/丢弃都进 `data/runtime/persona/<包>/changelog.json`（上限 200 条）。
+评估修订另有一份 `revisions.json`：记录每版改了什么、分数，以及备份目录；
+`/人设 撤回` 优先回滚整版修订，没有修订时才退回旧的"撤一条表层"路径。
 """
 
 from __future__ import annotations
@@ -68,6 +75,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -175,8 +183,8 @@ def forbidden_items() -> list[str]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("【"):
-            # 段落标题：开始/结束一节。只收「禁止事项」那一节里的条目。
-            in_section = "禁止" in line
+            # 段落标题：开始/结束一节。收「禁止事项」与 v2 的「绝对不做」两节。
+            in_section = ("禁止" in line) or ("绝对不做" in line)
             continue
         if not in_section:
             continue
@@ -641,6 +649,243 @@ def undo_last() -> dict[str, Any]:
     return {"ok": True, "text": text}
 
 
+# --------------------------------------------------------------------- 三层写入（评估驱动）
+# 2026-10-24 起，评估驱动的修订**允许改三层**。这是对原先"另外两层没有写路径"的
+# 有意推翻，所以补偿措施必须一起到位：每次修订先整份备份、写失败不落地、可整版回滚。
+_LAYER_LABEL = {"base": "底层人设", "forbidden": "禁止事项", "surface": "表层人设"}
+_REVISIONS_FILE = "revisions.json"
+_HISTORY_DIR = "history"
+_MAX_LAYER_TEXT = 20000
+
+
+def layer_text(role: str) -> str:
+    if role == "base":
+        return base_text()
+    if role == "forbidden":
+        return forbidden_text()
+    if role == "surface":
+        return surface_text()
+    raise ValueError(f"未知人设层：{role}")
+
+
+def _write_layer(role: str, text: str) -> None:
+    path = config.layer_file_path(role)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(str(text).rstrip() + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _revisions_path() -> Path:
+    return config.persona_data_dir() / _REVISIONS_FILE
+
+
+def _load_revisions() -> dict[str, Any]:
+    path = _revisions_path()
+    if not path.exists():
+        return {"version": 1, "items": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("人设修订记录损坏，按空记录继续：%s", path.name)
+        return {"version": 1, "items": []}
+    return raw if isinstance(raw, dict) else {"version": 1, "items": []}
+
+
+def _save_revisions(data: dict[str, Any]) -> None:
+    path = _revisions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def revisions(limit: int = 10) -> list[dict[str, Any]]:
+    items = [x for x in (_load_revisions().get("items") or []) if isinstance(x, dict)]
+    return items[-max(1, int(limit)):]
+
+
+def apply_revision(
+    changes: list[dict[str, Any]],
+    *,
+    reason: str = "",
+    source: str = "评估",
+    scores: dict[str, Any] | None = None,
+    allow_delete: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """把一组「段落替换」写进三层，整版备份、可整版回滚。
+
+    `changes` 的每一项：`{"layer": "base|forbidden|surface", "find": "...", "replace": "...", "why": "..."}`。
+    **先全部校验再落地**：任何一条 `find` 不唯一/找不到，整批不写。
+    `allow_delete=True` 时允许 `replace` 为空（= 删除这一段），仍会拒绝把整层改空。
+    """
+    if not changes:
+        return {"ok": False, "why": "没有要写的改动"}
+    if len(changes) > 12:
+        return {"ok": False, "why": f"一次改动太多（{len(changes)} 条），最多 12 条"}
+
+    current = {role: layer_text(role) for role in _LAYER_LABEL}
+    planned = dict(current)
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(changes):
+        if not isinstance(item, dict):
+            return {"ok": False, "why": f"第 {index + 1} 条不是对象"}
+        role = str(item.get("layer") or "")
+        if role not in _LAYER_LABEL:
+            return {"ok": False, "why": f"第 {index + 1} 条的 layer 不合法：{role!r}"}
+        if role == "base":
+            # v2 的结构性约束：底层只定义"她是谁"，不允许评估台改写。
+            return {"ok": False, "why": "底层人设不允许由评估台修改（v2 结构性约束）"}
+        find = str(item.get("find") or "")
+        replace = str(item.get("replace") or "")
+        if len(find) < 8:
+            return {"ok": False, "why": f"第 {index + 1} 条的 find 太短，无法安全定位"}
+        if not replace.strip() and not allow_delete:
+            return {"ok": False, "why": f"第 {index + 1} 条的 replace 为空"}
+        if len(replace) > 4000:
+            return {"ok": False, "why": f"第 {index + 1} 条的 replace 过长（>{4000} 字）"}
+        hits = planned[role].count(find)
+        if hits != 1:
+            return {
+                "ok": False,
+                "why": f"第 {index + 1} 条在{_LAYER_LABEL[role]}里匹配到 {hits} 次（必须正好 1 次）：{find[:30]}",
+            }
+        planned[role] = planned[role].replace(find, replace, 1)
+        normalized.append({
+            "layer": role, "find": find, "replace": replace,
+            "why": str(item.get("why") or "")[:300],
+        })
+
+    for role, text in planned.items():
+        if not text.strip():
+            return {"ok": False, "why": f"{_LAYER_LABEL[role]}会被改空，拒绝写入"}
+        if len(text) > _MAX_LAYER_TEXT:
+            return {"ok": False, "why": f"{_LAYER_LABEL[role]}超出 {_MAX_LAYER_TEXT} 字上限"}
+
+    if dry_run:
+        return {"ok": True, "planned": planned, "changes": normalized}
+
+    rev = time.strftime("%Y%m%d-%H%M%S")
+    backup = config.persona_data_dir() / _HISTORY_DIR / rev
+    try:
+        backup.mkdir(parents=True, exist_ok=True)
+        had_override: dict[str, bool] = {}
+        for role, text in current.items():
+            (backup / f"{role}.txt").write_text(str(text), encoding="utf-8")
+            had_override[role] = config.layer_is_overridden(role)
+        (backup / "meta.json").write_text(
+            json.dumps(
+                {"rev": rev, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "had_override": had_override, "changes": normalized},
+                ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.exception("人设修订备份失败")
+        return {"ok": False, "why": f"备份失败，未写入：{exc}"}
+
+    written: list[str] = []
+    try:
+        for role, text in planned.items():
+            if text != current[role]:
+                _write_layer(role, text)
+                written.append(role)
+    except OSError as exc:
+        logger.exception("人设修订写入失败，尝试回滚")
+        _restore_backup(backup)
+        return {"ok": False, "why": f"写入失败，已回滚：{exc}"}
+
+    data = _load_revisions()
+    data.setdefault("items", []).append({
+        "rev": rev,
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "reason": reason,
+        "scores": scores or {},
+        "changes": normalized,
+        "written": written,
+        "backup": str(backup.relative_to(config.persona_data_dir())),
+    })
+    data["items"] = data["items"][-100:]
+    _save_revisions(data)
+    _prune_history()
+    log_change(
+        "revised", text=f"{len(normalized)} 处（{'/'.join(_LAYER_LABEL[x] for x in written) or '无变化'}）",
+        reason=reason or "评估驱动修订", code="ok", source=source,
+    )
+    logger.info("人设修订已写入 rev=%s：%d 处，涉及 %s", rev, len(normalized), written)
+    return {"ok": True, "rev": rev, "written": written, "changes": normalized, "backup": str(backup)}
+
+
+def _prune_history(keep: int = 30) -> None:
+    """只保留最近 `keep` 版备份，避免 history/ 无限长大（每版三份正文）。"""
+    root = config.persona_data_dir() / _HISTORY_DIR
+    try:
+        dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
+    except OSError:
+        return
+    for old in dirs[:-keep] if keep > 0 else []:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _restore_backup(backup: Path) -> bool:
+    if (backup / "batch.json").exists():
+        from .persona_revision_batch import restore
+        return restore(backup)
+    meta_path = backup / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        had_override = dict(meta.get("had_override") or {})
+        for role in _LAYER_LABEL:
+            src = backup / f"{role}.txt"
+            if not src.exists():
+                continue
+            if had_override.get(role, True):
+                _write_layer(role, src.read_text(encoding="utf-8"))
+            else:
+                path = config.layer_file_path(role)
+                if path.exists():
+                    path.unlink()
+        return True
+    except OSError:
+        logger.exception("回滚人设备份失败：%s", backup)
+        return False
+
+
+def undo_revision() -> dict[str, Any]:
+    """撤销**最近一次评估修订**（整版回滚）。"""
+    data = _load_revisions()
+    items = [x for x in (data.get("items") or []) if isinstance(x, dict)]
+    if not items:
+        return {"ok": False, "why": "没有可回滚的评估修订"}
+    last = items[-1]
+    backup = config.persona_data_dir() / str(last.get("backup") or "")
+    if not backup.exists():
+        return {"ok": False, "why": f"找不到备份目录：{last.get('backup')}"}
+    if not _restore_backup(backup):
+        return {"ok": False, "why": "回滚写盘失败"}
+    data["items"] = items[:-1]
+    _save_revisions(data)
+    log_change("undone", text=f"回滚修订 {last.get('rev')}", reason="整版回滚", source="主人")
+    logger.info("人设修订已回滚 rev=%s", last.get("rev"))
+    return {"ok": True, "rev": last.get("rev"), "changes": last.get("changes") or []}
+
+
+def revisions_text(limit: int = 10) -> str:
+    items = revisions(limit)
+    if not items:
+        return "（还没有评估驱动的修订）"
+    lines = []
+    for item in reversed(items):
+        lines.append(f"· {item.get('at')} [{item.get('source')}] {len(item.get('changes') or [])} 处"
+                     f"（{'/'.join(_LAYER_LABEL.get(x, x) for x in item.get('written') or []) or '无变化'}）")
+        for change in (item.get("changes") or [])[:6]:
+            lines.append(f"    - {_LAYER_LABEL.get(change.get('layer'), change.get('layer'))}："
+                         f"{str(change.get('why') or change.get('find') or '')[:60]}")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------- 渲染
 def render() -> str:
     """三层拼成的 system 前缀。**每轮现读**（表层会被自动迭代改）。"""
@@ -667,11 +912,25 @@ def describe(limit: int = 40) -> str:
         f"  包目录：{st['pack_dir']}",
         f"  运行数据：{st['pack_stage']}",
         "",
-        f"【底层人设】{st['base_chars']} 字（**只有你能改**：{st['base_file']}）",
-        f"【禁止事项】{st['forbidden_chars']} 字（**只有你能改**：{st['forbidden_file']}）",
-        f"【表层人设】{st['surface_chars']} 字（**自动迭代只写这一层**：{st['surface_file']}）",
+        f"【底层人设】{st['base_chars']} 字（**只有你能改**；v2 下评估台也不能写：{st['base_file']}）",
+        f"【禁止事项】{st['forbidden_chars']} 字（人 / 评估台可改，每次备份可回滚：{st['forbidden_file']}）",
+        f"【表层人设】{st['surface_chars']} 字（人 / 评估台可改：{st['surface_file']}）",
+    ]
+    try:
+        from . import persona_examples, persona_vector
+
+        values = persona_vector.state().get("values") or {}
+        if values:
+            rows.append("【行为矢量】" + "、".join(
+                f"{key}={round(float(value), 2)}" for key, value in values.items()))
+        ex = persona_examples.stats()
+        if ex.get("total"):
+            rows.append(f"【示例库】{ex['total']} 条（good {ex['good']} / bad {ex['bad']}）")
+    except Exception:  # noqa: BLE001 - v1 包没有这些文件，读不到就不显示
+        pass
+    rows.extend([
         "",
-        f"禁止事项共 {len(forbidden_items())} 条（自动迭代碰这些会被直接丢弃）。",
+        f"禁止事项共 {len(forbidden_items())} 条（表层候选碰这些会被直接丢弃）。",
         f"变更日志 {st['changes']} 条：/人设 日志 看；/人设 撤回 撤销最近一次自动改动。",
         (
             f"待采纳的候选 {st['pending']} 条：/人设 候选 看，/人设 采纳 <序号> 才写进表层。"
@@ -680,7 +939,7 @@ def describe(limit: int = 40) -> str:
         ),
         "",
         "切换人格：/人设 包 看可用包，/人设 切换 <id> 换一个（立即生效）。",
-    ]
+    ])
     return "\n".join(rows)
 
 
@@ -724,8 +983,9 @@ def changelog_text(limit: int = 12) -> str:
 # "它今天怎么怪怪的"，根本不知道人格文件被动过。AstrBot 那边用
 # `review_mode`（管理员审核）解同一件事。
 #
-# 现在：自动迭代产出 → 落候选池 + 通知 → 人工 /人设 采纳 才进表层。
-# 开关 `persona_iter_auto_apply=True` 可退回改造前的直接生效行为。
+# 现在：手动反思产出 → 落候选池 + 通知 → 人工 /人设 采纳 才进表层。
+# 2026-10-24：定期自动反思已停用；`persona_iter_auto_apply` 参数已移除，
+# 候选池恒为"人工采纳"。评估驱动的修订走 `apply_revision()`，不经过这里。
 _PENDING_FILE = "candidates.json"
 _MAX_PENDING = 50      # 池上限；满了按时间淘汰最旧的待采纳条目
 
@@ -904,7 +1164,7 @@ def candidates_text(limit: int = 20) -> str:
     items = candidates(limit=limit)
     if not items:
         return "（候选池是空的）"
-    auto = bool(settings.get("persona_iter_auto_apply"))
+    auto = False  # 自动生效路径已随旧迭代一起删除；候选一律人工采纳
     lines: list[str] = []
     for i, it in enumerate(items, 1):
         lines.append(f"{i}. {str(it.get('text', ''))[:80]}")
